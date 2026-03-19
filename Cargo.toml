@@ -1,0 +1,56 @@
+[package]
+name = "beeboop"
+version = "0.1.0"
+edition = "2021"
+description = "Low-latency event-driven trading bot for Polymarket BTC 5-min markets"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
+futures-util = "0.3"
+
+# HTTP client (for REST order entry)
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
+time = { version = "0.3", features = ["formatting"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Crypto / signing (for EIP-712)
+alloy = { version = "1", features = ["signer-local"] }
+
+# Data recording (append-only logs)
+parquet = { version = "53", features = ["async"] }
+arrow = { version = "53", features = ["chrono-tz"] }
+
+# Stats / analysis
+ndarray = "0.16"
+
+# Config
+dotenvy = "0.15"
+
+# Metrics histograms
+hdrhistogram = "7"
+
+# UUID for nonces
+uuid = { version = "1", features = ["v4"] }
+
+# URL handling
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
