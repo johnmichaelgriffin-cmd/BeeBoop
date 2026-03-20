@@ -30,12 +30,19 @@ chrono = { version = "0.4", features = ["serde"] }
 # Crypto / signing (for EIP-712)
 alloy = { version = "1", features = ["signer-local"] }
 
-# Data recording (append-only logs)
-parquet = { version = "53", features = ["async"] }
-arrow = { version = "53", features = ["chrono-tz"] }
+# Official Polymarket CLOB SDK — handles EIP-712 signing, order creation, REST posting
+polymarket-client-sdk = { version = "0.4", features = ["clob", "ws", "rtds", "tracing"] }
+
+# Data recording (append-only logs) — disabled for now to avoid chrono version conflict
+# parquet = { version = "53", features = ["async"] }
+# arrow = { version = "53", features = ["chrono-tz"] }
 
 # Stats / analysis
 ndarray = "0.16"
+
+# Decimal math (re-exported by polymarket SDK but we need it directly)
+rust_decimal = "1"
+rust_decimal_macros = "1"
 
 # Config
 dotenvy = "0.15"

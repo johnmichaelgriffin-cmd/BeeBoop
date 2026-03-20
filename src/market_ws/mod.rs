@@ -15,6 +15,54 @@ use tracing::{error, info, warn};
 use crate::types::{BBO, OrderBook, PriceLevel, RecordedEvent, TickSize, Trade};
 
 const MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+const GAMMA_API: &str = "https://gamma-api.polymarket.com";
+
+/// Fetch BTC 5-min market token IDs for current + next window from Gamma API.
+/// Slug format: btc-updown-5m-{window_timestamp}
+/// Window timestamp = floor(now / 300) * 300
+pub async fn fetch_btc_token_ids() -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let client = reqwest::Client::new();
+    let now = chrono::Utc::now().timestamp();
+    let wts = now - (now % 300);
+
+    let mut token_ids = Vec::new();
+
+    // Fetch current window + next window
+    for ts in [wts, wts + 300] {
+        let slug = format!("btc-updown-5m-{}", ts);
+        let resp = client
+            .get(format!("{}/events", GAMMA_API))
+            .query(&[("slug", slug.as_str())])
+            .timeout(std::time::Duration::from_secs(10))
+            .send()
+            .await?;
+
+        let body = resp.text().await?;
+        let events: serde_json::Value = serde_json::from_str(&body)?;
+
+        if let Some(arr) = events.as_array() {
+            for event in arr {
+                if let Some(markets) = event.get("markets").and_then(|m| m.as_array()) {
+                    for market in markets {
+                        let tokens_raw = market.get("clobTokenIds")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("[]");
+                        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(tokens_raw) {
+                            for tid in parsed {
+                                if !tid.is_empty() && !token_ids.contains(&tid) {
+                                    token_ids.push(tid);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    info!("market_ws: fetched {} token IDs for windows {} and {}", token_ids.len(), wts, wts + 300);
+    Ok(token_ids)
+}
 
 /// Events emitted by the market WebSocket.
 #[derive(Debug, Clone)]
@@ -35,13 +83,29 @@ struct SubscribeMsg {
 }
 
 /// Run the market WebSocket connection loop.
-/// Automatically reconnects on disconnect.
+/// Auto-fetches token IDs from Gamma API and reconnects on disconnect.
+/// Re-fetches tokens on each reconnect to pick up new windows.
 pub async fn run(
-    token_ids: Vec<String>,
+    _initial_token_ids: Vec<String>,
     tx: mpsc::UnboundedSender<MarketEvent>,
 ) {
     loop {
-        info!("market_ws: connecting to {}", MARKET_WS_URL);
+        // Fetch fresh token IDs each connection cycle
+        let token_ids = match fetch_btc_token_ids().await {
+            Ok(ids) if !ids.is_empty() => ids,
+            Ok(_) => {
+                warn!("market_ws: no token IDs found, retrying in 10s...");
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            }
+            Err(e) => {
+                error!("market_ws: failed to fetch token IDs: {}, retrying in 10s...", e);
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                continue;
+            }
+        };
+
+        info!("market_ws: connecting to {} with {} tokens", MARKET_WS_URL, token_ids.len());
         match connect_and_stream(&token_ids, &tx).await {
             Ok(()) => warn!("market_ws: connection closed cleanly, reconnecting..."),
             Err(e) => error!("market_ws: connection error: {}, reconnecting in 2s...", e),
@@ -58,6 +122,9 @@ async fn connect_and_stream(
     let (mut write, mut read) = ws_stream.split();
 
     info!("market_ws: connected, subscribing to {} tokens", token_ids.len());
+    for (i, tid) in token_ids.iter().enumerate() {
+        info!("market_ws:   token[{}]: {}...{}", i, &tid[..8.min(tid.len())], &tid[tid.len().saturating_sub(8)..]);
+    }
 
     // Subscribe to all event types for our tokens
     let sub = SubscribeMsg {
@@ -67,13 +134,31 @@ async fn connect_and_stream(
     let sub_json = serde_json::to_string(&sub)?;
     write.send(Message::Text(sub_json.into())).await?;
 
-    info!("market_ws: subscribed");
+    info!("market_ws: subscribed, listening for events...");
 
-    while let Some(msg) = read.next().await {
-        let local_recv_us = chrono::Utc::now().timestamp_micros();
+    // Track window boundary — reconnect every 5 min to pick up new tokens
+    let now = chrono::Utc::now().timestamp();
+    let next_window = (now - (now % 300)) + 300;
+    let reconnect_at = next_window + 5; // reconnect 5s into next window
+    info!("market_ws: will reconnect at {} ({}s from now)", reconnect_at, reconnect_at - now);
 
-        match msg? {
-            Message::Text(text) => {
+    loop {
+        // Check if we should reconnect for new window
+        if chrono::Utc::now().timestamp() >= reconnect_at {
+            info!("market_ws: new window — disconnecting to re-subscribe with fresh tokens");
+            let _ = write.send(Message::Close(None)).await;
+            break;
+        }
+
+        // Use timeout so we can check the reconnect timer
+        let msg = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            read.next(),
+        ).await;
+
+        match msg {
+            Ok(Some(Ok(Message::Text(text)))) => {
+                let local_recv_us = chrono::Utc::now().timestamp_micros();
                 let text_str: &str = text.as_ref();
 
                 // Record raw event
@@ -90,12 +175,23 @@ async fn connect_and_stream(
                     warn!("market_ws: parse error: {}", e);
                 }
             }
-            Message::Ping(data) => {
-                write.send(Message::Pong(data)).await?;
+            Ok(Some(Ok(Message::Ping(data)))) => {
+                let _ = write.send(Message::Pong(data)).await;
             }
-            Message::Close(_) => {
+            Ok(Some(Ok(Message::Close(_)))) => {
                 info!("market_ws: received close frame");
                 break;
+            }
+            Ok(Some(Err(e))) => {
+                return Err(e.into());
+            }
+            Ok(None) => {
+                info!("market_ws: stream ended");
+                break;
+            }
+            Err(_) => {
+                // Timeout — just loop back to check reconnect timer
+                continue;
             }
             _ => {}
         }
