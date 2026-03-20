@@ -477,27 +477,26 @@ impl ExecutionEngine {
     }
 
     /// FOK SELL at a minimum price — won't dump below this.
-    pub async fn do_fok_sell_at_price(client: &AuthedClient, signer: &PrivateKeySigner, token_u256: U256, shares: f64, _min_price: f64) -> Result<OrderResult, String> {
-        use polymarket_client_sdk::clob::types::{Amount, OrderType, Side};
+    pub async fn do_fok_sell_at_price(client: &AuthedClient, signer: &PrivateKeySigner, token_u256: U256, shares: f64, min_price: f64) -> Result<OrderResult, String> {
+        use polymarket_client_sdk::clob::types::{OrderType, Side};
 
-        // FOK SELL via market_order — SELL must use Amount::shares
-        // SDK auto-calculates price by walking bids in the orderbook
-        // Round down shares to avoid over-selling
+        // FOK SELL via limit_order with floor price — NEVER sells below entry
         let shares_rounded = (shares * 100.0).floor() / 100.0;
         if shares_rounded <= 0.0 {
             return Err("shares rounds to 0".to_string());
         }
 
-        let amount = Amount::shares(
-            Decimal::from_str(&format!("{:.2}", shares_rounded)).map_err(|e| format!("dec: {}", e))?
-        ).map_err(|e| format!("amount: {}", e))?;
+        let size_dec = Decimal::from_str(&format!("{:.2}", shares_rounded)).map_err(|e| format!("dec: {}", e))?;
+        // Floor price = entry price, formatted to 2dp for tick size
+        let price_dec = Decimal::from_str(&format!("{:.2}", min_price)).map_err(|e| format!("dec: {}", e))?;
 
-        info!("FOK SELL building: {:.2}sh market_order (auto-price), token={}", shares_rounded, token_u256);
+        info!("FOK SELL building: {:.2}sh limit_order floor={:.2}, token={}", shares_rounded, min_price, token_u256);
 
-        // Don't set price — let SDK calculate from orderbook bids
-        let order = client.market_order()
+        // limit_order with FOK — fills at bid price but ONLY if bid >= floor
+        let order = client.limit_order()
             .token_id(token_u256)
-            .amount(amount)
+            .size(size_dec)
+            .price(price_dec)
             .side(Side::Sell)
             .order_type(OrderType::FOK)
             .build().await
