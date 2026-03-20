@@ -454,7 +454,7 @@ async fn main() {
                 if now - last_signal_log >= 5 {
                     let s = state_strat.read().await;
                     info!(
-                        "SIGNAL: score={:.3} mode={:?} | BN=${:.2} CL=${:.2} lag={:.1}bps ret2s={:.1}bps | OBI={:.3} | UP ask={} DN ask={}",
+                        "SIGNAL: score={:.3} mode={:?} | BN=${:.2} CL=${:.2} lag={:.1}bps ret2s={:.1}bps | OBI={:.3} | UP ask={} DN ask={} | hist={}",
                         signal.score,
                         signal.mode,
                         s.binance_rtds_price,
@@ -464,6 +464,7 @@ async fn main() {
                         obi.as_ref().map(|o| o.value).unwrap_or(0.0),
                         s.up_best_ask.map(|a| format!("{:.0}c", a * 100.0)).unwrap_or("?".into()),
                         s.dn_best_ask.map(|a| format!("{:.0}c", a * 100.0)).unwrap_or("?".into()),
+                        s.binance_mid_history.len(),
                     );
                     last_signal_log = now;
                     drop(s);
