@@ -366,7 +366,9 @@ impl ExecutionEngine {
     pub async fn do_fok_sell_at_price(client: &AuthedClient, signer: &PrivateKeySigner, token_u256: U256, shares: f64, min_price: f64) -> Result<OrderResult, String> {
         use polymarket_client_sdk::clob::types::{OrderType, Side};
         let size_dec = Decimal::from_str(&format!("{:.2}", shares)).map_err(|e| format!("dec: {}", e))?;
-        let price_dec = Decimal::from_str(&format!("{:.4}", min_price)).map_err(|e| format!("dec: {}", e))?;
+        // Round to 2 decimal places to match tick size (0.01)
+        let price_rounded = (min_price * 100.0).round() / 100.0;
+        let price_dec = Decimal::from_str(&format!("{:.2}", price_rounded)).map_err(|e| format!("dec: {}", e))?;
         let order = client.limit_order().token_id(token_u256).size(size_dec).price(price_dec)
             .side(Side::Sell).order_type(OrderType::FOK)
             .build().await.map_err(|e| format!("build: {}", e))?;
