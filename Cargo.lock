@@ -980,10 +980,12 @@ name = "beeboop"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "base64 0.22.1",
  "chrono",
  "dotenvy",
  "futures-util",
  "hdrhistogram",
+ "hmac",
  "ndarray",
  "polymarket-client-sdk",
  "reqwest 0.12.28",
@@ -992,6 +994,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "time",
  "tokio",
  "tokio-tungstenite 0.24.0",

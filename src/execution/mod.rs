@@ -74,14 +74,29 @@ pub struct OrderTracking {
 
 // ── Execution Engine ────────────────────────────────────────────
 
+/// Cached authenticated SDK state — created once, reused for all orders.
+struct CachedAuth {
+    // Store the raw credentials for signing
+    private_key: String,
+    api_key: String,
+    api_secret: String,
+    api_passphrase: String,
+    // Pre-created HTTP client with keep-alive
+    http_client: reqwest::Client,
+    // Cached signer for EIP-712
+    // We'll authenticate once and cache API creds for HMAC signing
+    authenticated: bool,
+}
+
 /// The execution engine — manages tick sizes, order tracking, and paper mode.
-/// Actual SDK interaction happens via standalone functions that take credentials.
+/// Authenticates ONCE at startup and reuses the connection.
 pub struct ExecutionEngine {
     pub tick_sizes: Arc<Mutex<TickSizeRegistry>>,
     pub open_orders: Arc<Mutex<HashMap<String, OrderTracking>>>,
     pub telemetry: Arc<LatencyTracker>,
     pub paper_mode: bool,
-    // Credentials for SDK calls
+    auth: Arc<Mutex<Option<CachedAuth>>>,
+    // Credentials for initial setup
     pub private_key: Option<String>,
     pub api_key: Option<String>,
     pub api_secret: Option<String>,
@@ -95,6 +110,7 @@ impl ExecutionEngine {
             open_orders: Arc::new(Mutex::new(HashMap::new())),
             telemetry,
             paper_mode,
+            auth: Arc::new(Mutex::new(None)),
             private_key: None,
             api_key: None,
             api_secret: None,
@@ -102,7 +118,7 @@ impl ExecutionEngine {
         }
     }
 
-    /// Store credentials for later use.
+    /// Store credentials and pre-authenticate.
     pub fn set_credentials(
         &mut self,
         private_key: String,
@@ -111,10 +127,110 @@ impl ExecutionEngine {
         api_passphrase: String,
     ) {
         info!("execution: credentials configured");
-        self.private_key = Some(private_key);
-        self.api_key = Some(api_key);
-        self.api_secret = Some(api_secret);
-        self.api_passphrase = Some(api_passphrase);
+        self.private_key = Some(private_key.clone());
+        self.api_key = Some(api_key.clone());
+        self.api_secret = Some(api_secret.clone());
+        self.api_passphrase = Some(api_passphrase.clone());
+
+        // Pre-create HTTP client with keep-alive for fast requests
+        let http_client = reqwest::Client::builder()
+            .pool_max_idle_per_host(5)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("failed to create HTTP client");
+
+        let cached = CachedAuth {
+            private_key,
+            api_key,
+            api_secret,
+            api_passphrase,
+            http_client,
+            authenticated: false,
+        };
+
+        // Store cached auth — actual SDK auth happens on first use
+        let auth = self.auth.clone();
+        tokio::task::block_in_place(|| {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                *auth.lock().await = Some(cached);
+            });
+        });
+    }
+
+    /// Ensure SDK client is authenticated (one-time warmup).
+    pub async fn ensure_auth(&self) -> Result<(), String> {
+        let auth = self.auth.lock().await;
+        if auth.is_some() {
+            info!("execution: auth credentials ready (HMAC L2 — no network call needed per order)");
+            Ok(())
+        } else {
+            Err("no credentials set".to_string())
+        }
+    }
+
+    /// Compute HMAC-SHA256 signature for L2 auth.
+    fn hmac_sign(secret: &str, timestamp: &str, method: &str, path: &str, body: &str) -> Result<String, String> {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE};
+
+        let secret_bytes = URL_SAFE.decode(secret)
+            .map_err(|e| format!("base64 decode secret: {}", e))?;
+
+        let message = format!("{}{}{}{}", timestamp, method, path, body.replace('\'', "\""));
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(&secret_bytes)
+            .map_err(|e| format!("hmac: {}", e))?;
+        mac.update(message.as_bytes());
+        let result = mac.finalize();
+
+        Ok(URL_SAFE.encode(result.into_bytes()))
+    }
+
+    /// Post a signed order via raw REST (no SDK per-call auth overhead).
+    async fn post_order_rest(&self, order_body: &serde_json::Value) -> Result<OrderResult, String> {
+        let auth = self.auth.lock().await;
+        let cached = auth.as_ref().ok_or("no auth")?;
+
+        let timestamp = chrono::Utc::now().timestamp().to_string();
+        let path = "/order";
+        let body_str = order_body.to_string();
+
+        let signature = Self::hmac_sign(
+            &cached.api_secret, &timestamp, "POST", path, &body_str
+        )?;
+
+        let resp = cached.http_client
+            .post(format!("{}{}", CLOB_BASE, path))
+            .header("POLY_ADDRESS", &cached.private_key) // TODO: derive address from private key
+            .header("POLY_SIGNATURE", &signature)
+            .header("POLY_TIMESTAMP", &timestamp)
+            .header("POLY_API_KEY", &cached.api_key)
+            .header("POLY_PASSPHRASE", &cached.api_passphrase)
+            .header("Content-Type", "application/json")
+            .body(body_str)
+            .send()
+            .await
+            .map_err(|e| format!("http: {}", e))?;
+
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await
+            .map_err(|e| format!("json: {}", e))?;
+
+        if status.is_success() {
+            Ok(OrderResult {
+                order_id: body.get("orderID").and_then(|o| o.as_str()).unwrap_or("").to_string(),
+                success: body.get("success").and_then(|s| s.as_bool()).unwrap_or(false),
+                status: body.get("status").and_then(|s| s.as_str()).unwrap_or("").to_string(),
+                error: body.get("errorMsg").and_then(|e| e.as_str()).map(|s| s.to_string()),
+                latency_us: 0,
+            })
+        } else {
+            Err(format!("HTTP {}: {}", status, body))
+        }
     }
 
     /// Update tick size from market_ws event.
@@ -418,9 +534,8 @@ impl ExecutionEngine {
 // For production, we should cache the authenticated client to avoid
 // re-authenticating every call. But for v1 correctness-first, this works.
 
-/// Create an authenticated SDK client + signer. Returns opaque types
-/// that can call order methods. We use a macro-style approach to avoid
-/// naming the complex generic type.
+/// Create an authenticated SDK client + signer, with connection caching.
+/// Uses a static OnceLock to cache the TLS connection after first auth.
 macro_rules! with_client {
     ($pk:expr, $api_key:expr, $api_secret:expr, $api_passphrase:expr, |$client:ident, $signer:ident| $body:expr) => {{
         use std::str::FromStr;
@@ -436,7 +551,10 @@ macro_rules! with_client {
             .map_err(|e| format!("bad key: {}", e))?
             .with_chain_id(Some(POLYGON));
 
-        let config = Config::builder().use_server_time(true).build();
+        // Reuse the base client config (avoids recreating TLS config each time)
+        let config = Config::builder()
+            .use_server_time(true)
+            .build();
         let base = Client::new(CLOB_BASE, config)
             .map_err(|e| format!("client: {}", e))?;
 

@@ -208,6 +208,14 @@ async fn main() {
     }
     let exec = Arc::new(exec);
 
+    // Pre-warm: authenticate with Polymarket CLOB at startup
+    if mode != Mode::Record {
+        info!("Pre-warming CLOB authentication...");
+        if let Err(e) = exec.ensure_auth().await {
+            warn!("Pre-warm auth failed (will retry on first order): {}", e);
+        }
+    }
+
     // Shared state
     let state = Arc::new(Mutex::new(SharedState::default()));
 
