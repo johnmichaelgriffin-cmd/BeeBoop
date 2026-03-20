@@ -268,6 +268,39 @@ async fn main() {
         binance_l2::run(binance_tx).await;
     });
 
+    // REST fallback: poll token prices every 2s in case WS is flaky
+    let state_rest = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        loop {
+            interval.tick().await;
+            let s = state_rest.lock().await;
+            let up_id = s.up_token_id.clone();
+            let dn_id = s.dn_token_id.clone();
+            drop(s);
+
+            if up_id.is_empty() || dn_id.is_empty() {
+                continue;
+            }
+
+            // Poll both tokens in parallel
+            let (up_result, dn_result) = tokio::join!(
+                market_ws::poll_book_rest(&up_id),
+                market_ws::poll_book_rest(&dn_id),
+            );
+
+            let mut s = state_rest.lock().await;
+            if let Some((bid, ask)) = up_result {
+                s.up_best_bid = Some(bid);
+                s.up_best_ask = Some(ask);
+            }
+            if let Some((bid, ask)) = dn_result {
+                s.dn_best_bid = Some(bid);
+                s.dn_best_ask = Some(ask);
+            }
+        }
+    });
+
     // Spawn telemetry logger
     let telem_clone = telemetry.clone();
     tokio::spawn(async move {

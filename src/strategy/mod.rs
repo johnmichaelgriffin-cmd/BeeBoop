@@ -181,7 +181,7 @@ const W_BINANCE_RETURN: f64 = 0.35;
 const ENTRY_THRESHOLD: f64 = 0.40;       // score > this → enter
 const MIN_ORACLE_LAG_BPS: f64 = 1.5;     // oracle must be lagging
 const ENTRY_SPEND_USDC: f64 = 20.0;      // dollars per entry
-const EXIT_TARGET_CENTS: f64 = 0.03;     // 3c profit target
+const EXIT_TARGET_PCT: f64 = 0.10;       // 10% profit target
 const EXIT_TIME_STOP_MS: i64 = 8_000;    // 8s max hold
 const EXIT_SIGNAL_REVERSAL: f64 = -0.20; // exit if signal flips against us
 const COOLDOWN_MS: i64 = 3_000;          // 3s between scalps
@@ -367,33 +367,22 @@ pub fn evaluate_scalp(
                 state.dn_best_bid
             };
 
-            let tick_size = if position.token_id == state.up_token_id {
-                state.tick_size_up
-            } else {
-                state.tick_size_dn
-            };
-
-            // Exit condition 1: TARGET HIT — bid is above entry + target
+            // Exit condition 1: TARGET HIT — bid is above entry + 10%
             if let Some(bid) = current_bid {
-                let profit_per_share = bid - position.entry_price;
-                if profit_per_share >= EXIT_TARGET_CENTS {
-                    // Post maker exit (GTC postOnly sell at bid)
-                    let sell_price = quantize_sell(bid, tick_size);
-                    if sell_price > position.entry_price {
-                        actions.push(StrategyAction::MakerExit {
-                            token_id: position.token_id.clone(),
-                            shares: position.shares,
-                            price: sell_price,
-                            reason: format!(
-                                "TARGET HIT: entry={:.0}c bid={:.0}c profit={:.0}c hold={}ms",
-                                position.entry_price * 100.0,
-                                bid * 100.0,
-                                profit_per_share * 100.0,
-                                hold_ms,
-                            ),
-                        });
-                        return actions;
-                    }
+                let profit_pct = (bid - position.entry_price) / position.entry_price;
+                if profit_pct >= EXIT_TARGET_PCT {
+                    actions.push(StrategyAction::TakerExit {
+                        token_id: position.token_id.clone(),
+                        shares: position.shares,
+                        reason: format!(
+                            "TARGET HIT: entry={:.0}c bid={:.0}c profit={:.1}% hold={}ms",
+                            position.entry_price * 100.0,
+                            bid * 100.0,
+                            profit_pct * 100.0,
+                            hold_ms,
+                        ),
+                    });
+                    return actions;
                 }
             }
 
@@ -527,7 +516,7 @@ mod tests {
         let state = MarketState {
             elapsed_s: 20,
             up_token_id: "up_123".into(),
-            up_best_bid: Some(0.68), // 3c above entry
+            up_best_bid: Some(0.72), // 10.7% above entry of 0.65
             tick_size_up: 0.01,
             ..Default::default()
         };
@@ -541,7 +530,7 @@ mod tests {
         pos.entry_time_us = chrono::Utc::now().timestamp_micros() - 1_000_000; // 1s ago
 
         let actions = evaluate_scalp(&pos, &signal, &state, &RiskLimits::default(), &default_config(), 0);
-        assert!(actions.iter().any(|a| matches!(a, StrategyAction::MakerExit { .. })));
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::TakerExit { .. })));
     }
 
     #[test]

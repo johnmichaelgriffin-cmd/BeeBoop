@@ -16,6 +16,40 @@ use crate::types::{BBO, OrderBook, PriceLevel, RecordedEvent, TickSize, Trade};
 
 const MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const GAMMA_API: &str = "https://gamma-api.polymarket.com";
+const CLOB_API: &str = "https://clob.polymarket.com";
+
+/// REST fallback: poll best ask/bid from CLOB /book endpoint.
+/// Used when WebSocket is flaky.
+pub async fn poll_book_rest(token_id: &str) -> Option<(f64, f64)> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/book", CLOB_API))
+        .query(&[("token_id", token_id)])
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?;
+
+    let body: serde_json::Value = resp.json().await.ok()?;
+
+    let best_ask = body.get("asks")
+        .and_then(|a| a.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()))
+                .reduce(f64::min)
+        })?;
+
+    let best_bid = body.get("bids")
+        .and_then(|b| b.as_array())
+        .and_then(|arr| {
+            arr.iter()
+                .filter_map(|l| l.get("price").and_then(|p| p.as_str()).and_then(|s| s.parse::<f64>().ok()))
+                .reduce(f64::max)
+        })?;
+
+    Some((best_bid, best_ask))
+}
 
 /// Token info with UP/DN label.
 #[derive(Debug, Clone)]
@@ -163,12 +197,13 @@ async fn connect_and_stream(
     }
 
     // Subscribe to all event types for our tokens
-    let sub = SubscribeMsg {
-        r#type: "market".to_string(),
-        assets_ids: token_ids.to_vec(),
-        custom_feature_enabled: true,
-    };
-    let sub_json = serde_json::to_string(&sub)?;
+    // Build subscription JSON manually to control exact field names
+    let sub_json = serde_json::json!({
+        "type": "market",
+        "assets_ids": token_ids,
+        "custom_feature_enabled": true,
+    }).to_string();
+    info!("market_ws: sending subscription: {}", &sub_json[..200.min(sub_json.len())]);
     write.send(Message::Text(sub_json.into())).await?;
 
     info!("market_ws: subscribed, listening for events...");
