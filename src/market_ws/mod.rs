@@ -80,6 +80,7 @@ pub enum MarketEvent {
 struct SubscribeMsg {
     r#type: String,
     assets_ids: Vec<String>,
+    custom_feature_enabled: bool,
 }
 
 /// Run the market WebSocket connection loop.
@@ -128,13 +129,26 @@ async fn connect_and_stream(
 
     // Subscribe to all event types for our tokens
     let sub = SubscribeMsg {
-        r#type: "subscribe".to_string(),
+        r#type: "market".to_string(),
         assets_ids: token_ids.to_vec(),
+        custom_feature_enabled: true,
     };
     let sub_json = serde_json::to_string(&sub)?;
     write.send(Message::Text(sub_json.into())).await?;
 
     info!("market_ws: subscribed, listening for events...");
+
+    // Spawn PING keepalive task (every 10s)
+    let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+            if ping_tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
 
     // Track window boundary — reconnect every 5 min to pick up new tokens
     let now = chrono::Utc::now().timestamp();
@@ -150,50 +164,57 @@ async fn connect_and_stream(
             break;
         }
 
-        // Use timeout so we can check the reconnect timer
-        let msg = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            read.next(),
-        ).await;
+        tokio::select! {
+            // Handle PING keepalive
+            _ = ping_rx.recv() => {
+                let _ = write.send(Message::Ping(vec![].into())).await;
+            }
 
-        match msg {
-            Ok(Some(Ok(Message::Text(text)))) => {
-                let local_recv_us = chrono::Utc::now().timestamp_micros();
-                let text_str: &str = text.as_ref();
+            // Handle incoming messages with timeout
+            msg = tokio::time::timeout(std::time::Duration::from_secs(15), read.next()) => {
+                match msg {
+                    Ok(Some(Ok(Message::Text(text)))) => {
+                        let local_recv_us = chrono::Utc::now().timestamp_micros();
+                        let text_str: &str = text.as_ref();
 
-                // Record raw event
-                let raw = RecordedEvent {
-                    local_recv_us,
-                    source: "market_ws".to_string(),
-                    event_type: "raw".to_string(),
-                    raw_json: text_str.to_string(),
-                };
-                let _ = tx.send(MarketEvent::Raw(raw));
+                        // Record raw event
+                        let raw = RecordedEvent {
+                            local_recv_us,
+                            source: "market_ws".to_string(),
+                            event_type: "raw".to_string(),
+                            raw_json: text_str.to_string(),
+                        };
+                        let _ = tx.send(MarketEvent::Raw(raw));
 
-                // Parse and dispatch
-                if let Err(e) = parse_and_dispatch(text_str, local_recv_us, tx) {
-                    warn!("market_ws: parse error: {}", e);
+                        // Parse and dispatch
+                        if let Err(e) = parse_and_dispatch(text_str, local_recv_us, tx) {
+                            warn!("market_ws: parse error: {}", e);
+                        }
+                    }
+                    Ok(Some(Ok(Message::Ping(data)))) => {
+                        let _ = write.send(Message::Pong(data)).await;
+                    }
+                    Ok(Some(Ok(Message::Pong(_)))) => {
+                        // Server responded to our PING — connection is alive
+                    }
+                    Ok(Some(Ok(Message::Close(_)))) => {
+                        info!("market_ws: received close frame");
+                        break;
+                    }
+                    Ok(Some(Err(e))) => {
+                        return Err(e.into());
+                    }
+                    Ok(None) => {
+                        info!("market_ws: stream ended");
+                        break;
+                    }
+                    Err(_) => {
+                        warn!("market_ws: no data for 15s, reconnecting...");
+                        break;
+                    }
+                    _ => {}
                 }
             }
-            Ok(Some(Ok(Message::Ping(data)))) => {
-                let _ = write.send(Message::Pong(data)).await;
-            }
-            Ok(Some(Ok(Message::Close(_)))) => {
-                info!("market_ws: received close frame");
-                break;
-            }
-            Ok(Some(Err(e))) => {
-                return Err(e.into());
-            }
-            Ok(None) => {
-                info!("market_ws: stream ended");
-                break;
-            }
-            Err(_) => {
-                // Timeout — just loop back to check reconnect timer
-                continue;
-            }
-            _ => {}
         }
     }
 
