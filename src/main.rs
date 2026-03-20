@@ -575,9 +575,14 @@ async fn main() {
                                         info!(">>> WAITING FOR SETTLEMENT... attempt {}/10 ({}s)", attempt, attempt * 3);
                                     }
                                     if !settled {
-                                        // After 30s still no balance — use estimate, shave 5%
-                                        actual_shares = (shares_est * 0.95).floor();
-                                        warn!(">>> SETTLEMENT TIMEOUT after 30s — using {:.0}sh (95% of estimate)", actual_shares);
+                                        // After 30s still no balance — use estimate directly
+                                        actual_shares = shares_est;
+                                        warn!(">>> SETTLEMENT TIMEOUT after 30s — using estimate {:.1}sh", actual_shares);
+                                    }
+                                    // Never let shares be 0 if we know we bought
+                                    if actual_shares < 1.0 {
+                                        actual_shares = shares_est;
+                                        warn!(">>> SHARES TOO LOW ({:.2}), using estimate {:.1}sh", actual_shares, shares_est);
                                     }
                                     position.shares = actual_shares;
 
