@@ -381,11 +381,25 @@ pub fn evaluate_scalp(
                 }
             }
 
-            // NO signal reversal exit — hold to resolution if underwater
-            // NO time stop exit — hold to resolution if target not hit
-            // Only sell when profitable. If we're wrong, sweeper redeems at $0 or $1.
+            // After 8s without target hit: post GTC sell at entry+10% and let it rest
+            // If someone fills it before resolution, great. If not, hold to resolution.
+            if hold_ms >= EXIT_TIME_STOP_MS && position.exit_order_id.is_none() {
+                let target_price = position.entry_price * (1.0 + EXIT_TARGET_PCT);
+                let tick = if position.token_id == state.up_token_id { state.tick_size_up } else { state.tick_size_dn };
+                let quantized = quantize_sell(target_price, tick);
+                actions.push(StrategyAction::MakerExit {
+                    token_id: position.token_id.clone(),
+                    shares: position.shares,
+                    price: quantized,
+                    reason: format!(
+                        "RESTING SELL: entry={:.0}c target={:.0}c (+10%) — hold to resolution if no fill",
+                        position.entry_price * 100.0, quantized * 100.0,
+                    ),
+                });
+                return actions;
+            }
 
-            // Otherwise hold
+            // Otherwise hold — never sell at a loss
             actions.push(StrategyAction::Hold);
         }
 
