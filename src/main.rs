@@ -164,6 +164,11 @@ async fn main() {
         .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
         .init();
 
+    // Install rustls crypto provider (required for TLS WebSocket connections)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // Load config
     dotenvy::dotenv().ok();
     let config = load_config();
