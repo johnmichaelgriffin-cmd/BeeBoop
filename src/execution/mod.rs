@@ -175,21 +175,22 @@ impl ExecutionEngine {
         let key_uuid = Uuid::parse_str(ak).map_err(|e| format!("bad uuid: {}", e))?;
         let creds = Credentials::new(key_uuid, secret.to_string(), pass.to_string());
 
-        // Use EOA signature type — buys work with this.
-        // Sells TBD — may need settlement wait (MATCHED→MINED) before selling.
+        // GnosisSafe signature type — Safe address is auto-derived from EOA.
+        // Auth succeeded with this on 2026-03-20T17:13.
+        // Safe = 0x2ef913a175aa06d31dbbedf7915ae0fbabb54db4
         let safe_addr = polymarket_client_sdk::derive_safe_wallet(local_signer.address(), POLYGON);
-        info!("execution: EOA = {:?}, Safe = {:?} (for reference)", local_signer.address(), safe_addr);
+        info!("execution: EOA = {:?}, Safe = {:?}", local_signer.address(), safe_addr);
 
         let authed = base
             .authentication_builder(&local_signer)
             .credentials(creds)
-            .signature_type(SignatureType::Eoa)
+            .signature_type(SignatureType::GnosisSafe)
             .authenticate()
             .await
             .map_err(|e| format!("auth: {}", e))?;
 
         let elapsed = start.elapsed();
-        info!("execution: authenticated as EOA in {:.0}ms — cached forever", elapsed.as_millis());
+        info!("execution: authenticated as GnosisSafe in {:.0}ms — cached forever", elapsed.as_millis());
 
         *self.sdk_client.write().await = Some(authed);
         *self.signer.write().await = Some(local_signer);
