@@ -268,6 +268,36 @@ impl ExecutionEngine {
         Some(format!("{:?}", signer.address()))
     }
 
+    /// Check USDC.e balance on-chain (for wallet monitoring).
+    pub async fn check_usdc_balance(&self, wallet_address: &str) -> Result<f64, String> {
+        let addr_clean = if wallet_address.starts_with("0x") { &wallet_address[2..] } else { wallet_address };
+        let addr_padded = format!("{:0>64}", addr_clean.to_lowercase());
+        // balanceOf(address) selector = 0x70a08231
+        let call_data = format!("0x70a08231{}", addr_padded);
+        let body = serde_json::json!({
+            "jsonrpc": "2.0", "method": "eth_call",
+            "params": [{"to": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174", "data": call_data}, "latest"],
+            "id": 1
+        });
+        let client = reqwest::Client::new();
+        let resp = client.post(POLYGON_RPC).json(&body).send().await.map_err(|e| format!("rpc: {}", e))?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| format!("json: {}", e))?;
+        let hex = json.get("result").and_then(|r| r.as_str()).ok_or("no result")?;
+        let raw = u128::from_str_radix(hex.trim_start_matches("0x"), 16).map_err(|e| format!("hex: {}", e))?;
+        Ok(raw as f64 / 1_000_000.0)
+    }
+
+    /// Check CLOB balance-allowance for a conditional token (what the CLOB thinks is available).
+    /// This is more reliable than on-chain checks because it accounts for reserved amounts.
+    pub async fn check_clob_balance(&self, token_id: &str) -> Result<f64, String> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/balance-allowance?asset_type=CONDITIONAL&token_id={}", CLOB_BASE, token_id);
+        let resp = client.get(&url).send().await.map_err(|e| format!("http: {}", e))?;
+        let json: serde_json::Value = resp.json().await.map_err(|e| format!("json: {}", e))?;
+        let balance = json.get("balance").and_then(|b| b.as_str()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        Ok(balance)
+    }
+
     // ── HOT PATH: Order methods ─────────────────────────────────
     // These acquire READ locks only (non-blocking when no writes).
 
@@ -433,17 +463,33 @@ impl ExecutionEngine {
 
     /// FOK SELL at a minimum price — won't dump below this.
     pub async fn do_fok_sell_at_price(client: &AuthedClient, signer: &PrivateKeySigner, token_u256: U256, shares: f64, min_price: f64) -> Result<OrderResult, String> {
-        use polymarket_client_sdk::clob::types::{OrderType, Side};
-        let size_dec = Decimal::from_str(&format!("{:.2}", shares)).map_err(|e| format!("dec: {}", e))?;
-        // Round to 2 decimal places to match tick size (0.01)
+        use polymarket_client_sdk::clob::types::{Amount, OrderType, Side};
+
+        // Use market_order() for FOK SELL — NOT limit_order()
+        // Per Polymarket docs: FOK/FAK are market orders, SELL specifies shares as amount
+        let shares_rounded = (shares * 100.0).floor() / 100.0; // round down to avoid over-selling
+        let amount = Amount::shares(
+            Decimal::from_str(&format!("{:.2}", shares_rounded)).map_err(|e| format!("dec: {}", e))?
+        ).map_err(|e| format!("amount: {}", e))?;
+
+        // Price floor as worst acceptable price
         let price_rounded = (min_price * 100.0).round() / 100.0;
         let price_dec = Decimal::from_str(&format!("{:.2}", price_rounded)).map_err(|e| format!("dec: {}", e))?;
-        let order = client.limit_order().token_id(token_u256).size(size_dec).price(price_dec)
-            .side(Side::Sell).order_type(OrderType::FOK)
-            .build().await.map_err(|e| format!("build: {}", e))?;
+
+        info!("FOK SELL building: {:.2}sh market_order, price_floor={:.2}, token={}", shares_rounded, price_rounded, token_u256);
+
+        let order = client.market_order()
+            .token_id(token_u256)
+            .amount(amount)
+            .price(price_dec)
+            .side(Side::Sell)
+            .order_type(OrderType::FOK)
+            .build().await
+            .map_err(|e| format!("build: {}", e))?;
+
         let signed = client.sign(signer, order).await.map_err(|e| format!("sign: {}", e))?;
         let resp = client.post_order(signed).await.map_err(|e| format!("post: {}", e))?;
-        info!("FOK SELL result: id={} success={} status={:?} err={:?} min_price={:.0}c", resp.order_id, resp.success, resp.status, resp.error_msg, min_price*100.0);
+        info!("FOK SELL result: id={} success={} status={:?} err={:?}", resp.order_id, resp.success, resp.status, resp.error_msg);
         Ok(OrderResult { order_id: resp.order_id, success: resp.success, status: format!("{:?}", resp.status), error: resp.error_msg, latency_us: 0 })
     }
 

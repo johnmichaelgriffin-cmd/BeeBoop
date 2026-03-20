@@ -421,9 +421,31 @@ async fn main() {
             let mut maker_count = 0u64;
             let mut taker_count = 0u64;
             let mut hold_count = 0u64;
+            let mut last_balance_check_us: i64 = 0;
+            let start_balance_usdc: f64 = {
+                let wallet = exec_strat.wallet_address().unwrap_or_default();
+                exec_strat.check_usdc_balance(&wallet).await.unwrap_or(0.0)
+            };
+            let min_balance_usdc: f64 = 50.0; // Stop if USDC drops below $50
+            info!("💰 Starting USDC balance: ${:.2} | min threshold: ${:.2}", start_balance_usdc, min_balance_usdc);
 
             loop {
                 interval.tick().await;
+
+                // ── Wallet balance check every 5 minutes ──────────
+                let now_us = chrono::Utc::now().timestamp_micros();
+                if now_us - last_balance_check_us > 300_000_000 { // 5 min in microseconds
+                    last_balance_check_us = now_us;
+                    let wallet = exec_strat.wallet_address().unwrap_or_default();
+                    if let Ok(usdc_bal) = exec_strat.check_usdc_balance(&wallet).await {
+                        let session_pnl = usdc_bal - start_balance_usdc;
+                        info!("💰 WALLET CHECK: ${:.2} USDC | session PnL: ${:.2}", usdc_bal, session_pnl);
+                        if usdc_bal < min_balance_usdc {
+                            error!("🛑 USDC balance ${:.2} below ${:.2} minimum — STOPPING BOT", usdc_bal, min_balance_usdc);
+                            risk.kill_switch_triggered = true;
+                        }
+                    }
+                }
 
                 let s = state_strat.read().await;
 
@@ -509,24 +531,34 @@ async fn main() {
                                     position.entry_order_id = Some(r.order_id.clone());
                                     sell_retry_count = 0; // reset for new position
 
-                                    // Check on-chain balance to know EXACT shares we hold
-                                    let wallet = exec_strat.wallet_address().unwrap_or_default();
-                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await; // wait for chain
-                                    match exec_strat.check_token_balance(&wallet, token_id).await {
-                                        Ok(actual_shares) if actual_shares > 0.0 => {
-                                            position.shares = actual_shares;
-                                            info!(">>> BALANCE CHECK: {:.1}sh on-chain (estimated {:.0}sh)", actual_shares, shares_est);
+                                    // Wait for CLOB settlement then check available balance
+                                    // Try CLOB balance (accounts for reservations), fall back to on-chain
+                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    let mut actual_shares = shares_est;
+
+                                    // Try CLOB balance-allowance first (most accurate)
+                                    match exec_strat.check_clob_balance(token_id).await {
+                                        Ok(bal) if bal > 0.0 => {
+                                            actual_shares = bal;
+                                            info!(">>> CLOB BALANCE: {:.1}sh available (est {:.0}sh)", bal, shares_est);
                                         }
-                                        Ok(_) => {
-                                            // Balance is 0 — might not have settled yet, use estimate
-                                            position.shares = shares_est;
-                                            warn!(">>> BALANCE CHECK: 0 on-chain, using estimate {:.0}sh", shares_est);
-                                        }
-                                        Err(e) => {
-                                            position.shares = shares_est;
-                                            warn!(">>> BALANCE CHECK FAILED: {}, using estimate {:.0}sh", e, shares_est);
+                                        _ => {
+                                            // Fall back to on-chain balance
+                                            let wallet = exec_strat.wallet_address().unwrap_or_default();
+                                            match exec_strat.check_token_balance(&wallet, token_id).await {
+                                                Ok(bal) if bal > 0.0 => {
+                                                    actual_shares = bal;
+                                                    info!(">>> ON-CHAIN BALANCE: {:.1}sh (est {:.0}sh)", bal, shares_est);
+                                                }
+                                                _ => {
+                                                    // Use estimate but shave 1% to avoid over-selling
+                                                    actual_shares = (shares_est * 0.99).floor();
+                                                    warn!(">>> BALANCE CHECK: both failed, using {:.0}sh (99% of estimate)", actual_shares);
+                                                }
+                                            }
                                         }
                                     }
+                                    position.shares = actual_shares;
 
                                     let target_sell = ask * 1.10; // 10% target
                                     info!(
