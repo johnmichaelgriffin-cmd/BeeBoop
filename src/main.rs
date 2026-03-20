@@ -491,35 +491,32 @@ async fn main() {
                             position.side_label = side_label.clone();
                             position.entry_time_us = chrono::Utc::now().timestamp_micros();
 
-                            info!(">>> ENTRY FOK: {} ${:.2} | {}", side_label, spend_usdc, reason);
+                            let ask = if *side_label == "UP" {
+                                market_state.up_best_ask.unwrap_or(0.5)
+                            } else {
+                                market_state.dn_best_ask.unwrap_or(0.5)
+                            };
+                            let shares_est = spend_usdc / ask;
+                            info!(">>> ENTRY FOK: {} ${:.2} ~{:.0}sh @ {:.0}c | {}", side_label, spend_usdc, shares_est, ask*100.0, reason);
+
                             let result = exec_strat.taker_fok_buy(token_id, *spend_usdc).await;
                             match &result {
                                 Ok(ref r) if r.success => {
-                                    // Transition to LONG (in paper mode, simulate fill)
-                                    let ask = if *side_label == "UP" {
-                                        market_state.up_best_ask.unwrap_or(0.5)
-                                    } else {
-                                        market_state.dn_best_ask.unwrap_or(0.5)
-                                    };
                                     position.state = PositionState::Long;
-                                    position.token_id = token_id.clone();
-                                    position.side_label = side_label.clone();
                                     position.entry_price = ask;
-                                    position.shares = spend_usdc / ask;
-                                    position.entry_time_us = chrono::Utc::now().timestamp_micros();
+                                    position.shares = shares_est;
                                     position.entry_order_id = Some(r.order_id.clone());
+                                    let target_sell = ask * 1.10; // 10% target
                                     info!(
-                                        ">>> POSITION: LONG {} {:.1}sh @ {:.0}c",
-                                        side_label, position.shares, ask * 100.0
+                                        ">>> FILLED! LONG {} {:.0}sh @ {:.0}c | target sell @ {:.0}c (+10%) | order={}",
+                                        side_label, shares_est, ask * 100.0, target_sell * 100.0, r.order_id
                                     );
                                 }
                                 Ok(ref r) => {
-                                    // Order posted but not successful (e.g. rejected)
-                                    warn!(">>> ENTRY REJECTED: {} | back to FLAT", r.status);
+                                    warn!(">>> ENTRY REJECTED: status={} err={:?} | back to FLAT", r.status, r.error);
                                     position = Position::new_flat();
                                 }
                                 Err(ref e) => {
-                                    // Network error etc
                                     warn!(">>> ENTRY ERROR: {} | back to FLAT", e);
                                     position = Position::new_flat();
                                 }
@@ -539,8 +536,10 @@ async fn main() {
                         }
                         StrategyAction::TakerExit { token_id, shares, reason } => {
                             taker_count += 1;
-                            info!(">>> EXIT FOK SELL: {:.1}sh | {}", shares, reason);
-                            let _ = exec_strat.taker_fok_sell(token_id, *shares).await;
+                            // Sell with entry price as floor — never sell at a loss
+                            let min_sell_price = position.entry_price;
+                            info!(">>> EXIT FOK SELL: {:.0}sh floor={:.0}c | {}", shares, min_sell_price*100.0, reason);
+                            let _ = exec_strat.taker_fok_sell(token_id, *shares, min_sell_price).await;
                             // Back to flat
                             let pnl_est = if let Some(bid) = if position.side_label == "UP" {
                                 market_state.up_best_bid

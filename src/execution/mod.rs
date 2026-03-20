@@ -246,7 +246,9 @@ impl ExecutionEngine {
         }
     }
 
-    pub async fn taker_fok_sell(&self, token_id: &str, shares: f64) -> Result<OrderResult, String> {
+    /// FOK SELL with a minimum price floor (won't sell below this).
+    /// Pass entry_price to never sell at a loss.
+    pub async fn taker_fok_sell(&self, token_id: &str, shares: f64, min_price: f64) -> Result<OrderResult, String> {
         let start = std::time::Instant::now();
         if self.paper_mode {
             return Ok(OrderResult { order_id: format!("paper-sell-{}", chrono::Utc::now().timestamp_millis()), success: true, status: "PAPER".into(), error: None, latency_us: 0 });
@@ -256,11 +258,11 @@ impl ExecutionEngine {
         let signer_guard = self.signer.read().await;
         let signer = signer_guard.as_ref().ok_or("no signer")?;
         let token_u256 = self.token_cache.write().await.get_or_parse(token_id)?;
-        let result = Self::do_fok_sell(client, signer, token_u256, shares).await;
+        let result = Self::do_fok_sell_at_price(client, signer, token_u256, shares, min_price).await;
         let elapsed_us = start.elapsed().as_micros() as u64;
         self.telemetry.record("taker_fok_sell", elapsed_us);
         match result {
-            Ok(r) => { info!(">>> FOK SELL {:.0}sh -> {} | {}ms", shares, r.order_id, elapsed_us/1000); Ok(OrderResult { latency_us: elapsed_us, ..r }) }
+            Ok(r) => { info!(">>> FOK SELL {:.0}sh floor={:.0}c -> {} | {}ms", shares, min_price*100.0, r.order_id, elapsed_us/1000); Ok(OrderResult { latency_us: elapsed_us, ..r }) }
             Err(e) => { warn!(">>> FOK SELL FAILED: {} | {}ms", e, elapsed_us/1000); Err(e) }
         }
     }
@@ -321,12 +323,21 @@ impl ExecutionEngine {
 // ── Static order methods — pure logic, no lock acquisition ──────
 
 impl ExecutionEngine {
+    /// FOK BUY: limit order at 99c with FOK type (same as lockprofit.py).
+    /// `spend_usdc` / 0.99 ≈ shares to buy. Fills at market ask via price improvement.
     async fn do_fok_buy(client: &AuthedClient, signer: &PrivateKeySigner, token_u256: U256, spend_usdc: f64) -> Result<OrderResult, String> {
-        use polymarket_client_sdk::clob::types::{Amount, OrderType, Side};
-        let amount = Amount::usdc(Decimal::from_str(&format!("{:.2}", spend_usdc)).map_err(|e| format!("dec: {}", e))?).map_err(|e| format!("amt: {}", e))?;
-        let order = client.market_order().token_id(token_u256).amount(amount).side(Side::Buy).order_type(OrderType::FOK).build().await.map_err(|e| format!("build: {}", e))?;
+        use polymarket_client_sdk::clob::types::{OrderType, Side};
+        // Limit order at 99c — effectively a market order via price improvement
+        // shares = spend / 0.99 (we'll get filled at the actual ask, not 99c)
+        let shares = (spend_usdc / 0.99).floor();
+        let size_dec = Decimal::from_str(&format!("{:.2}", shares)).map_err(|e| format!("dec: {}", e))?;
+        let price_dec = Decimal::from_str("0.99").unwrap();
+        let order = client.limit_order().token_id(token_u256).size(size_dec).price(price_dec)
+            .side(Side::Buy).order_type(OrderType::FOK)
+            .build().await.map_err(|e| format!("build: {}", e))?;
         let signed = client.sign(signer, order).await.map_err(|e| format!("sign: {}", e))?;
         let resp = client.post_order(signed).await.map_err(|e| format!("post: {}", e))?;
+        info!("FOK BUY result: id={} success={} status={:?} err={:?}", resp.order_id, resp.success, resp.status, resp.error_msg);
         Ok(OrderResult { order_id: resp.order_id, success: resp.success, status: format!("{:?}", resp.status), error: resp.error_msg, latency_us: 0 })
     }
 
@@ -342,13 +353,24 @@ impl ExecutionEngine {
         Ok(OrderResult { order_id: resp.order_id, success: resp.success, status: format!("{:?}", resp.status), error: resp.error_msg, latency_us: 0 })
     }
 
+    /// FOK SELL at a specific min price — won't fill below this price.
+    /// Use entry_price as floor so we never sell at a loss.
     async fn do_fok_sell(client: &AuthedClient, signer: &PrivateKeySigner, token_u256: U256, shares: f64) -> Result<OrderResult, String> {
+        // This version is a stub — callers should use do_fok_sell_at_price instead
+        Self::do_fok_sell_at_price(client, signer, token_u256, shares, 0.01).await
+    }
+
+    /// FOK SELL at a minimum price — won't dump below this.
+    pub async fn do_fok_sell_at_price(client: &AuthedClient, signer: &PrivateKeySigner, token_u256: U256, shares: f64, min_price: f64) -> Result<OrderResult, String> {
         use polymarket_client_sdk::clob::types::{OrderType, Side};
         let size_dec = Decimal::from_str(&format!("{:.2}", shares)).map_err(|e| format!("dec: {}", e))?;
-        let price_dec = Decimal::from_str("0.01").unwrap();
-        let order = client.limit_order().token_id(token_u256).size(size_dec).price(price_dec).side(Side::Sell).order_type(OrderType::FOK).build().await.map_err(|e| format!("build: {}", e))?;
+        let price_dec = Decimal::from_str(&format!("{:.4}", min_price)).map_err(|e| format!("dec: {}", e))?;
+        let order = client.limit_order().token_id(token_u256).size(size_dec).price(price_dec)
+            .side(Side::Sell).order_type(OrderType::FOK)
+            .build().await.map_err(|e| format!("build: {}", e))?;
         let signed = client.sign(signer, order).await.map_err(|e| format!("sign: {}", e))?;
         let resp = client.post_order(signed).await.map_err(|e| format!("post: {}", e))?;
+        info!("FOK SELL result: id={} success={} status={:?} err={:?} min_price={:.0}c", resp.order_id, resp.success, resp.status, resp.error_msg, min_price*100.0);
         Ok(OrderResult { order_id: resp.order_id, success: resp.success, status: format!("{:?}", resp.status), error: resp.error_msg, latency_us: 0 })
     }
 
