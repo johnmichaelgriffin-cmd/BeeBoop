@@ -215,14 +215,49 @@ async fn main() {
     let (market_tx, mut market_rx) = mpsc::unbounded_channel::<market_ws::MarketEvent>();
     let (rtds_tx, mut rtds_rx) = mpsc::unbounded_channel::<rtds::RtdsEvent>();
     let (binance_tx, mut binance_rx) = mpsc::unbounded_channel::<binance_l2::BinanceEvent>();
+    let (token_info_tx, mut token_info_rx) = mpsc::unbounded_channel::<Vec<market_ws::TokenInfo>>();
 
     // Market tokens (empty for now — will be populated per-window)
     let market_tokens: Vec<String> = vec![];
 
+    // Spawn token info receiver — updates shared state with UP/DN token IDs
+    let state_tokens = state.clone();
+    tokio::spawn(async move {
+        while let Some(infos) = token_info_rx.recv().await {
+            let mut s = state_tokens.lock().await;
+            let now = chrono::Utc::now().timestamp();
+            let current_wts = now - (now % 300);
+
+            // Find current window's UP and DN tokens
+            for ti in &infos {
+                if ti.window_ts != current_wts {
+                    continue;
+                }
+                let outcome_lower = ti.outcome.to_lowercase();
+                if outcome_lower.contains("up") {
+                    if s.up_token_id != ti.token_id {
+                        info!("state: UP token = {}...{}", &ti.token_id[..8.min(ti.token_id.len())], &ti.token_id[ti.token_id.len().saturating_sub(8)..]);
+                        s.up_token_id = ti.token_id.clone();
+                        s.up_best_ask = None;
+                        s.up_best_bid = None;
+                    }
+                } else if outcome_lower.contains("down") {
+                    if s.dn_token_id != ti.token_id {
+                        info!("state: DN token = {}...{}", &ti.token_id[..8.min(ti.token_id.len())], &ti.token_id[ti.token_id.len().saturating_sub(8)..]);
+                        s.dn_token_id = ti.token_id.clone();
+                        s.dn_best_ask = None;
+                        s.dn_best_bid = None;
+                    }
+                }
+            }
+            s.window_start_ts = current_wts;
+        }
+    });
+
     // Spawn feed tasks
     let market_tokens_clone = market_tokens.clone();
     tokio::spawn(async move {
-        market_ws::run(market_tokens_clone, market_tx).await;
+        market_ws::run(market_tokens_clone, market_tx, Some(token_info_tx)).await;
     });
 
     tokio::spawn(async move {

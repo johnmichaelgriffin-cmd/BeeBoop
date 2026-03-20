@@ -17,15 +17,23 @@ use crate::types::{BBO, OrderBook, PriceLevel, RecordedEvent, TickSize, Trade};
 const MARKET_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const GAMMA_API: &str = "https://gamma-api.polymarket.com";
 
+/// Token info with UP/DN label.
+#[derive(Debug, Clone)]
+pub struct TokenInfo {
+    pub token_id: String,
+    pub outcome: String, // "Up" or "Down"
+    pub window_ts: i64,
+}
+
 /// Fetch BTC 5-min market token IDs for current + next window from Gamma API.
-/// Slug format: btc-updown-5m-{window_timestamp}
-/// Window timestamp = floor(now / 300) * 300
-pub async fn fetch_btc_token_ids() -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+/// Returns labeled tokens (UP/DN) so the strategy knows which side is which.
+pub async fn fetch_btc_tokens() -> Result<(Vec<String>, Vec<TokenInfo>), Box<dyn std::error::Error + Send + Sync>> {
     let client = reqwest::Client::new();
     let now = chrono::Utc::now().timestamp();
     let wts = now - (now % 300);
 
     let mut token_ids = Vec::new();
+    let mut token_infos = Vec::new();
 
     // Fetch current window + next window
     for ts in [wts, wts + 300] {
@@ -44,13 +52,25 @@ pub async fn fetch_btc_token_ids() -> Result<Vec<String>, Box<dyn std::error::Er
             for event in arr {
                 if let Some(markets) = event.get("markets").and_then(|m| m.as_array()) {
                     for market in markets {
+                        let outcome = market.get("groupItemTitle")
+                            .or_else(|| market.get("outcome"))
+                            .and_then(|o| o.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
                         let tokens_raw = market.get("clobTokenIds")
                             .and_then(|t| t.as_str())
                             .unwrap_or("[]");
+
                         if let Ok(parsed) = serde_json::from_str::<Vec<String>>(tokens_raw) {
                             for tid in parsed {
                                 if !tid.is_empty() && !token_ids.contains(&tid) {
-                                    token_ids.push(tid);
+                                    token_ids.push(tid.clone());
+                                    token_infos.push(TokenInfo {
+                                        token_id: tid,
+                                        outcome: outcome.clone(),
+                                        window_ts: ts,
+                                    });
                                 }
                             }
                         }
@@ -60,8 +80,16 @@ pub async fn fetch_btc_token_ids() -> Result<Vec<String>, Box<dyn std::error::Er
         }
     }
 
-    info!("market_ws: fetched {} token IDs for windows {} and {}", token_ids.len(), wts, wts + 300);
-    Ok(token_ids)
+    info!("market_ws: fetched {} tokens for windows {} and {}", token_ids.len(), wts, wts + 300);
+    for ti in &token_infos {
+        info!("market_ws:   {} = {}...{} (window {})",
+            ti.outcome,
+            &ti.token_id[..8.min(ti.token_id.len())],
+            &ti.token_id[ti.token_id.len().saturating_sub(8)..],
+            ti.window_ts,
+        );
+    }
+    Ok((token_ids, token_infos))
 }
 
 /// Events emitted by the market WebSocket.
@@ -89,11 +117,18 @@ struct SubscribeMsg {
 pub async fn run(
     _initial_token_ids: Vec<String>,
     tx: mpsc::UnboundedSender<MarketEvent>,
+    token_info_tx: Option<mpsc::UnboundedSender<Vec<TokenInfo>>>,
 ) {
     loop {
         // Fetch fresh token IDs each connection cycle
-        let token_ids = match fetch_btc_token_ids().await {
-            Ok(ids) if !ids.is_empty() => ids,
+        let (token_ids, token_infos) = match fetch_btc_tokens().await {
+            Ok((ids, infos)) if !ids.is_empty() => {
+                // Send token infos to main for shared state update
+                if let Some(ref info_tx) = token_info_tx {
+                    let _ = info_tx.send(infos.clone());
+                }
+                (ids, infos)
+            }
             Ok(_) => {
                 warn!("market_ws: no token IDs found, retrying in 10s...");
                 tokio::time::sleep(std::time::Duration::from_secs(10)).await;
