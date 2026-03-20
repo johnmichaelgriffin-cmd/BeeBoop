@@ -480,11 +480,21 @@ async fn main() {
                 for action in &actions {
                     match action {
                         StrategyAction::TakerEntry { token_id, spend_usdc, side_label, reason } => {
+                            // CRITICAL: Only enter if we're actually FLAT
+                            if position.state != PositionState::Flat {
+                                continue;
+                            }
                             taker_count += 1;
+                            // Transition to Entering BEFORE the async call to prevent re-entry
+                            position.state = PositionState::Entering;
+                            position.token_id = token_id.clone();
+                            position.side_label = side_label.clone();
+                            position.entry_time_us = chrono::Utc::now().timestamp_micros();
+
                             info!(">>> ENTRY FOK: {} ${:.2} | {}", side_label, spend_usdc, reason);
                             let result = exec_strat.taker_fok_buy(token_id, *spend_usdc).await;
-                            if let Ok(ref r) = result {
-                                if r.success {
+                            match &result {
+                                Ok(ref r) if r.success => {
                                     // Transition to LONG (in paper mode, simulate fill)
                                     let ask = if *side_label == "UP" {
                                         market_state.up_best_ask.unwrap_or(0.5)
@@ -502,6 +512,16 @@ async fn main() {
                                         ">>> POSITION: LONG {} {:.1}sh @ {:.0}c",
                                         side_label, position.shares, ask * 100.0
                                     );
+                                }
+                                Ok(ref r) => {
+                                    // Order posted but not successful (e.g. rejected)
+                                    warn!(">>> ENTRY REJECTED: {} | back to FLAT", r.status);
+                                    position = Position::new_flat();
+                                }
+                                Err(ref e) => {
+                                    // Network error etc
+                                    warn!(">>> ENTRY ERROR: {} | back to FLAT", e);
+                                    position = Position::new_flat();
                                 }
                             }
                             risk.order_count_this_window += 1;
