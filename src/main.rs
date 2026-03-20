@@ -415,6 +415,7 @@ async fn main() {
             let mut risk = RiskLimits::default();
             let mut position = Position::new_flat();
             let mut last_scalp_exit_us: i64 = 0;
+            let mut sell_retry_count: u32 = 0;
             let mut last_signal_log = 0i64;
             let mut total_decisions = 0u64;
             let mut maker_count = 0u64;
@@ -506,6 +507,7 @@ async fn main() {
                                     position.state = PositionState::Long;
                                     position.entry_price = ask;
                                     position.entry_order_id = Some(r.order_id.clone());
+                                    sell_retry_count = 0; // reset for new position
 
                                     // Check on-chain balance to know EXACT shares we hold
                                     let wallet = exec_strat.wallet_address().unwrap_or_default();
@@ -556,44 +558,70 @@ async fn main() {
                         }
                         StrategyAction::TakerExit { token_id, shares, reason } => {
                             taker_count += 1;
-                            let min_sell_price = position.entry_price;
-                            info!(">>> EXIT FOK SELL: {:.0}sh floor={:.0}c | {}", shares, min_sell_price*100.0, reason);
-                            let sell_result = exec_strat.taker_fok_sell(token_id, *shares, min_sell_price).await;
 
-                            let sold = match &sell_result {
-                                Ok(r) if r.success => {
-                                    info!(">>> SELL FILLED: order={}", r.order_id);
-                                    true
-                                }
-                                Ok(r) => {
-                                    warn!(">>> SELL REJECTED: status={} err={:?} — STAYING LONG, will retry", r.status, r.error);
-                                    false
-                                }
-                                Err(e) => {
-                                    warn!(">>> SELL ERROR: {} — STAYING LONG, will retry", e);
-                                    false
-                                }
-                            };
-
-                            if sold {
-                                let pnl_est = if let Some(bid) = if position.side_label == "UP" {
-                                    market_state.up_best_bid
-                                } else {
-                                    market_state.dn_best_bid
-                                } {
-                                    (bid - position.entry_price) * position.shares
-                                } else {
-                                    0.0
-                                };
+                            // If window has ended, don't try to sell — market is closed/resolved
+                            // Just go FLAT and let the sweeper redeem on-chain
+                            if market_state.elapsed_s >= config.cancel_at_s {
                                 info!(
-                                    ">>> POSITION: FLAT (was {} {:.0}sh, est PnL ${:.2}, hold {}ms)",
-                                    position.side_label, position.shares, pnl_est, position.hold_time_ms()
+                                    ">>> WINDOW ENDED — holding {} {:.1}sh to resolution (sweeper will redeem)",
+                                    position.side_label, position.shares
                                 );
                                 position = Position::new_flat();
                                 last_scalp_exit_us = chrono::Utc::now().timestamp_micros();
                                 risk.scalps_this_window += 1;
+                            } else {
+                                let min_sell_price = position.entry_price;
+                                info!(">>> EXIT FOK SELL: {:.1}sh floor={:.0}c | {}", shares, min_sell_price*100.0, reason);
+                                let sell_result = exec_strat.taker_fok_sell(token_id, *shares, min_sell_price).await;
+
+                                let sold = match &sell_result {
+                                    Ok(r) if r.success => {
+                                        info!(">>> SELL FILLED: order={}", r.order_id);
+                                        true
+                                    }
+                                    Ok(r) => {
+                                        warn!(">>> SELL REJECTED: status={} err={:?}", r.status, r.error);
+                                        false
+                                    }
+                                    Err(e) => {
+                                        warn!(">>> SELL ERROR: {}", e);
+                                        false
+                                    }
+                                };
+
+                                if sold {
+                                    let pnl_est = if let Some(bid) = if position.side_label == "UP" {
+                                        market_state.up_best_bid
+                                    } else {
+                                        market_state.dn_best_bid
+                                    } {
+                                        (bid - position.entry_price) * position.shares
+                                    } else {
+                                        0.0
+                                    };
+                                    info!(
+                                        ">>> POSITION: FLAT (SOLD {} {:.1}sh, est PnL ${:.2}, hold {}ms)",
+                                        position.side_label, position.shares, pnl_est, position.hold_time_ms()
+                                    );
+                                    position = Position::new_flat();
+                                    last_scalp_exit_us = chrono::Utc::now().timestamp_micros();
+                                    risk.scalps_this_window += 1;
+                                } else {
+                                    // Sell failed — count retries. After 3 failures, give up and hold to resolution
+                                    sell_retry_count += 1;
+                                    if sell_retry_count >= 3 {
+                                        warn!(">>> SELL FAILED 3x — giving up, holding to resolution");
+                                        position = Position::new_flat();
+                                        last_scalp_exit_us = chrono::Utc::now().timestamp_micros();
+                                        risk.scalps_this_window += 1;
+                                        sell_retry_count = 0;
+                                    } else {
+                                        warn!(">>> SELL FAILED (attempt {}/3) — will retry in 2s", sell_retry_count);
+                                        // Add a delay before retry to avoid spam
+                                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                                    }
+                                }
                             }
-                            // If sell failed, position stays LONG — strategy will retry exit next cycle
                             risk.order_count_this_window += 1;
                         }
                         StrategyAction::CancelAll => {
