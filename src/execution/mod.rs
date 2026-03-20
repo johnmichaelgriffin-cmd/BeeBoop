@@ -184,7 +184,7 @@ impl ExecutionEngine {
         let authed = base
             .authentication_builder(&local_signer)
             .credentials(creds)
-            .signature_type(SignatureType::GnosisSafe)
+            .signature_type(SignatureType::Eoa)
             .authenticate()
             .await
             .map_err(|e| format!("auth: {}", e))?;
