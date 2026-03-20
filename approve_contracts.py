@@ -29,9 +29,10 @@ POLYGON_RPCS = [
 ]
 CHAIN_ID = 137
 
-USDC_E       = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
-CTF          = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
-CTF_EXCHANGE = Web3.to_checksum_address("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
+USDC_E              = Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174")
+CTF                 = Web3.to_checksum_address("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+CTF_EXCHANGE        = Web3.to_checksum_address("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E")
+NEG_RISK_EXCHANGE   = Web3.to_checksum_address("0xC5d563A36AE78145C45a50134d48A1215220f80a")
 
 MAX_UINT256 = 2**256 - 1
 
@@ -162,7 +163,30 @@ else:
     send_tx(usdc.functions.approve(CTF_EXCHANGE, MAX_UINT256))
 print()
 
+# ─── Approval 4: CTF tokens → NegRisk CTF Exchange (for SELLING on neg-risk markets) ─
 print("━" * 50)
-print("✅ All approvals done! Ready to mint + sell.")
+print("4️⃣  CTF tokens → NegRisk CTF Exchange (for CLOB selling on 5-min markets)")
+approved4 = ctf.functions.isApprovedForAll(ADDRESS, NEG_RISK_EXCHANGE).call()
+if approved4:
+    print(f"   Already approved ✓")
+else:
+    print(f"   Approving...")
+    send_tx(ctf.functions.setApprovalForAll(NEG_RISK_EXCHANGE, True))
+print()
+
+# ─── Approval 5: USDC.e → NegRisk CTF Exchange (for trading) ─
+print("━" * 50)
+print("5️⃣  USDC.e → NegRisk CTF Exchange (for CLOB trading on 5-min markets)")
+allowance5 = usdc.functions.allowance(ADDRESS, NEG_RISK_EXCHANGE).call()
+if allowance5 >= MAX_UINT256 // 2:
+    print(f"   Already approved ✓")
+else:
+    print(f"   Current allowance: {allowance5 / 1e6:.2f} USDC")
+    print(f"   Approving max...")
+    send_tx(usdc.functions.approve(NEG_RISK_EXCHANGE, MAX_UINT256))
+print()
+
+print("━" * 50)
+print("✅ All approvals done! Ready to buy + sell on neg-risk markets.")
 print(f"   Wallet: {ADDRESS}")
 print(f"   USDC.e: {usdc_balance / 1e6:.2f}")
