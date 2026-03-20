@@ -110,7 +110,7 @@ pub struct ExecutionEngine {
     pub open_orders: Arc<RwLock<HashMap<String, OrderTracking>>>,
     pub telemetry: Arc<LatencyTracker>,
     pub paper_mode: bool,
-    /// Authenticated SDK client — created once, read-locked for all orders.
+    /// Authenticated SDK client — EOA for all orders.
     sdk_client: Arc<RwLock<Option<AuthedClient>>>,
     /// Cached signer — local crypto only, no network.
     signer: Arc<RwLock<Option<PrivateKeySigner>>>,
@@ -147,7 +147,8 @@ impl ExecutionEngine {
         self.api_passphrase = Some(api_passphrase);
     }
 
-    /// Authenticate ONCE. All subsequent calls use cached client via RwLock::read().
+    /// Authenticate ONCE with EOA. Sell failures are settlement timing, not signature type.
+    /// After buy fills, must wait for on-chain settlement (MATCHED→MINED) before selling.
     pub async fn ensure_auth(&self) -> Result<(), String> {
         {
             if self.sdk_client.read().await.is_some() {
@@ -169,17 +170,13 @@ impl ExecutionEngine {
         use alloy::signers::Signer as _;
         local_signer.set_chain_id(Some(POLYGON));
 
+        let safe_addr = polymarket_client_sdk::derive_safe_wallet(local_signer.address(), POLYGON);
+        info!("execution: EOA = {:?}, Safe = {:?} (for reference)", local_signer.address(), safe_addr);
+
         let config = Config::builder().use_server_time(true).build();
         let base = Client::new(CLOB_BASE, config).map_err(|e| format!("client: {}", e))?;
-
         let key_uuid = Uuid::parse_str(ak).map_err(|e| format!("bad uuid: {}", e))?;
         let creds = Credentials::new(key_uuid, secret.to_string(), pass.to_string());
-
-        // GnosisSafe signature type — Safe address is auto-derived from EOA.
-        // Auth succeeded with this on 2026-03-20T17:13.
-        // Safe = 0x2ef913a175aa06d31dbbedf7915ae0fbabb54db4
-        let safe_addr = polymarket_client_sdk::derive_safe_wallet(local_signer.address(), POLYGON);
-        info!("execution: EOA = {:?}, Safe = {:?}", local_signer.address(), safe_addr);
 
         let authed = base
             .authentication_builder(&local_signer)
@@ -190,7 +187,7 @@ impl ExecutionEngine {
             .map_err(|e| format!("auth: {}", e))?;
 
         let elapsed = start.elapsed();
-        info!("execution: authenticated as GnosisSafe in {:.0}ms — cached forever", elapsed.as_millis());
+        info!("execution: authenticated as EOA in {:.0}ms — cached forever", elapsed.as_millis());
 
         *self.sdk_client.write().await = Some(authed);
         *self.signer.write().await = Some(local_signer);

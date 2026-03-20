@@ -534,32 +534,37 @@ async fn main() {
                                     position.entry_order_id = Some(r.order_id.clone());
                                     sell_retry_count = 0; // reset for new position
 
-                                    // Wait for CLOB settlement then check available balance
-                                    // Try CLOB balance (accounts for reservations), fall back to on-chain
-                                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                                    let mut actual_shares = shares_est;
-
-                                    // Try CLOB balance-allowance first (most accurate)
-                                    match exec_strat.check_clob_balance(token_id).await {
-                                        Ok(bal) if bal > 0.0 => {
-                                            actual_shares = bal;
-                                            info!(">>> CLOB BALANCE: {:.1}sh available (est {:.0}sh)", bal, shares_est);
-                                        }
-                                        _ => {
-                                            // Fall back to on-chain balance
-                                            let wallet = exec_strat.wallet_address().unwrap_or_default();
-                                            match exec_strat.check_token_balance(&wallet, token_id).await {
-                                                Ok(bal) if bal > 0.0 => {
-                                                    actual_shares = bal;
-                                                    info!(">>> ON-CHAIN BALANCE: {:.1}sh (est {:.0}sh)", bal, shares_est);
-                                                }
-                                                _ => {
-                                                    // Use estimate but shave 1% to avoid over-selling
-                                                    actual_shares = (shares_est * 0.99).floor();
-                                                    warn!(">>> BALANCE CHECK: both failed, using {:.0}sh (99% of estimate)", actual_shares);
-                                                }
+                                    // Poll for on-chain settlement — MATCHED doesn't mean tokens are available.
+                                    // Poll every 3s up to 30s until balanceOf > 0.
+                                    let wallet = exec_strat.wallet_address().unwrap_or_default();
+                                    let mut actual_shares = 0.0_f64;
+                                    let mut settled = false;
+                                    for attempt in 1..=10 {
+                                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                        // Check CLOB balance first (includes pending settlements)
+                                        if let Ok(bal) = exec_strat.check_clob_balance(token_id).await {
+                                            if bal > 0.0 {
+                                                actual_shares = bal;
+                                                info!(">>> SETTLEMENT CONFIRMED via CLOB: {:.1}sh (attempt {}/10, {}s)", bal, attempt, attempt * 3);
+                                                settled = true;
+                                                break;
                                             }
                                         }
+                                        // Fall back to on-chain
+                                        if let Ok(bal) = exec_strat.check_token_balance(&wallet, token_id).await {
+                                            if bal > 0.0 {
+                                                actual_shares = bal;
+                                                info!(">>> SETTLEMENT CONFIRMED on-chain: {:.1}sh (attempt {}/10, {}s)", bal, attempt, attempt * 3);
+                                                settled = true;
+                                                break;
+                                            }
+                                        }
+                                        info!(">>> WAITING FOR SETTLEMENT... attempt {}/10 ({}s)", attempt, attempt * 3);
+                                    }
+                                    if !settled {
+                                        // After 30s still no balance — use estimate, shave 5%
+                                        actual_shares = (shares_est * 0.95).floor();
+                                        warn!(">>> SETTLEMENT TIMEOUT after 30s — using {:.0}sh (95% of estimate)", actual_shares);
                                     }
                                     position.shares = actual_shares;
 
