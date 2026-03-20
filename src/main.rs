@@ -230,7 +230,9 @@ async fn main() {
     let market_tokens: Vec<String> = vec![];
 
     // Spawn token info receiver — updates shared state with UP/DN token IDs
+    // Also sets neg_risk=true for each token in the SDK cache (CRITICAL for sells)
     let state_tokens = state.clone();
+    let exec_tokens = exec.clone();
     tokio::spawn(async move {
         while let Some(infos) = token_info_rx.recv().await {
             let mut s = state_tokens.write().await;
@@ -249,6 +251,8 @@ async fn main() {
                         s.up_token_id = ti.token_id.clone();
                         s.up_best_ask = None;
                         s.up_best_bid = None;
+                        // Set neg_risk=true for this token (5-min BTC markets are neg-risk)
+                        exec_tokens.set_neg_risk(&ti.token_id).await;
                     }
                 } else if outcome_lower.contains("down") {
                     if s.dn_token_id != ti.token_id {
@@ -256,6 +260,8 @@ async fn main() {
                         s.dn_token_id = ti.token_id.clone();
                         s.dn_best_ask = None;
                         s.dn_best_bid = None;
+                        // Set neg_risk=true for this token
+                        exec_tokens.set_neg_risk(&ti.token_id).await;
                     }
                 }
             }

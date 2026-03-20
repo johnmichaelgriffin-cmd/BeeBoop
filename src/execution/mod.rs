@@ -203,6 +203,18 @@ impl ExecutionEngine {
         self.tick_sizes.write().await.update(ts);
     }
 
+    /// Set neg_risk=true for a token in the SDK's internal cache.
+    /// CRITICAL: 5-min BTC markets are neg-risk. Without this, sells fail.
+    pub async fn set_neg_risk(&self, token_id: &str) {
+        let client_guard = self.sdk_client.read().await;
+        if let Some(client) = client_guard.as_ref() {
+            if let Ok(token_u256) = U256::from_str(token_id) {
+                client.set_neg_risk(token_u256, true);
+                info!("execution: set neg_risk=true for token {}...{}", &token_id[..8.min(token_id.len())], &token_id[token_id.len().saturating_sub(8)..]);
+            }
+        }
+    }
+
     /// Check on-chain token balance for a specific token ID.
     /// Returns the number of shares we hold (as f64, already divided by 1e6).
     /// Uses the CTF contract's balanceOf(address, tokenId) view call.
