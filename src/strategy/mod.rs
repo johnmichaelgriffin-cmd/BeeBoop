@@ -288,14 +288,9 @@ pub fn evaluate_scalp(
         return actions;
     }
     if state.elapsed_s >= config.cancel_at_s {
-        // Flatten any position before window ends
-        if position.state == PositionState::Long {
-            actions.push(StrategyAction::TakerExit {
-                token_id: position.token_id.clone(),
-                shares: position.shares,
-                reason: "WINDOW END — emergency flatten".to_string(),
-            });
-        }
+        // Window ending — DON'T sell at a loss. Hold to resolution.
+        // Sweeper will redeem winning tokens. Losing tokens go to $0.
+        // Only cancel open orders, don't force-sell positions.
         actions.push(StrategyAction::CancelAll);
         return actions;
     }
@@ -386,32 +381,9 @@ pub fn evaluate_scalp(
                 }
             }
 
-            // Exit condition 2: SIGNAL REVERSAL — signal flipped against our position
-            let our_direction = if position.side_label == "UP" { 1.0 } else { -1.0 };
-            if signal.score * our_direction < EXIT_SIGNAL_REVERSAL {
-                actions.push(StrategyAction::TakerExit {
-                    token_id: position.token_id.clone(),
-                    shares: position.shares,
-                    reason: format!(
-                        "SIGNAL REVERSAL: score={:.3} vs our_dir={:.0} hold={}ms",
-                        signal.score, our_direction, hold_ms,
-                    ),
-                });
-                return actions;
-            }
-
-            // Exit condition 3: TIME STOP — held too long, edge decayed
-            if hold_ms >= EXIT_TIME_STOP_MS {
-                actions.push(StrategyAction::TakerExit {
-                    token_id: position.token_id.clone(),
-                    shares: position.shares,
-                    reason: format!(
-                        "TIME STOP: {}ms >= {}ms",
-                        hold_ms, EXIT_TIME_STOP_MS,
-                    ),
-                });
-                return actions;
-            }
+            // NO signal reversal exit — hold to resolution if underwater
+            // NO time stop exit — hold to resolution if target not hit
+            // Only sell when profitable. If we're wrong, sweeper redeems at $0 or $1.
 
             // Otherwise hold
             actions.push(StrategyAction::Hold);
