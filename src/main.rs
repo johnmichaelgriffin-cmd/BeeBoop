@@ -18,7 +18,7 @@ mod sim;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 
 use crate::execution::ExecutionEngine;
@@ -217,7 +217,7 @@ async fn main() {
     }
 
     // Shared state
-    let state = Arc::new(Mutex::new(SharedState::default()));
+    let state = Arc::new(RwLock::new(SharedState::default()));
 
     // Create channels
     let (market_tx, mut market_rx) = mpsc::unbounded_channel::<market_ws::MarketEvent>();
@@ -232,7 +232,7 @@ async fn main() {
     let state_tokens = state.clone();
     tokio::spawn(async move {
         while let Some(infos) = token_info_rx.recv().await {
-            let mut s = state_tokens.lock().await;
+            let mut s = state_tokens.write().await;
             let now = chrono::Utc::now().timestamp();
             let current_wts = now - (now % 300);
 
@@ -276,13 +276,13 @@ async fn main() {
         binance_l2::run(binance_tx).await;
     });
 
-    // REST fallback: poll token prices every 2s in case WS is flaky
+    // REST fallback: poll token prices every 500ms for speed
     let state_rest = state.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
             interval.tick().await;
-            let s = state_rest.lock().await;
+            let s = state_rest.read().await;
             let up_id = s.up_token_id.clone();
             let dn_id = s.dn_token_id.clone();
             drop(s);
@@ -297,7 +297,7 @@ async fn main() {
                 market_ws::poll_book_rest(&dn_id),
             );
 
-            let mut s = state_rest.lock().await;
+            let mut s = state_rest.write().await;
             if let Some((bid, ask)) = up_result {
                 s.up_best_bid = Some(bid);
                 s.up_best_ask = Some(ask);
@@ -330,7 +330,7 @@ async fn main() {
             // Update shared state with token BBO
             match &event {
                 market_ws::MarketEvent::BestBidAsk(bbo) => {
-                    let mut s = state1.lock().await;
+                    let mut s = state1.write().await;
                     if bbo.token_id == s.up_token_id {
                         s.up_best_ask = bbo.best_ask;
                         s.up_best_bid = bbo.best_bid;
@@ -340,7 +340,7 @@ async fn main() {
                     }
                 }
                 market_ws::MarketEvent::TickSizeChange(ts) => {
-                    let mut s = state1.lock().await;
+                    let mut s = state1.write().await;
                     if ts.token_id == s.up_token_id {
                         s.tick_size_up = ts.tick_size;
                     } else if ts.token_id == s.dn_token_id {
@@ -359,7 +359,7 @@ async fn main() {
             match &event {
                 rtds::RtdsEvent::Raw(raw) => rec2.record(raw),
                 rtds::RtdsEvent::Price(ref p) => {
-                    let mut s = state2.lock().await;
+                    let mut s = state2.write().await;
                     match p.source {
                         RefSource::RtdsChainlink => {
                             s.chainlink_price = p.price;
@@ -383,11 +383,11 @@ async fn main() {
             match &event {
                 binance_l2::BinanceEvent::Raw(raw) => rec3.record(raw),
                 binance_l2::BinanceEvent::Obi(obi) => {
-                    let mut s = state3.lock().await;
+                    let mut s = state3.write().await;
                     s.obi = Some(obi.clone());
                 }
                 binance_l2::BinanceEvent::MidPrice(ref p) => {
-                    let mut s = state3.lock().await;
+                    let mut s = state3.write().await;
                     s.binance_mid = p.price;
                     let ts = p.local_recv_ts;
                     s.binance_mid_history.push_back((ts, p.price));
@@ -409,8 +409,8 @@ async fn main() {
         let config_strat = config.clone();
 
         tokio::spawn(async move {
-            info!("Strategy loop starting (500ms cycle)...");
-            let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+            info!("Strategy loop starting (100ms cycle — SPEED MODE)...");
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(100));
             let mut risk = RiskLimits::default();
             let mut position = Position::new_flat();
             let mut last_scalp_exit_us: i64 = 0;
@@ -423,7 +423,7 @@ async fn main() {
             loop {
                 interval.tick().await;
 
-                let s = state_strat.lock().await;
+                let s = state_strat.read().await;
 
                 // Skip if no data yet
                 if s.binance_mid <= 0.0 {
@@ -452,7 +452,7 @@ async fn main() {
                 // Log signal every 5 seconds
                 let now = chrono::Utc::now().timestamp();
                 if now - last_signal_log >= 5 {
-                    let s = state_strat.lock().await;
+                    let s = state_strat.read().await;
                     info!(
                         "SIGNAL: score={:.3} mode={:?} | BN=${:.2} CL=${:.2} lag={:.1}bps ret2s={:.1}bps | OBI={:.3} | UP ask={} DN ask={}",
                         signal.score,
