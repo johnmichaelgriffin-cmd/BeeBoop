@@ -175,16 +175,23 @@ impl ExecutionEngine {
         let key_uuid = Uuid::parse_str(ak).map_err(|e| format!("bad uuid: {}", e))?;
         let creds = Credentials::new(key_uuid, secret.to_string(), pass.to_string());
 
+        // Use GnosisSafe signature type — Polymarket routes tokens to a
+        // deterministic Safe proxy wallet derived from your EOA via CREATE2.
+        // Buys debit USDC from EOA, but tokens land in the Safe.
+        // Sells must sign as the Safe owner to access those tokens.
+        let safe_addr = polymarket_client_sdk::derive_safe_wallet(local_signer.address(), POLYGON);
+        info!("execution: EOA = {:?}, Safe = {:?}", local_signer.address(), safe_addr);
+
         let authed = base
             .authentication_builder(&local_signer)
             .credentials(creds)
-            .signature_type(SignatureType::Eoa)
+            .signature_type(SignatureType::GnosisSafe)
             .authenticate()
             .await
             .map_err(|e| format!("auth: {}", e))?;
 
         let elapsed = start.elapsed();
-        info!("execution: authenticated in {:.0}ms — cached forever", elapsed.as_millis());
+        info!("execution: authenticated as GnosisSafe in {:.0}ms — cached forever", elapsed.as_millis());
 
         *self.sdk_client.write().await = Some(authed);
         *self.signer.write().await = Some(local_signer);
