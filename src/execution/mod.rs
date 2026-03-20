@@ -160,8 +160,10 @@ impl ExecutionEngine {
         let start = std::time::Instant::now();
 
         let pk_clean = if pk.starts_with("0x") { &pk[2..] } else { pk.as_str() };
-        let local_signer = PrivateKeySigner::from_str(pk_clean)
+        let mut local_signer = PrivateKeySigner::from_str(pk_clean)
             .map_err(|e| format!("bad key: {}", e))?;
+        use alloy::signers::Signer as _;
+        local_signer.set_chain_id(Some(POLYGON));
 
         let config = Config::builder().use_server_time(true).build();
         let base = Client::new(CLOB_BASE, config).map_err(|e| format!("client: {}", e))?;
