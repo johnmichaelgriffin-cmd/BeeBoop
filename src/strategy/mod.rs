@@ -362,71 +362,59 @@ pub fn evaluate_scalp(
                 state.dn_best_bid
             };
 
-            // Exit condition 1: TARGET HIT — bid is above entry + 10%
-            if let Some(bid) = current_bid {
-                let profit_pct = (bid - position.entry_price) / position.entry_price;
-                if profit_pct >= EXIT_TARGET_PCT {
-                    actions.push(StrategyAction::TakerExit {
+            // ONLY sell via GTC at entry+10%. NEVER FOK sell (causes losses).
+            // Post GTC resting sell immediately. If someone fills it, profit.
+            // If not, hold to resolution — sweeper redeems winners.
+            if position.exit_order_id.is_none() {
+                let target_price = position.entry_price * (1.0 + EXIT_TARGET_PCT);
+                let tick = if position.token_id == state.up_token_id { state.tick_size_up } else { state.tick_size_dn };
+                let quantized = quantize_sell(target_price, tick);
+
+                if let Some(bid) = current_bid {
+                    let profit_pct = (bid - position.entry_price) / position.entry_price;
+                    if profit_pct >= EXIT_TARGET_PCT {
+                        // Bid is already above target — post GTC at current bid to fill fast
+                        let bid_quantized = quantize_sell(bid, tick);
+                        actions.push(StrategyAction::MakerExit {
+                            token_id: position.token_id.clone(),
+                            shares: position.shares,
+                            price: bid_quantized.max(quantized), // never below entry+10%
+                            reason: format!(
+                                "TARGET HIT: entry={:.0}c bid={:.0}c profit={:.1}% — GTC sell at {:.0}c",
+                                position.entry_price * 100.0, bid * 100.0,
+                                profit_pct * 100.0, bid_quantized.max(quantized) * 100.0,
+                            ),
+                        });
+                        return actions;
+                    }
+                }
+
+                // After 8s: post resting GTC at entry+10%, hold to resolution if no fill
+                if hold_ms >= EXIT_TIME_STOP_MS {
+                    actions.push(StrategyAction::MakerExit {
                         token_id: position.token_id.clone(),
                         shares: position.shares,
+                        price: quantized,
                         reason: format!(
-                            "TARGET HIT: entry={:.0}c bid={:.0}c profit={:.1}% hold={}ms",
-                            position.entry_price * 100.0,
-                            bid * 100.0,
-                            profit_pct * 100.0,
-                            hold_ms,
+                            "RESTING SELL: entry={:.0}c target={:.0}c (+10%) — hold to resolution if no fill",
+                            position.entry_price * 100.0, quantized * 100.0,
                         ),
                     });
                     return actions;
                 }
             }
 
-            // After 8s without target hit: post GTC sell at entry+10% and let it rest
-            // If someone fills it before resolution, great. If not, hold to resolution.
-            if hold_ms >= EXIT_TIME_STOP_MS && position.exit_order_id.is_none() {
-                let target_price = position.entry_price * (1.0 + EXIT_TARGET_PCT);
-                let tick = if position.token_id == state.up_token_id { state.tick_size_up } else { state.tick_size_dn };
-                let quantized = quantize_sell(target_price, tick);
-                actions.push(StrategyAction::MakerExit {
-                    token_id: position.token_id.clone(),
-                    shares: position.shares,
-                    price: quantized,
-                    reason: format!(
-                        "RESTING SELL: entry={:.0}c target={:.0}c (+10%) — hold to resolution if no fill",
-                        position.entry_price * 100.0, quantized * 100.0,
-                    ),
-                });
-                return actions;
-            }
-
             // Otherwise hold — never sell at a loss
             actions.push(StrategyAction::Hold);
         }
 
-        // ── EXITING: waiting for exit fill ──────────────────
+        // ── EXITING: GTC sell resting on book ────────────────
         PositionState::Exiting => {
-            let exit_elapsed_ms = if position.exit_posted_at_us > 0 {
-                (now_us - position.exit_posted_at_us) / 1000
-            } else {
-                0
-            };
-
-            // If maker exit hasn't filled after timeout, go taker
-            if exit_elapsed_ms > MAKER_EXIT_TIMEOUT_MS {
-                // Cancel the maker exit and do a taker exit
-                if let Some(ref oid) = position.exit_order_id {
-                    actions.push(StrategyAction::CancelOrder(oid.clone()));
-                }
-                actions.push(StrategyAction::TakerExit {
-                    token_id: position.token_id.clone(),
-                    shares: position.shares,
-                    reason: format!(
-                        "MAKER EXIT TIMEOUT: {}ms, switching to taker",
-                        exit_elapsed_ms,
-                    ),
-                });
-            }
-            // Otherwise wait for fill
+            // GTC sell is on the book at entry+10%. Just wait.
+            // If it fills, great — main loop detects via user WS.
+            // If it doesn't fill before resolution, hold to resolution.
+            // NEVER switch to taker/FOK sell — that causes losses.
+            actions.push(StrategyAction::Hold);
         }
     }
 
@@ -498,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn test_long_exit_on_target() {
+    fn test_long_exit_on_target_posts_gtc() {
         let state = MarketState {
             elapsed_s: 20,
             up_token_id: "up_123".into(),
@@ -516,15 +504,17 @@ mod tests {
         pos.entry_time_us = chrono::Utc::now().timestamp_micros() - 1_000_000; // 1s ago
 
         let actions = evaluate_scalp(&pos, &signal, &state, &RiskLimits::default(), &default_config(), 0);
-        assert!(actions.iter().any(|a| matches!(a, StrategyAction::TakerExit { .. })));
+        // Target hit = GTC sell at entry+10%, NOT FOK
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::MakerExit { .. })));
+        assert!(!actions.iter().any(|a| matches!(a, StrategyAction::TakerExit { .. })));
     }
 
     #[test]
-    fn test_long_exit_on_time_stop() {
+    fn test_long_exit_on_time_stop_posts_gtc() {
         let state = MarketState {
             elapsed_s: 20,
             up_token_id: "up_123".into(),
-            up_best_bid: Some(0.655), // not enough profit
+            up_best_bid: Some(0.655), // not enough profit for target
             tick_size_up: 0.01,
             ..Default::default()
         };
@@ -538,7 +528,9 @@ mod tests {
         pos.entry_time_us = chrono::Utc::now().timestamp_micros() - 9_000_000; // 9s ago
 
         let actions = evaluate_scalp(&pos, &signal, &state, &RiskLimits::default(), &default_config(), 0);
-        assert!(actions.iter().any(|a| matches!(a, StrategyAction::TakerExit { .. })));
+        // Time stop = post GTC at entry+10%, NOT FOK sell
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::MakerExit { .. })));
+        assert!(!actions.iter().any(|a| matches!(a, StrategyAction::TakerExit { .. })));
     }
 
     #[test]
@@ -561,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn test_window_end_flattens_position() {
+    fn test_window_end_holds_to_resolution() {
         let state = MarketState {
             elapsed_s: 241, // past cancel_at_s
             up_token_id: "up_123".into(),
@@ -574,8 +566,10 @@ mod tests {
         pos.shares = 30.0;
 
         let actions = evaluate_scalp(&pos, &signal, &state, &RiskLimits::default(), &default_config(), 0);
-        assert!(actions.iter().any(|a| matches!(a, StrategyAction::TakerExit { .. })));
+        // Window end = cancel all open orders but DON'T force sell. Hold to resolution.
         assert!(actions.iter().any(|a| matches!(a, StrategyAction::CancelAll)));
+        // No TakerExit — never FOK sell
+        assert!(!actions.iter().any(|a| matches!(a, StrategyAction::TakerExit { .. })));
     }
 
     #[test]
