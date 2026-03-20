@@ -86,26 +86,26 @@ pub async fn fetch_btc_tokens() -> Result<(Vec<String>, Vec<TokenInfo>), Box<dyn
             for event in arr {
                 if let Some(markets) = event.get("markets").and_then(|m| m.as_array()) {
                     for market in markets {
-                        let outcome = market.get("groupItemTitle")
-                            .or_else(|| market.get("outcome"))
+                        // outcomes and clobTokenIds are parallel JSON-encoded arrays
+                        let outcomes_raw = market.get("outcomes")
                             .and_then(|o| o.as_str())
-                            .unwrap_or("")
-                            .to_string();
-
+                            .unwrap_or("[]");
                         let tokens_raw = market.get("clobTokenIds")
                             .and_then(|t| t.as_str())
                             .unwrap_or("[]");
 
-                        if let Ok(parsed) = serde_json::from_str::<Vec<String>>(tokens_raw) {
-                            for tid in parsed {
-                                if !tid.is_empty() && !token_ids.contains(&tid) {
-                                    token_ids.push(tid.clone());
-                                    token_infos.push(TokenInfo {
-                                        token_id: tid,
-                                        outcome: outcome.clone(),
-                                        window_ts: ts,
-                                    });
-                                }
+                        let outcomes: Vec<String> = serde_json::from_str(outcomes_raw).unwrap_or_default();
+                        let tokens: Vec<String> = serde_json::from_str(tokens_raw).unwrap_or_default();
+
+                        for (i, tid) in tokens.iter().enumerate() {
+                            if !tid.is_empty() && !token_ids.contains(tid) {
+                                let outcome = outcomes.get(i).cloned().unwrap_or_default();
+                                token_ids.push(tid.clone());
+                                token_infos.push(TokenInfo {
+                                    token_id: tid.clone(),
+                                    outcome,
+                                    window_ts: ts,
+                                });
                             }
                         }
                     }
