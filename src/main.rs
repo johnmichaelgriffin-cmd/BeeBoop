@@ -420,6 +420,7 @@ async fn main() {
             let mut last_scalp_exit_us: i64 = 0;
             let mut sell_retry_count: u32 = 0;
             let mut last_signal_log = 0i64;
+            let mut current_window_ts: i64 = 0;
             let mut total_decisions = 0u64;
             let mut maker_count = 0u64;
             let mut taker_count = 0u64;
@@ -467,6 +468,17 @@ async fn main() {
                     timestamp: chrono::Utc::now().timestamp_micros(),
                 };
                 let market_state = s.market_state();
+
+                // Detect window change — reset position for new window
+                if market_state.window_start_ts != current_window_ts && market_state.window_start_ts > 0 {
+                    if current_window_ts > 0 && position.state != PositionState::Flat {
+                        info!(">>> NEW WINDOW — resetting position (was {:?}, held to resolution)", position.state);
+                    }
+                    current_window_ts = market_state.window_start_ts;
+                    position = Position::new_flat();
+                    risk.scalps_this_window = 0;
+                    sell_retry_count = 0;
+                }
 
                 drop(s); // Release lock before executing
 
@@ -607,9 +619,9 @@ async fn main() {
                                     ">>> WINDOW ENDED — holding {} {:.1}sh to resolution (sweeper will redeem)",
                                     position.side_label, position.shares
                                 );
-                                position = Position::new_flat();
+                                // Stay LONG to block new buys until next window resets position
+                                // Position will be reset when new window tokens arrive
                                 last_scalp_exit_us = chrono::Utc::now().timestamp_micros();
-                                risk.scalps_this_window += 1;
                             } else {
                                 let min_sell_price = position.entry_price;
                                 info!(">>> EXIT FOK SELL: {:.1}sh floor={:.0}c | {}", shares, min_sell_price*100.0, reason);
@@ -652,9 +664,8 @@ async fn main() {
                                     sell_retry_count += 1;
                                     if sell_retry_count >= 3 {
                                         warn!(">>> SELL FAILED 3x — giving up, holding to resolution");
-                                        position = Position::new_flat();
+                                        // Stay LONG to block new buys
                                         last_scalp_exit_us = chrono::Utc::now().timestamp_micros();
-                                        risk.scalps_this_window += 1;
                                         sell_retry_count = 0;
                                     } else {
                                         warn!(">>> SELL FAILED (attempt {}/3) — will retry in 2s", sell_retry_count);

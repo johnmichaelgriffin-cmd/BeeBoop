@@ -460,7 +460,7 @@ impl ExecutionEngine {
     async fn do_gtc_buy(client: &AuthedClient, signer: &PrivateKeySigner, token_u256: U256, shares: f64, price: f64, post_only: bool) -> Result<OrderResult, String> {
         use polymarket_client_sdk::clob::types::{OrderType, Side};
         let size_dec = Decimal::from_str(&format!("{:.2}", shares)).map_err(|e| format!("dec: {}", e))?;
-        let price_dec = Decimal::from_str(&format!("{:.4}", price)).map_err(|e| format!("dec: {}", e))?;
+        let price_dec = Decimal::from_str(&format!("{:.2}", price)).map_err(|e| format!("dec: {}", e))?;
         let mut b = client.limit_order().token_id(token_u256).size(size_dec).price(price_dec).side(Side::Buy).order_type(OrderType::GTC);
         if post_only { b = b.post_only(true); }
         let order = b.build().await.map_err(|e| format!("build: {}", e))?;
@@ -512,7 +512,7 @@ impl ExecutionEngine {
     async fn do_gtc_sell(client: &AuthedClient, signer: &PrivateKeySigner, token_u256: U256, shares: f64, price: f64, post_only: bool) -> Result<OrderResult, String> {
         use polymarket_client_sdk::clob::types::{OrderType, Side};
         let size_dec = Decimal::from_str(&format!("{:.2}", shares)).map_err(|e| format!("dec: {}", e))?;
-        let price_dec = Decimal::from_str(&format!("{:.4}", price)).map_err(|e| format!("dec: {}", e))?;
+        let price_dec = Decimal::from_str(&format!("{:.2}", price)).map_err(|e| format!("dec: {}", e))?;
         let mut b = client.limit_order().token_id(token_u256).size(size_dec).price(price_dec).side(Side::Sell).order_type(OrderType::GTC);
         if post_only { b = b.post_only(true); }
         let order = b.build().await.map_err(|e| format!("build: {}", e))?;
