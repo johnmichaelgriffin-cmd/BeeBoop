@@ -210,9 +210,10 @@ async fn main() {
 
     // Pre-warm: authenticate with Polymarket CLOB at startup
     if mode != Mode::Record {
-        info!("Pre-warming CLOB authentication...");
-        if let Err(e) = exec.ensure_auth().await {
-            warn!("Pre-warm auth failed (will retry on first order): {}", e);
+        info!("Pre-warming CLOB authentication (paper_mode={})...", exec.paper_mode);
+        match exec.ensure_auth().await {
+            Ok(()) => info!("CLOB authentication SUCCESS — ready to trade"),
+            Err(e) => error!("CLOB authentication FAILED: {} — orders will fail!", e),
         }
     }
 
