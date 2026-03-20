@@ -1,33 +1,99 @@
-//! Strategy module — PURE decision logic, no network calls.
+//! Strategy module — Scalp state machine with BUY + SELL logic.
 //!
-//! Takes signals (OBI, oracle lag, basis, market state) and outputs
-//! order intents. The execution module handles actual placement.
+//! Monetizes the ~2s Binance→Chainlink oracle lag by:
+//!   1. ENTRY: Buy token when strong directional signal fires (Binance moved, oracle hasn't)
+//!   2. HOLD: Wait 1-10s for Polymarket token to reprice
+//!   3. EXIT: Sell when target hit, signal reverses, or time stop
 //!
-//! Two execution modes:
-//!   Mode 1 (Maker): postOnly GTC when signal is moderate — sit below ask
-//!   Mode 2 (Taker): FOK burst when signal is strong — grab liquidity now
+//! Three execution modes for entry:
+//!   Mode A (default): FOK entry (taker), GTD exit (maker) — recommended start
+//!   Mode B: Maker entry (postOnly GTC), taker exit
+//!   Mode C: Market-making (both sides) — future
 //!
-//! Signal: combined score from oracle lag + OBI + Binance return
-//! Gated by: fee-aware threshold, window timing, risk limits
+//! Position state machine per side: FLAT → ENTERING → LONG → EXITING → FLAT
 
 use crate::types::{
     BotConfig, ObiSignal, OracleLagDirection, OracleLagSignal, OrderRequest, OrderSide, OrderType,
 };
 
-/// A decision the strategy wants to make.
+// ── Position State Machine ──────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PositionState {
+    Flat,       // No position
+    Entering,   // Entry order submitted, waiting for fill
+    Long,       // Holding shares, waiting for exit signal
+    Exiting,    // Exit order submitted, waiting for fill
+}
+
+#[derive(Debug, Clone)]
+pub struct Position {
+    pub state: PositionState,
+    pub token_id: String,
+    pub side_label: String,       // "UP" or "DN"
+    pub entry_price: f64,         // price we bought at
+    pub shares: f64,              // shares held
+    pub entry_time_us: i64,       // when we entered
+    pub entry_order_id: Option<String>,
+    pub exit_order_id: Option<String>,
+    pub exit_posted_at_us: i64,   // when exit order was posted
+}
+
+impl Position {
+    pub fn new_flat() -> Self {
+        Self {
+            state: PositionState::Flat,
+            token_id: String::new(),
+            side_label: String::new(),
+            entry_price: 0.0,
+            shares: 0.0,
+            entry_time_us: 0,
+            entry_order_id: None,
+            exit_order_id: None,
+            exit_posted_at_us: 0,
+        }
+    }
+
+    pub fn hold_time_ms(&self) -> i64 {
+        if self.entry_time_us == 0 { return 0; }
+        (chrono::Utc::now().timestamp_micros() - self.entry_time_us) / 1000
+    }
+}
+
+// ── Strategy Actions ────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub enum StrategyAction {
-    /// Place an order
-    PlaceOrder(OrderRequest),
+    /// Buy entry: FOK taker to grab liquidity
+    TakerEntry {
+        token_id: String,
+        spend_usdc: f64,
+        side_label: String,
+        reason: String,
+    },
+    /// Sell exit: GTC postOnly to sell at target price (maker)
+    MakerExit {
+        token_id: String,
+        shares: f64,
+        price: f64,
+        reason: String,
+    },
+    /// Sell exit: FOK taker to flatten immediately
+    TakerExit {
+        token_id: String,
+        shares: f64,
+        reason: String,
+    },
     /// Cancel a specific order
     CancelOrder(String),
     /// Cancel all orders
     CancelAll,
-    /// Do nothing this cycle
+    /// Do nothing
     Hold,
 }
 
-/// Market state visible to the strategy.
+// ── Market State ────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Default)]
 pub struct MarketState {
     pub up_token_id: String,
@@ -44,7 +110,8 @@ pub struct MarketState {
     pub tick_size_dn: f64,
 }
 
-/// Risk limits.
+// ── Risk Limits ─────────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct RiskLimits {
     pub max_position_per_side: f64,
@@ -53,6 +120,8 @@ pub struct RiskLimits {
     pub cancel_count_this_window: u64,
     pub order_count_this_window: u64,
     pub kill_switch_triggered: bool,
+    pub scalps_this_window: u64,
+    pub max_scalps_per_window: u64,
 }
 
 impl Default for RiskLimits {
@@ -64,11 +133,14 @@ impl Default for RiskLimits {
             cancel_count_this_window: 0,
             order_count_this_window: 0,
             kill_switch_triggered: false,
+            scalps_this_window: 0,
+            max_scalps_per_window: 50,
         }
     }
 }
 
-/// Binance return signal — computed from bookTicker mid changes.
+// ── Binance Return Signal ───────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct BinanceReturnSignal {
     pub return_2s: f64,     // 2-second return (bps)
@@ -76,7 +148,8 @@ pub struct BinanceReturnSignal {
     pub timestamp: i64,
 }
 
-/// Combined signal score and metadata for audit logging.
+// ── Signal Snapshot ─────────────────────────────────────────────
+
 #[derive(Debug, Clone)]
 pub struct SignalSnapshot {
     pub score: f64,
@@ -84,61 +157,64 @@ pub struct SignalSnapshot {
     pub oracle_lag_component: f64,
     pub binance_return_component: f64,
     pub basis_bps: f64,
-    pub mode: ExecutionMode,
+    pub mode: SignalMode,
     pub reason: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ExecutionMode {
-    Hold,           // No action
-    Maker,          // postOnly GTC, sit below ask
-    Taker,          // FOK, grab liquidity now
+pub enum SignalMode {
+    NoSignal,       // Below threshold
+    Entry,          // Strong enough to enter
 }
 
-// ── Signal weights (calibrated from lead/lag lab) ────────────────
+// Keep old names for compatibility
+pub type ExecutionMode = SignalMode;
+
+// ── Signal Weights ──────────────────────────────────────────────
 
 const W_OBI: f64 = 0.25;
 const W_ORACLE_LAG: f64 = 0.40;
 const W_BINANCE_RETURN: f64 = 0.35;
 
-// ── Thresholds ───────────────────────────────────────────────────
+// ── Scalp Parameters ────────────────────────────────────────────
 
-const MAKER_THRESHOLD: f64 = 0.30;     // score > this → maker mode
-const TAKER_THRESHOLD: f64 = 0.65;     // score > this → taker burst
-const MIN_ORACLE_LAG_BPS: f64 = 1.5;   // oracle must be lagging >= 1.5 bps
-const TAKER_FEE_BPS: f64 = 3.0;        // approximate taker fee
-const MAKER_OFFSET_C: f64 = 0.02;      // maker bid = ask - 2c
+const ENTRY_THRESHOLD: f64 = 0.40;       // score > this → enter
+const MIN_ORACLE_LAG_BPS: f64 = 1.5;     // oracle must be lagging
+const ENTRY_SPEND_USDC: f64 = 20.0;      // dollars per entry
+const EXIT_TARGET_CENTS: f64 = 0.03;     // 3c profit target
+const EXIT_TIME_STOP_MS: i64 = 8_000;    // 8s max hold
+const EXIT_SIGNAL_REVERSAL: f64 = -0.20; // exit if signal flips against us
+const COOLDOWN_MS: i64 = 3_000;          // 3s between scalps
+const MAKER_EXIT_TIMEOUT_MS: i64 = 4_000; // 4s GTD timeout, then taker exit
 
-// ── Strategy sizes ───────────────────────────────────────────────
-
-const MAKER_SIZE: f64 = 20.0;          // shares per maker GTC
-const TAKER_SIZE_DOLLARS: f64 = 30.0;  // dollar notional for FOK burst
-
-/// Quantize price to nearest tick size (always round DOWN for buys).
-/// Uses integer math internally to avoid floating point precision issues.
-fn quantize_price(price: f64, tick_size: f64) -> f64 {
+/// Quantize price to nearest tick size (round DOWN for buys, round UP for sells).
+fn quantize_buy(price: f64, tick_size: f64) -> f64 {
     if tick_size <= 0.0 {
-        return (price * 100.0).floor() / 100.0; // default 1c tick
+        return (price * 100.0).floor() / 100.0;
     }
-    // Convert to integer ticks to avoid float rounding
     let ticks = (price / tick_size).floor() as i64;
     let result = ticks as f64 * tick_size;
-    // Round to avoid accumulated float error (6 decimal places)
     (result * 1_000_000.0).round() / 1_000_000.0
 }
 
-/// Compute combined signal score from all inputs.
+fn quantize_sell(price: f64, tick_size: f64) -> f64 {
+    if tick_size <= 0.0 {
+        return (price * 100.0).ceil() / 100.0;
+    }
+    let ticks = (price / tick_size).ceil() as i64;
+    let result = ticks as f64 * tick_size;
+    (result * 1_000_000.0).round() / 1_000_000.0
+}
+
+// ── Signal Computation ──────────────────────────────────────────
+
 pub fn compute_signal(
     obi: Option<&ObiSignal>,
     oracle_lag: Option<&OracleLagSignal>,
     binance_ret: Option<&BinanceReturnSignal>,
 ) -> SignalSnapshot {
-    // OBI component: normalize to [-1, +1] range, already there
-    let obi_raw = obi.map(|o| o.value).unwrap_or(0.0);
-    let obi_component = obi_raw.clamp(-1.0, 1.0);
+    let obi_component = obi.map(|o| o.value.clamp(-1.0, 1.0)).unwrap_or(0.0);
 
-    // Oracle lag component: basis direction + magnitude
-    // Positive lag_bps = Binance above Chainlink = oracle will update UP
     let (oracle_component, basis_bps) = oracle_lag
         .map(|o| {
             let dir = match o.direction {
@@ -146,54 +222,32 @@ pub fn compute_signal(
                 OracleLagDirection::Down => -1.0,
                 OracleLagDirection::Flat => 0.0,
             };
-            // Scale: 2bps lag → component of ±0.5, 5bps → ±1.0
             let magnitude = (o.lag_bps.abs() / 5.0).clamp(0.0, 1.0);
             (dir * magnitude, o.lag_bps)
         })
         .unwrap_or((0.0, 0.0));
 
-    // Binance return component: normalize 2s return
-    // 2bps → component of ±0.5, 5bps → ±1.0
-    let (ret_component, _ret_raw) = binance_ret
-        .map(|r| {
-            let normalized = (r.return_2s / 5.0).clamp(-1.0, 1.0);
-            (normalized, r.return_2s)
-        })
-        .unwrap_or((0.0, 0.0));
+    let ret_component = binance_ret
+        .map(|r| (r.return_2s / 5.0).clamp(-1.0, 1.0))
+        .unwrap_or(0.0);
 
-    // Combined weighted score
     let score = W_OBI * obi_component + W_ORACLE_LAG * oracle_component + W_BINANCE_RETURN * ret_component;
 
-    // Determine execution mode
-    let abs_score = score.abs();
-
-    // Gate: oracle must actually be lagging for taker mode
     let oracle_lagging = oracle_lag
         .map(|o| o.lag_bps.abs() >= MIN_ORACLE_LAG_BPS)
         .unwrap_or(false);
 
-    let mode = if abs_score >= TAKER_THRESHOLD && oracle_lagging {
-        ExecutionMode::Taker
-    } else if abs_score >= MAKER_THRESHOLD {
-        ExecutionMode::Maker
+    let mode = if score.abs() >= ENTRY_THRESHOLD && oracle_lagging {
+        SignalMode::Entry
     } else {
-        ExecutionMode::Hold
+        SignalMode::NoSignal
     };
 
-    let reason = match mode {
-        ExecutionMode::Taker => format!(
-            "TAKER: score={:.3} obi={:.3} oracle={:.1}bps ret={:.1}bps",
-            score, obi_component, basis_bps, binance_ret.map(|r| r.return_2s).unwrap_or(0.0)
-        ),
-        ExecutionMode::Maker => format!(
-            "MAKER: score={:.3} obi={:.3} oracle={:.1}bps ret={:.1}bps",
-            score, obi_component, basis_bps, binance_ret.map(|r| r.return_2s).unwrap_or(0.0)
-        ),
-        ExecutionMode::Hold => format!(
-            "HOLD: score={:.3} (threshold={:.2})",
-            score, MAKER_THRESHOLD
-        ),
-    };
+    let reason = format!(
+        "score={:.3} obi={:.3} oracle={:.1}bps ret={:.1}bps",
+        score, obi_component, basis_bps,
+        binance_ret.map(|r| r.return_2s).unwrap_or(0.0)
+    );
 
     SignalSnapshot {
         score,
@@ -206,24 +260,22 @@ pub fn compute_signal(
     }
 }
 
-/// v1 Strategy: OBI + Oracle Lag + Binance Return → directional trading.
+// ── Scalp Strategy Evaluator ────────────────────────────────────
+
+/// Evaluate the scalp strategy given current position, signal, and market state.
 ///
-/// Two modes:
-///   - Maker: postOnly GTC below ask when signal is moderate
-///   - Taker: FOK burst when signal is strong AND oracle is lagging
-///
-/// Guardrails:
-///   - Max position per side
-///   - Cancel rate limiting
-///   - postOnly never combined with FOK
-///   - Fee-aware: taker only fires when expected move > fees + spread
-pub fn evaluate(
-    state: &MarketState,
+/// Returns actions to take. The caller (main loop) is responsible for
+/// executing actions and updating position state.
+pub fn evaluate_scalp(
+    position: &Position,
     signal: &SignalSnapshot,
+    state: &MarketState,
     risk: &RiskLimits,
     config: &BotConfig,
+    last_scalp_exit_us: i64,
 ) -> Vec<StrategyAction> {
     let mut actions = Vec::new();
+    let now_us = chrono::Utc::now().timestamp_micros();
 
     // Kill switch
     if risk.kill_switch_triggered {
@@ -236,86 +288,187 @@ pub fn evaluate(
         return actions;
     }
     if state.elapsed_s >= config.cancel_at_s {
+        // Flatten any position before window ends
+        if position.state == PositionState::Long {
+            actions.push(StrategyAction::TakerExit {
+                token_id: position.token_id.clone(),
+                shares: position.shares,
+                reason: "WINDOW END — emergency flatten".to_string(),
+            });
+        }
         actions.push(StrategyAction::CancelAll);
         return actions;
     }
 
-    // Order rate sanity check
-    if risk.order_count_this_window as usize >= risk.max_open_orders * 10 {
-        return actions; // too many orders this window, back off
+    // Scalp rate limit
+    if risk.scalps_this_window >= risk.max_scalps_per_window {
+        return actions;
     }
 
-    match signal.mode {
-        ExecutionMode::Hold => {
+    match position.state {
+        // ── FLAT: look for entry ────────────────────────────
+        PositionState::Flat => {
+            // Cooldown check
+            if last_scalp_exit_us > 0 && (now_us - last_scalp_exit_us) < COOLDOWN_MS as i64 * 1000 {
+                actions.push(StrategyAction::Hold);
+                return actions;
+            }
+
+            if signal.mode != SignalMode::Entry {
+                actions.push(StrategyAction::Hold);
+                return actions;
+            }
+
+            // Determine which token to buy
+            let (token_id, best_ask, side_label) = if signal.score > 0.0 {
+                // BTC going up → buy UP token
+                (&state.up_token_id, state.up_best_ask, "UP")
+            } else {
+                // BTC going down → buy DN token
+                (&state.dn_token_id, state.dn_best_ask, "DN")
+            };
+
+            if token_id.is_empty() {
+                return actions;
+            }
+
+            if let Some(ask) = best_ask {
+                // Sanity: don't buy if ask is too high or too low
+                if ask > 0.05 && ask < 0.95 {
+                    actions.push(StrategyAction::TakerEntry {
+                        token_id: token_id.clone(),
+                        spend_usdc: ENTRY_SPEND_USDC,
+                        side_label: side_label.to_string(),
+                        reason: format!("ENTRY {} | {}", side_label, signal.reason),
+                    });
+                }
+            }
+        }
+
+        // ── ENTERING: waiting for fill confirmation ─────────
+        PositionState::Entering => {
+            // Check timeout: if entry not confirmed in 3s, go back to FLAT
+            if position.hold_time_ms() > 3_000 {
+                if let Some(ref oid) = position.entry_order_id {
+                    actions.push(StrategyAction::CancelOrder(oid.clone()));
+                }
+            }
+            // Otherwise wait for fill (handled by main loop via user WS)
+        }
+
+        // ── LONG: look for exit ─────────────────────────────
+        PositionState::Long => {
+            let hold_ms = position.hold_time_ms();
+
+            // Get current bid for our token (what we can sell at)
+            let current_bid = if position.token_id == state.up_token_id {
+                state.up_best_bid
+            } else {
+                state.dn_best_bid
+            };
+
+            let tick_size = if position.token_id == state.up_token_id {
+                state.tick_size_up
+            } else {
+                state.tick_size_dn
+            };
+
+            // Exit condition 1: TARGET HIT — bid is above entry + target
+            if let Some(bid) = current_bid {
+                let profit_per_share = bid - position.entry_price;
+                if profit_per_share >= EXIT_TARGET_CENTS {
+                    // Post maker exit (GTC postOnly sell at bid)
+                    let sell_price = quantize_sell(bid, tick_size);
+                    if sell_price > position.entry_price {
+                        actions.push(StrategyAction::MakerExit {
+                            token_id: position.token_id.clone(),
+                            shares: position.shares,
+                            price: sell_price,
+                            reason: format!(
+                                "TARGET HIT: entry={:.0}c bid={:.0}c profit={:.0}c hold={}ms",
+                                position.entry_price * 100.0,
+                                bid * 100.0,
+                                profit_per_share * 100.0,
+                                hold_ms,
+                            ),
+                        });
+                        return actions;
+                    }
+                }
+            }
+
+            // Exit condition 2: SIGNAL REVERSAL — signal flipped against our position
+            let our_direction = if position.side_label == "UP" { 1.0 } else { -1.0 };
+            if signal.score * our_direction < EXIT_SIGNAL_REVERSAL {
+                actions.push(StrategyAction::TakerExit {
+                    token_id: position.token_id.clone(),
+                    shares: position.shares,
+                    reason: format!(
+                        "SIGNAL REVERSAL: score={:.3} vs our_dir={:.0} hold={}ms",
+                        signal.score, our_direction, hold_ms,
+                    ),
+                });
+                return actions;
+            }
+
+            // Exit condition 3: TIME STOP — held too long, edge decayed
+            if hold_ms >= EXIT_TIME_STOP_MS {
+                actions.push(StrategyAction::TakerExit {
+                    token_id: position.token_id.clone(),
+                    shares: position.shares,
+                    reason: format!(
+                        "TIME STOP: {}ms >= {}ms",
+                        hold_ms, EXIT_TIME_STOP_MS,
+                    ),
+                });
+                return actions;
+            }
+
+            // Otherwise hold
             actions.push(StrategyAction::Hold);
         }
 
-        ExecutionMode::Maker => {
-            // Determine which side to buy based on signal direction
-            let (token_id, best_ask, filled, tick_size) = if signal.score > 0.0 {
-                // BTC going up → buy UP token
-                (&state.up_token_id, state.up_best_ask, state.up_filled, state.tick_size_up)
+        // ── EXITING: waiting for exit fill ──────────────────
+        PositionState::Exiting => {
+            let exit_elapsed_ms = if position.exit_posted_at_us > 0 {
+                (now_us - position.exit_posted_at_us) / 1000
             } else {
-                // BTC going down → buy DN token
-                (&state.dn_token_id, state.dn_best_ask, state.dn_filled, state.tick_size_dn)
+                0
             };
 
-            if let Some(ask) = best_ask {
-                if filled < risk.max_position_per_side {
-                    let raw_price = ask - MAKER_OFFSET_C;
-                    let price = quantize_price(raw_price, tick_size);
-
-                    if price > 0.0 && price < ask {
-                        actions.push(StrategyAction::PlaceOrder(OrderRequest {
-                            token_id: token_id.clone(),
-                            side: OrderSide::Buy,
-                            price,
-                            size: MAKER_SIZE,
-                            order_type: OrderType::GTC,
-                            post_only: true, // GTC + postOnly = guaranteed maker
-                        }));
-                    }
+            // If maker exit hasn't filled after timeout, go taker
+            if exit_elapsed_ms > MAKER_EXIT_TIMEOUT_MS {
+                // Cancel the maker exit and do a taker exit
+                if let Some(ref oid) = position.exit_order_id {
+                    actions.push(StrategyAction::CancelOrder(oid.clone()));
                 }
+                actions.push(StrategyAction::TakerExit {
+                    token_id: position.token_id.clone(),
+                    shares: position.shares,
+                    reason: format!(
+                        "MAKER EXIT TIMEOUT: {}ms, switching to taker",
+                        exit_elapsed_ms,
+                    ),
+                });
             }
-        }
-
-        ExecutionMode::Taker => {
-            // Determine side
-            let (token_id, best_ask, filled, tick_size) = if signal.score > 0.0 {
-                (&state.up_token_id, state.up_best_ask, state.up_filled, state.tick_size_up)
-            } else {
-                (&state.dn_token_id, state.dn_best_ask, state.dn_filled, state.tick_size_dn)
-            };
-
-            if let Some(ask) = best_ask {
-                if filled < risk.max_position_per_side {
-                    // Fee-aware check: expected move must exceed taker fee + spread
-                    let expected_move_bps = signal.basis_bps.abs();
-                    let spread_bps = 100.0 * (ask - ask * 0.99) / ask; // rough estimate
-
-                    if expected_move_bps > TAKER_FEE_BPS + spread_bps {
-                        // FOK: specify dollar amount for BUY (per Polymarket docs)
-                        // size = dollar notional / price ≈ shares we'll get
-                        let shares = (TAKER_SIZE_DOLLARS / ask).floor();
-                        let price = quantize_price(0.99, tick_size); // limit at 99c
-
-                        if shares > 0.0 {
-                            actions.push(StrategyAction::PlaceOrder(OrderRequest {
-                                token_id: token_id.clone(),
-                                side: OrderSide::Buy,
-                                price,
-                                size: shares,
-                                order_type: OrderType::FOK,
-                                post_only: false, // FOK cannot be postOnly
-                            }));
-                        }
-                    }
-                }
-            }
+            // Otherwise wait for fill
         }
     }
 
     actions
+}
+
+// ── Backward compatibility ──────────────────────────────────────
+
+/// Legacy evaluate function — wraps scalp evaluator for existing callers.
+pub fn evaluate(
+    state: &MarketState,
+    signal: &SignalSnapshot,
+    risk: &RiskLimits,
+    config: &BotConfig,
+) -> Vec<StrategyAction> {
+    let flat_pos = Position::new_flat();
+    evaluate_scalp(&flat_pos, signal, state, risk, config, 0)
 }
 
 #[cfg(test)]
@@ -341,134 +494,125 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_hold_when_no_signal() {
-        let state = MarketState {
-            elapsed_s: 20,
-            up_best_ask: Some(0.65),
-            dn_best_ask: Some(0.35),
-            tick_size_up: 0.01,
-            tick_size_dn: 0.01,
-            ..Default::default()
-        };
-        let signal = compute_signal(None, None, None);
-        assert_eq!(signal.mode, ExecutionMode::Hold);
-        let actions = evaluate(&state, &signal, &RiskLimits::default(), &default_config());
-        assert!(matches!(actions[0], StrategyAction::Hold));
-    }
-
-    #[test]
-    fn test_maker_mode_on_moderate_signal() {
-        let state = MarketState {
-            elapsed_s: 20,
-            up_token_id: "up_123".into(),
-            up_best_ask: Some(0.65),
-            tick_size_up: 0.01,
-            ..Default::default()
-        };
-        let obi = ObiSignal {
-            value: 0.8,
-            levels_used: 10,
-            timestamp: 0,
-            local_ts: 0,
-        };
+    fn strong_signal_up() -> SignalSnapshot {
+        let obi = ObiSignal { value: 0.9, levels_used: 10, timestamp: 0, local_ts: 0 };
         let oracle = OracleLagSignal {
-            binance_price: 70000.0,
-            chainlink_price: 69990.0,
-            lag_bps: 1.4, // below taker threshold
-            direction: OracleLagDirection::Up,
-            timestamp: 0,
-            local_ts: 0,
-        };
-        let signal = compute_signal(Some(&obi), Some(&oracle), None);
-        assert_eq!(signal.mode, ExecutionMode::Maker);
-    }
-
-    #[test]
-    fn test_taker_mode_on_strong_signal() {
-        let state = MarketState {
-            elapsed_s: 20,
-            up_token_id: "up_123".into(),
-            up_best_ask: Some(0.65),
-            tick_size_up: 0.01,
-            ..Default::default()
-        };
-        let obi = ObiSignal {
-            value: 0.95,
-            levels_used: 10,
-            timestamp: 0,
-            local_ts: 0,
-        };
-        let oracle = OracleLagSignal {
-            binance_price: 70000.0,
-            chainlink_price: 69980.0,
-            lag_bps: 2.9, // above min oracle lag
-            direction: OracleLagDirection::Up,
-            timestamp: 0,
-            local_ts: 0,
-        };
-        let ret = BinanceReturnSignal {
-            return_2s: 4.0,
-            return_500ms: 2.0,
-            timestamp: 0,
-        };
-        let signal = compute_signal(Some(&obi), Some(&oracle), Some(&ret));
-        assert_eq!(signal.mode, ExecutionMode::Taker);
-    }
-
-    #[test]
-    fn test_cancel_all_at_window_end() {
-        let state = MarketState {
-            elapsed_s: 241,
-            ..Default::default()
-        };
-        let signal = compute_signal(None, None, None);
-        let actions = evaluate(&state, &signal, &RiskLimits::default(), &default_config());
-        assert!(actions.iter().any(|a| matches!(a, StrategyAction::CancelAll)));
-    }
-
-    #[test]
-    fn test_post_only_never_with_fok() {
-        // Ensure FOK orders always have post_only = false
-        let state = MarketState {
-            elapsed_s: 20,
-            up_token_id: "up_123".into(),
-            up_best_ask: Some(0.65),
-            tick_size_up: 0.01,
-            ..Default::default()
-        };
-        let obi = ObiSignal { value: 0.95, levels_used: 10, timestamp: 0, local_ts: 0 };
-        let oracle = OracleLagSignal {
-            binance_price: 70000.0, chainlink_price: 69980.0,
-            lag_bps: 3.0, direction: OracleLagDirection::Up,
+            binance_price: 70000.0, chainlink_price: 69985.0,
+            lag_bps: 2.1, direction: OracleLagDirection::Up,
             timestamp: 0, local_ts: 0,
         };
-        let ret = BinanceReturnSignal { return_2s: 5.0, return_500ms: 3.0, timestamp: 0 };
-        let signal = compute_signal(Some(&obi), Some(&oracle), Some(&ret));
-        let actions = evaluate(&state, &signal, &RiskLimits::default(), &default_config());
-        for action in &actions {
-            if let StrategyAction::PlaceOrder(req) = action {
-                if req.order_type == OrderType::FOK {
-                    assert!(!req.post_only, "FOK must never have postOnly=true");
-                }
-            }
-        }
+        let ret = BinanceReturnSignal { return_2s: 3.5, return_500ms: 1.5, timestamp: 0 };
+        compute_signal(Some(&obi), Some(&oracle), Some(&ret))
     }
 
     #[test]
-    fn test_quantize_price() {
-        assert_eq!(quantize_price(0.637, 0.01), 0.63);
-        assert_eq!(quantize_price(0.637, 0.001), 0.637);
-        assert_eq!(quantize_price(0.635, 0.05), 0.60);
+    fn test_flat_entry_on_strong_signal() {
+        let state = MarketState {
+            elapsed_s: 20,
+            up_token_id: "up_123".into(),
+            up_best_ask: Some(0.65),
+            tick_size_up: 0.01,
+            ..Default::default()
+        };
+        let signal = strong_signal_up();
+        assert_eq!(signal.mode, SignalMode::Entry);
+
+        let pos = Position::new_flat();
+        let actions = evaluate_scalp(&pos, &signal, &state, &RiskLimits::default(), &default_config(), 0);
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::TakerEntry { .. })));
     }
 
     #[test]
-    fn test_kill_switch() {
-        let state = MarketState { elapsed_s: 20, ..Default::default() };
+    fn test_long_exit_on_target() {
+        let state = MarketState {
+            elapsed_s: 20,
+            up_token_id: "up_123".into(),
+            up_best_bid: Some(0.68), // 3c above entry
+            tick_size_up: 0.01,
+            ..Default::default()
+        };
+        let signal = strong_signal_up();
+        let mut pos = Position::new_flat();
+        pos.state = PositionState::Long;
+        pos.token_id = "up_123".into();
+        pos.side_label = "UP".into();
+        pos.entry_price = 0.65;
+        pos.shares = 30.0;
+        pos.entry_time_us = chrono::Utc::now().timestamp_micros() - 1_000_000; // 1s ago
+
+        let actions = evaluate_scalp(&pos, &signal, &state, &RiskLimits::default(), &default_config(), 0);
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::MakerExit { .. })));
+    }
+
+    #[test]
+    fn test_long_exit_on_time_stop() {
+        let state = MarketState {
+            elapsed_s: 20,
+            up_token_id: "up_123".into(),
+            up_best_bid: Some(0.655), // not enough profit
+            tick_size_up: 0.01,
+            ..Default::default()
+        };
+        let signal = strong_signal_up();
+        let mut pos = Position::new_flat();
+        pos.state = PositionState::Long;
+        pos.token_id = "up_123".into();
+        pos.side_label = "UP".into();
+        pos.entry_price = 0.65;
+        pos.shares = 30.0;
+        pos.entry_time_us = chrono::Utc::now().timestamp_micros() - 9_000_000; // 9s ago
+
+        let actions = evaluate_scalp(&pos, &signal, &state, &RiskLimits::default(), &default_config(), 0);
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::TakerExit { .. })));
+    }
+
+    #[test]
+    fn test_cooldown_prevents_immediate_reentry() {
+        let state = MarketState {
+            elapsed_s: 20,
+            up_token_id: "up_123".into(),
+            up_best_ask: Some(0.65),
+            tick_size_up: 0.01,
+            ..Default::default()
+        };
+        let signal = strong_signal_up();
+        let pos = Position::new_flat();
+        // Last exit was 1s ago (within 3s cooldown)
+        let last_exit = chrono::Utc::now().timestamp_micros() - 1_000_000;
+
+        let actions = evaluate_scalp(&pos, &signal, &state, &RiskLimits::default(), &default_config(), last_exit);
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::Hold)));
+        assert!(!actions.iter().any(|a| matches!(a, StrategyAction::TakerEntry { .. })));
+    }
+
+    #[test]
+    fn test_window_end_flattens_position() {
+        let state = MarketState {
+            elapsed_s: 241, // past cancel_at_s
+            up_token_id: "up_123".into(),
+            ..Default::default()
+        };
         let signal = compute_signal(None, None, None);
-        let mut risk = RiskLimits::default();
-        risk.kill_switch_triggered = true;
-        let actions = evaluate(&state, &signal, &risk, &default_config());
+        let mut pos = Position::new_flat();
+        pos.state = PositionState::Long;
+        pos.token_id = "up_123".into();
+        pos.shares = 30.0;
+
+        let actions = evaluate_scalp(&pos, &signal, &state, &RiskLimits::default(), &default_config(), 0);
+        assert!(actions.iter().any(|a| matches!(a, StrategyAction::TakerExit { .. })));
         assert!(actions.iter().any(|a| matches!(a, StrategyAction::CancelAll)));
+    }
+
+    #[test]
+    fn test_quantize_sell_rounds_up() {
+        assert_eq!(quantize_sell(0.653, 0.01), 0.66);
+        assert_eq!(quantize_sell(0.65, 0.01), 0.65);
+        assert_eq!(quantize_sell(0.651, 0.01), 0.66);
+    }
+
+    #[test]
+    fn test_quantize_buy_rounds_down() {
+        assert_eq!(quantize_buy(0.657, 0.01), 0.65);
+        assert_eq!(quantize_buy(0.65, 0.01), 0.65);
     }
 }

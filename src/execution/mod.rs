@@ -240,6 +240,109 @@ impl ExecutionEngine {
         }
     }
 
+    /// Place a taker FOK SELL order (flatten immediately).
+    /// `shares` is the number of shares to sell.
+    pub async fn taker_fok_sell(
+        &self,
+        token_id: &str,
+        shares: f64,
+    ) -> Result<OrderResult, String> {
+        let start = chrono::Utc::now().timestamp_micros();
+
+        if self.paper_mode {
+            let elapsed = (chrono::Utc::now().timestamp_micros() - start) as u64;
+            info!(
+                "execution [PAPER]: FOK SELL {:.1}sh of token {}...",
+                shares, &token_id[..16.min(token_id.len())]
+            );
+            return Ok(OrderResult {
+                order_id: format!("paper-sell-{}", chrono::Utc::now().timestamp_millis()),
+                success: true,
+                status: "PAPER".to_string(),
+                error: None,
+                latency_us: elapsed,
+            });
+        }
+
+        let pk = self.private_key.as_ref().ok_or("no private key")?;
+        let ak = self.api_key.as_ref().ok_or("no api key")?;
+        let secret = self.api_secret.as_ref().ok_or("no api secret")?;
+        let pass = self.api_passphrase.as_ref().ok_or("no api passphrase")?;
+
+        let result = sdk_fok_sell(pk, ak, secret, pass, token_id, shares).await;
+
+        let elapsed = (chrono::Utc::now().timestamp_micros() - start) as u64;
+        self.telemetry.record("taker_fok_sell", elapsed);
+
+        match result {
+            Ok(r) => {
+                info!(
+                    "execution: FOK SELL {:.1}sh -> order {} status={} latency={}us",
+                    shares, r.order_id, r.status, elapsed
+                );
+                Ok(OrderResult { latency_us: elapsed, ..r })
+            }
+            Err(e) => {
+                warn!("execution: FOK SELL {:.1}sh FAILED: {} latency={}us", shares, e, elapsed);
+                Err(e)
+            }
+        }
+    }
+
+    /// Place a maker GTC SELL limit order (postOnly — rest on book as offer).
+    pub async fn maker_gtc_sell(
+        &self,
+        token_id: &str,
+        shares: f64,
+        price: f64,
+        post_only: bool,
+    ) -> Result<OrderResult, String> {
+        let start = chrono::Utc::now().timestamp_micros();
+
+        let quantized = self.tick_sizes.lock().await
+            .quantize(token_id, price)
+            .ok_or("price quantizes to zero")?;
+
+        if self.paper_mode {
+            let elapsed = (chrono::Utc::now().timestamp_micros() - start) as u64;
+            info!(
+                "execution [PAPER]: GTC SELL {:.1}sh @ {:.0}c postOnly={} token {}...",
+                shares, quantized * 100.0, post_only, &token_id[..16.min(token_id.len())]
+            );
+            return Ok(OrderResult {
+                order_id: format!("paper-sell-{}", chrono::Utc::now().timestamp_millis()),
+                success: true,
+                status: "PAPER".to_string(),
+                error: None,
+                latency_us: elapsed,
+            });
+        }
+
+        let pk = self.private_key.as_ref().ok_or("no private key")?;
+        let ak = self.api_key.as_ref().ok_or("no api key")?;
+        let secret = self.api_secret.as_ref().ok_or("no api secret")?;
+        let pass = self.api_passphrase.as_ref().ok_or("no api passphrase")?;
+
+        let result = sdk_gtc_sell(pk, ak, secret, pass, token_id, shares, quantized, post_only).await;
+
+        let elapsed = (chrono::Utc::now().timestamp_micros() - start) as u64;
+        self.telemetry.record("maker_gtc_sell", elapsed);
+
+        match result {
+            Ok(r) => {
+                info!(
+                    "execution: GTC SELL {:.1}sh @ {:.0}c -> {} latency={}us",
+                    shares, quantized * 100.0, r.order_id, elapsed
+                );
+                Ok(OrderResult { latency_us: elapsed, ..r })
+            }
+            Err(e) => {
+                warn!("execution: GTC SELL FAILED: {} latency={}us", e, elapsed);
+                Err(e)
+            }
+        }
+    }
+
     /// Cancel a single order by ID.
     pub async fn cancel_order(&self, order_id: &str) -> Result<(), String> {
         if self.paper_mode {
@@ -486,5 +589,108 @@ async fn sdk_cancel_all(
             .map_err(|e| format!("cancel_all: {}", e))?;
 
         Ok(resp.canceled.len())
+    })
+}
+
+async fn sdk_fok_sell(
+    pk: &str,
+    api_key: &str,
+    api_secret: &str,
+    api_passphrase: &str,
+    token_id: &str,
+    shares: f64,
+) -> Result<OrderResult, String> {
+    with_client!(pk, api_key, api_secret, api_passphrase, |client, signer| {
+        use polymarket_client_sdk::clob::types::{OrderType, Side};
+        use polymarket_client_sdk::types::{Decimal, U256};
+
+        let token_u256 = U256::from_str(token_id)
+            .map_err(|e| format!("bad token: {}", e))?;
+
+        let size_dec = Decimal::from_str(&format!("{:.2}", shares))
+            .map_err(|e| format!("bad size: {}", e))?;
+
+        // FOK SELL: use limit_order at price 0.01 (floor) to sell shares
+        // Polymarket FOK SELL = specify shares via a limit order at min price
+        let price_dec = Decimal::from_str("0.01")
+            .map_err(|e| format!("bad price: {}", e))?;
+
+        let order = client
+            .limit_order()
+            .token_id(token_u256)
+            .size(size_dec)
+            .price(price_dec)
+            .side(Side::Sell)
+            .order_type(OrderType::FOK)
+            .build()
+            .await
+            .map_err(|e| format!("build: {}", e))?;
+
+        let signed = client.sign(&signer, order).await
+            .map_err(|e| format!("sign: {}", e))?;
+
+        let resp = client.post_order(signed).await
+            .map_err(|e| format!("post: {}", e))?;
+
+        Ok(OrderResult {
+            order_id: resp.order_id,
+            success: resp.success,
+            status: format!("{:?}", resp.status),
+            error: resp.error_msg,
+            latency_us: 0,
+        })
+    })
+}
+
+async fn sdk_gtc_sell(
+    pk: &str,
+    api_key: &str,
+    api_secret: &str,
+    api_passphrase: &str,
+    token_id: &str,
+    shares: f64,
+    price: f64,
+    post_only: bool,
+) -> Result<OrderResult, String> {
+    with_client!(pk, api_key, api_secret, api_passphrase, |client, signer| {
+        use polymarket_client_sdk::clob::types::{OrderType, Side};
+        use polymarket_client_sdk::types::{Decimal, U256};
+
+        let token_u256 = U256::from_str(token_id)
+            .map_err(|e| format!("bad token: {}", e))?;
+
+        let size_dec = Decimal::from_str(&format!("{:.2}", shares))
+            .map_err(|e| format!("bad size: {}", e))?;
+        let price_dec = Decimal::from_str(&format!("{:.4}", price))
+            .map_err(|e| format!("bad price: {}", e))?;
+
+        let mut builder = client
+            .limit_order()
+            .token_id(token_u256)
+            .size(size_dec)
+            .price(price_dec)
+            .side(Side::Sell)
+            .order_type(OrderType::GTC);
+
+        if post_only {
+            builder = builder.post_only(true);
+        }
+
+        let order = builder.build().await
+            .map_err(|e| format!("build: {}", e))?;
+
+        let signed = client.sign(&signer, order).await
+            .map_err(|e| format!("sign: {}", e))?;
+
+        let resp = client.post_order(signed).await
+            .map_err(|e| format!("post: {}", e))?;
+
+        Ok(OrderResult {
+            order_id: resp.order_id,
+            success: resp.success,
+            status: format!("{:?}", resp.status),
+            error: resp.error_msg,
+            latency_us: 0,
+        })
     })
 }

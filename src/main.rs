@@ -24,8 +24,8 @@ use tracing::{error, info, warn};
 use crate::execution::ExecutionEngine;
 use crate::leadlag_lab::EventRecorder;
 use crate::strategy::{
-    BinanceReturnSignal, ExecutionMode, MarketState, RiskLimits, SignalSnapshot,
-    StrategyAction, compute_signal, evaluate,
+    BinanceReturnSignal, ExecutionMode, MarketState, Position, PositionState, RiskLimits,
+    SignalSnapshot, StrategyAction, compute_signal, evaluate, evaluate_scalp,
 };
 use crate::telemetry::LatencyTracker;
 use crate::types::{BotConfig, ObiSignal, OracleLagDirection, OracleLagSignal, RefSource};
@@ -371,6 +371,8 @@ async fn main() {
             info!("Strategy loop starting (500ms cycle)...");
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
             let mut risk = RiskLimits::default();
+            let mut position = Position::new_flat();
+            let mut last_scalp_exit_us: i64 = 0;
             let mut last_signal_log = 0i64;
             let mut total_decisions = 0u64;
             let mut maker_count = 0u64;
@@ -426,43 +428,74 @@ async fn main() {
                     drop(s);
                 }
 
-                // Evaluate strategy
-                let actions = evaluate(&market_state, &signal, &risk, &config_strat);
+                // Evaluate scalp strategy
+                let actions = evaluate_scalp(
+                    &position, &signal, &market_state, &risk, &config_strat, last_scalp_exit_us,
+                );
 
                 // Execute actions
                 total_decisions += 1;
                 for action in &actions {
                     match action {
-                        StrategyAction::PlaceOrder(req) => {
-                            match signal.mode {
-                                ExecutionMode::Taker => {
-                                    taker_count += 1;
-                                    let spend = req.size * req.price;
+                        StrategyAction::TakerEntry { token_id, spend_usdc, side_label, reason } => {
+                            taker_count += 1;
+                            info!(">>> ENTRY FOK: {} ${:.2} | {}", side_label, spend_usdc, reason);
+                            let result = exec_strat.taker_fok_buy(token_id, *spend_usdc).await;
+                            if let Ok(ref r) = result {
+                                if r.success {
+                                    // Transition to LONG (in paper mode, simulate fill)
+                                    let ask = if *side_label == "UP" {
+                                        market_state.up_best_ask.unwrap_or(0.5)
+                                    } else {
+                                        market_state.dn_best_ask.unwrap_or(0.5)
+                                    };
+                                    position.state = PositionState::Long;
+                                    position.token_id = token_id.clone();
+                                    position.side_label = side_label.clone();
+                                    position.entry_price = ask;
+                                    position.shares = spend_usdc / ask;
+                                    position.entry_time_us = chrono::Utc::now().timestamp_micros();
+                                    position.entry_order_id = Some(r.order_id.clone());
                                     info!(
-                                        ">>> TAKER FOK: {} ${:.2} on {} | {}",
-                                        if req.token_id == market_state.up_token_id { "UP" } else { "DN" },
-                                        spend,
-                                        &req.token_id[..16.min(req.token_id.len())],
-                                        signal.reason,
+                                        ">>> POSITION: LONG {} {:.1}sh @ {:.0}c",
+                                        side_label, position.shares, ask * 100.0
                                     );
-                                    let _ = exec_strat.taker_fok_buy(&req.token_id, spend).await;
                                 }
-                                ExecutionMode::Maker => {
-                                    maker_count += 1;
-                                    info!(
-                                        ">>> MAKER GTC: {} {:.0}sh @ {:.0}c on {} | {}",
-                                        if req.token_id == market_state.up_token_id { "UP" } else { "DN" },
-                                        req.size,
-                                        req.price * 100.0,
-                                        &req.token_id[..16.min(req.token_id.len())],
-                                        signal.reason,
-                                    );
-                                    let _ = exec_strat.maker_gtc_buy(
-                                        &req.token_id, req.size, req.price, req.post_only
-                                    ).await;
-                                }
-                                _ => {}
                             }
+                            risk.order_count_this_window += 1;
+                        }
+                        StrategyAction::MakerExit { token_id, shares, price, reason } => {
+                            maker_count += 1;
+                            info!(">>> EXIT GTC SELL: {:.1}sh @ {:.0}c | {}", shares, price * 100.0, reason);
+                            let result = exec_strat.maker_gtc_sell(token_id, *shares, *price, true).await;
+                            if let Ok(ref r) = result {
+                                position.state = PositionState::Exiting;
+                                position.exit_order_id = Some(r.order_id.clone());
+                                position.exit_posted_at_us = chrono::Utc::now().timestamp_micros();
+                            }
+                            risk.order_count_this_window += 1;
+                        }
+                        StrategyAction::TakerExit { token_id, shares, reason } => {
+                            taker_count += 1;
+                            info!(">>> EXIT FOK SELL: {:.1}sh | {}", shares, reason);
+                            let _ = exec_strat.taker_fok_sell(token_id, *shares).await;
+                            // Back to flat
+                            let pnl_est = if let Some(bid) = if position.side_label == "UP" {
+                                market_state.up_best_bid
+                            } else {
+                                market_state.dn_best_bid
+                            } {
+                                (bid - position.entry_price) * position.shares
+                            } else {
+                                0.0
+                            };
+                            info!(
+                                ">>> POSITION: FLAT (was {} {:.1}sh, est PnL ${:.2}, hold {}ms)",
+                                position.side_label, position.shares, pnl_est, position.hold_time_ms()
+                            );
+                            position = Position::new_flat();
+                            last_scalp_exit_us = chrono::Utc::now().timestamp_micros();
+                            risk.scalps_this_window += 1;
                             risk.order_count_this_window += 1;
                         }
                         StrategyAction::CancelAll => {
