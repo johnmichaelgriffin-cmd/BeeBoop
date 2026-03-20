@@ -134,7 +134,7 @@ impl Default for RiskLimits {
             order_count_this_window: 0,
             kill_switch_triggered: false,
             scalps_this_window: 0,
-            max_scalps_per_window: 1,
+            max_scalps_per_window: 999, // uncapped — one at a time enforced by position state machine
         }
     }
 }

@@ -429,8 +429,9 @@ async fn main() {
                 let wallet = exec_strat.wallet_address().unwrap_or_default();
                 exec_strat.check_usdc_balance(&wallet).await.unwrap_or(0.0)
             };
-            let min_balance_usdc: f64 = 50.0; // Stop if USDC drops below $50
-            info!("💰 Starting USDC balance: ${:.2} | min threshold: ${:.2}", start_balance_usdc, min_balance_usdc);
+            let max_session_loss: f64 = 200.0; // Stop if we lose $200 from starting balance
+            let min_balance_usdc: f64 = (start_balance_usdc - max_session_loss).max(0.0);
+            info!("💰 Starting USDC balance: ${:.2} | stop-loss at ${:.2} (-$200)", start_balance_usdc, min_balance_usdc);
 
             loop {
                 interval.tick().await;
@@ -442,9 +443,9 @@ async fn main() {
                     let wallet = exec_strat.wallet_address().unwrap_or_default();
                     if let Ok(usdc_bal) = exec_strat.check_usdc_balance(&wallet).await {
                         let session_pnl = usdc_bal - start_balance_usdc;
-                        info!("💰 WALLET CHECK: ${:.2} USDC | session PnL: ${:.2}", usdc_bal, session_pnl);
-                        if usdc_bal < min_balance_usdc {
-                            error!("🛑 USDC balance ${:.2} below ${:.2} minimum — STOPPING BOT", usdc_bal, min_balance_usdc);
+                        info!("💰 WALLET CHECK: ${:.2} USDC | session PnL: ${:.2} | stop-loss at -$200", usdc_bal, session_pnl);
+                        if session_pnl <= -max_session_loss {
+                            error!("🛑 SESSION LOSS ${:.2} exceeds -${:.2} limit — STOPPING BOT", session_pnl, max_session_loss);
                             risk.kill_switch_triggered = true;
                         }
                     }
