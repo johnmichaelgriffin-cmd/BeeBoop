@@ -505,12 +505,31 @@ async fn main() {
                                 Ok(ref r) if r.success => {
                                     position.state = PositionState::Long;
                                     position.entry_price = ask;
-                                    position.shares = shares_est;
                                     position.entry_order_id = Some(r.order_id.clone());
+
+                                    // Check on-chain balance to know EXACT shares we hold
+                                    let wallet = exec_strat.wallet_address().unwrap_or_default();
+                                    tokio::time::sleep(std::time::Duration::from_millis(500)).await; // wait for chain
+                                    match exec_strat.check_token_balance(&wallet, token_id).await {
+                                        Ok(actual_shares) if actual_shares > 0.0 => {
+                                            position.shares = actual_shares;
+                                            info!(">>> BALANCE CHECK: {:.1}sh on-chain (estimated {:.0}sh)", actual_shares, shares_est);
+                                        }
+                                        Ok(_) => {
+                                            // Balance is 0 — might not have settled yet, use estimate
+                                            position.shares = shares_est;
+                                            warn!(">>> BALANCE CHECK: 0 on-chain, using estimate {:.0}sh", shares_est);
+                                        }
+                                        Err(e) => {
+                                            position.shares = shares_est;
+                                            warn!(">>> BALANCE CHECK FAILED: {}, using estimate {:.0}sh", e, shares_est);
+                                        }
+                                    }
+
                                     let target_sell = ask * 1.10; // 10% target
                                     info!(
-                                        ">>> FILLED! LONG {} {:.0}sh @ {:.0}c | target sell @ {:.0}c (+10%) | order={}",
-                                        side_label, shares_est, ask * 100.0, target_sell * 100.0, r.order_id
+                                        ">>> FILLED! LONG {} {:.1}sh @ {:.0}c | target sell @ {:.0}c (+10%) | order={}",
+                                        side_label, position.shares, ask * 100.0, target_sell * 100.0, r.order_id
                                     );
                                 }
                                 Ok(ref r) => {

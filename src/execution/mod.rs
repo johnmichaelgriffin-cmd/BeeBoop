@@ -31,6 +31,10 @@ type Decimal = polymarket_client_sdk::types::Decimal;
 
 const CLOB_BASE: &str = "https://clob.polymarket.com";
 
+// Polygon RPC + CTF contract for on-chain balance checks
+const POLYGON_RPC: &str = "https://polygon-bor-rpc.publicnode.com";
+const CTF_CONTRACT: &str = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045";
+
 // ── Tick Size Registry ──────────────────────────────────────────
 
 pub struct TickSizeRegistry {
@@ -197,6 +201,71 @@ impl ExecutionEngine {
 
     pub async fn update_tick_size(&self, ts: &TickSize) {
         self.tick_sizes.write().await.update(ts);
+    }
+
+    /// Check on-chain token balance for a specific token ID.
+    /// Returns the number of shares we hold (as f64, already divided by 1e6).
+    /// Uses the CTF contract's balanceOf(address, tokenId) view call.
+    pub async fn check_token_balance(&self, wallet_address: &str, token_id: &str) -> Result<f64, String> {
+        // balanceOf(address,uint256) selector = 0x00fdd58e
+        let addr_clean = if wallet_address.starts_with("0x") {
+            &wallet_address[2..]
+        } else {
+            wallet_address
+        };
+        let addr_padded = format!("{:0>64}", addr_clean.to_lowercase());
+
+        // Token ID as uint256 hex
+        let token_u256 = U256::from_str(token_id)
+            .map_err(|e| format!("bad token id: {}", e))?;
+        let token_hex = format!("{:064x}", token_u256);
+
+        let call_data = format!("0x00fdd58e{}{}", addr_padded, token_hex);
+
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "eth_call",
+            "params": [{
+                "to": CTF_CONTRACT,
+                "data": call_data
+            }, "latest"],
+            "id": 1
+        });
+
+        // Use a simple one-shot HTTP client for RPC (not on hot path)
+        let client = reqwest::Client::new();
+        let resp = client.post(POLYGON_RPC)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("rpc http: {}", e))?;
+
+        let json: serde_json::Value = resp.json().await
+            .map_err(|e| format!("rpc json: {}", e))?;
+
+        if let Some(error) = json.get("error") {
+            return Err(format!("rpc error: {}", error));
+        }
+
+        let result_hex = json.get("result")
+            .and_then(|r| r.as_str())
+            .ok_or("no result in rpc response")?;
+
+        // Parse hex result → u128 → f64 (CTF uses 1e6 decimals)
+        let hex_clean = result_hex.trim_start_matches("0x");
+        let raw = u128::from_str_radix(hex_clean, 16)
+            .map_err(|e| format!("parse hex: {}", e))?;
+        let balance = raw as f64 / 1_000_000.0;
+
+        Ok(balance)
+    }
+
+    /// Get the wallet address from the private key.
+    pub fn wallet_address(&self) -> Option<String> {
+        let pk = self.private_key.as_ref()?;
+        let pk_clean = if pk.starts_with("0x") { &pk[2..] } else { pk };
+        let signer = PrivateKeySigner::from_str(pk_clean).ok()?;
+        Some(format!("{:?}", signer.address()))
     }
 
     // ── HOT PATH: Order methods ─────────────────────────────────
