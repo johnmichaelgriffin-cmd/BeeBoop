@@ -251,8 +251,7 @@ async fn main() {
                         s.up_token_id = ti.token_id.clone();
                         s.up_best_ask = None;
                         s.up_best_bid = None;
-                        // Set neg_risk=true for this token (5-min BTC markets are neg-risk)
-                        exec_tokens.set_neg_risk(&ti.token_id).await;
+                        // SDK auto-detects neg_risk via GET /neg-risk — don't override manually
                     }
                 } else if outcome_lower.contains("down") {
                     if s.dn_token_id != ti.token_id {
@@ -260,8 +259,6 @@ async fn main() {
                         s.dn_token_id = ti.token_id.clone();
                         s.dn_best_ask = None;
                         s.dn_best_bid = None;
-                        // Set neg_risk=true for this token
-                        exec_tokens.set_neg_risk(&ti.token_id).await;
                     }
                 }
             }
