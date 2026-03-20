@@ -537,27 +537,44 @@ async fn main() {
                         }
                         StrategyAction::TakerExit { token_id, shares, reason } => {
                             taker_count += 1;
-                            // Sell with entry price as floor — never sell at a loss
                             let min_sell_price = position.entry_price;
                             info!(">>> EXIT FOK SELL: {:.0}sh floor={:.0}c | {}", shares, min_sell_price*100.0, reason);
-                            let _ = exec_strat.taker_fok_sell(token_id, *shares, min_sell_price).await;
-                            // Back to flat
-                            let pnl_est = if let Some(bid) = if position.side_label == "UP" {
-                                market_state.up_best_bid
-                            } else {
-                                market_state.dn_best_bid
-                            } {
-                                (bid - position.entry_price) * position.shares
-                            } else {
-                                0.0
+                            let sell_result = exec_strat.taker_fok_sell(token_id, *shares, min_sell_price).await;
+
+                            let sold = match &sell_result {
+                                Ok(r) if r.success => {
+                                    info!(">>> SELL FILLED: order={}", r.order_id);
+                                    true
+                                }
+                                Ok(r) => {
+                                    warn!(">>> SELL REJECTED: status={} err={:?} — STAYING LONG, will retry", r.status, r.error);
+                                    false
+                                }
+                                Err(e) => {
+                                    warn!(">>> SELL ERROR: {} — STAYING LONG, will retry", e);
+                                    false
+                                }
                             };
-                            info!(
-                                ">>> POSITION: FLAT (was {} {:.1}sh, est PnL ${:.2}, hold {}ms)",
-                                position.side_label, position.shares, pnl_est, position.hold_time_ms()
-                            );
-                            position = Position::new_flat();
-                            last_scalp_exit_us = chrono::Utc::now().timestamp_micros();
-                            risk.scalps_this_window += 1;
+
+                            if sold {
+                                let pnl_est = if let Some(bid) = if position.side_label == "UP" {
+                                    market_state.up_best_bid
+                                } else {
+                                    market_state.dn_best_bid
+                                } {
+                                    (bid - position.entry_price) * position.shares
+                                } else {
+                                    0.0
+                                };
+                                info!(
+                                    ">>> POSITION: FLAT (was {} {:.0}sh, est PnL ${:.2}, hold {}ms)",
+                                    position.side_label, position.shares, pnl_est, position.hold_time_ms()
+                                );
+                                position = Position::new_flat();
+                                last_scalp_exit_us = chrono::Utc::now().timestamp_micros();
+                                risk.scalps_this_window += 1;
+                            }
+                            // If sell failed, position stays LONG — strategy will retry exit next cycle
                             risk.order_count_this_window += 1;
                         }
                         StrategyAction::CancelAll => {
