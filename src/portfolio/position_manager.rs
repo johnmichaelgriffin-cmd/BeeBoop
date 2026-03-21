@@ -212,7 +212,19 @@ pub async fn run_position_manager_task(
                             shared.set_state(StrategyState::Cooldown);
                             position_held = false;
                         } else {
-                            warn!(">>> SELL FAILED ({}/3): {} — retry in 2s", exit_attempts, reason);
+                            warn!(">>> SELL FAILED ({}/3): {} — retrying in 2s", exit_attempts, reason);
+                            // Actually retry the sell
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            if let Some(pos) = shared.get_position() {
+                                let _ = exec_cmd_tx.send(ExecutionCommand::ExitTaker {
+                                    market_slug: pos.market_slug.clone(),
+                                    token_id: pos.token_id.clone(),
+                                    side: pos.side,
+                                    shares: pos.size,
+                                    min_price: 0.01,
+                                    reason: format!("retry_{}", exit_attempts),
+                                }).await;
+                            }
                         }
                     }
 
@@ -222,7 +234,28 @@ pub async fn run_position_manager_task(
 
             // Check exit conditions every 50ms while in position
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if position_held => {
-                if shared.get_state() != StrategyState::InPosition {
+                let current_state = shared.get_state();
+
+                // If stuck in Exiting for >15s, force reset
+                if current_state == StrategyState::Exiting {
+                    if let Some(pos) = shared.get_position() {
+                        let stuck_ms = chrono::Utc::now().timestamp_millis() - pos.entry_ts_ms;
+                        if stuck_ms > 15_000 {
+                            warn!(">>> STUCK IN EXITING for {}s — forcing back to Idle", stuck_ms / 1000);
+                            shared.clear_position();
+                            shared.set_state(StrategyState::Idle);
+                            position_held = false;
+                        }
+                    } else {
+                        // No position but stuck in Exiting — reset
+                        warn!(">>> EXITING with no position — forcing back to Idle");
+                        shared.set_state(StrategyState::Idle);
+                        position_held = false;
+                    }
+                    continue;
+                }
+
+                if current_state != StrategyState::InPosition {
                     continue;
                 }
 
