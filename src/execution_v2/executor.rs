@@ -230,16 +230,23 @@ async fn execute_fok_buy(
     spend_usdc: f64,
     _max_price: f64,
 ) -> Result<FillResult, String> {
-    use polymarket_client_sdk::clob::types::{Amount, OrderType, Side};
+    use polymarket_client_sdk::clob::types::{OrderType, Side};
 
     let token_u256 = U256::from_str(token_id).map_err(|e| format!("token: {}", e))?;
-    let amount = Amount::usdc(
-        Decimal::from_str(&format!("{:.2}", spend_usdc)).map_err(|e| format!("dec: {}", e))?
-    ).map_err(|e| format!("amount: {}", e))?;
 
-    let order = client.market_order()
+    // Calculate shares from spend / approximate ask price
+    // Use 99c limit to sweep the entire book (proven approach from v1)
+    let shares = (spend_usdc / 0.99).floor().max(1.0);
+    let size_dec = Decimal::from_str(&format!("{:.2}", shares)).map_err(|e| format!("dec: {}", e))?;
+    let price_dec = Decimal::from_str("0.99").map_err(|e| format!("dec: {}", e))?;
+
+    info!("FOK BUY: {:.2}sh limit@99c (${:.2} spend), token={}...{}",
+        shares, spend_usdc, &token_id[..8.min(token_id.len())], &token_id[token_id.len().saturating_sub(8)..]);
+
+    let order = client.limit_order()
         .token_id(token_u256)
-        .amount(amount)
+        .size(size_dec)
+        .price(price_dec)
         .side(Side::Buy)
         .order_type(OrderType::FOK)
         .build().await
