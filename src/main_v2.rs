@@ -111,7 +111,16 @@ async fn main() -> Result<()> {
         log_tx.clone(),
     ));
 
-    // ── 3. Polymarket price feed (REST polling) ─────────────────
+    // ── 3a. Polymarket price feed — WebSocket (primary, real-time) ──
+    let pm_top_watch_tx_ws = pm_top_watch_tx.clone();
+    tokio::spawn(feeds::market_ws::run_market_ws_task(
+        market_watch_rx.clone(),
+        polymarket_tx.clone(),
+        pm_top_watch_tx_ws,
+        log_tx.clone(),
+    ));
+
+    // ── 3b. Polymarket price feed — REST polling (fallback, 100ms) ──
     tokio::spawn(feeds::polymarket_ws::run_polymarket_ws_task(
         market_watch_rx.clone(),
         polymarket_tx,
