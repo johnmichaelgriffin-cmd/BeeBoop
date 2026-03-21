@@ -98,23 +98,27 @@ pub struct Signal {
     pub side: Side,
     pub entry_mode: EntryMode,
 
-    // Raw features
+    // Raw return features
     pub r200_bps: f64,
     pub r500_bps: f64,
     pub r800_bps: f64,
     pub r2000_bps: f64,
     pub fast_move_bps: f64,
-    pub basis_bps: f64,
-    pub obi: f64,
+
+    // Oracle lag features (corrected — debiased)
+    pub raw_basis_bps: f64,
+    pub basis_dev_bps: f64,   // raw - EMA_60s (debiased)
+    pub dbasis_bps: f64,      // short-horizon slope (250ms delta)
+
+    // Smoothed OBI
+    pub obi_ema: f64,
 
     // Combined score
     pub score: f64,
     pub confidence: f64,
 
-    // Confirmation flags
-    pub confirms_r2s: bool,
-    pub confirms_basis: bool,
-    pub confirms_obi: bool,
+    // Strong contradiction flag (hard veto)
+    pub strong_contradiction: bool,
 }
 
 // ── Position Types ──────────────────────────────────────────────
@@ -213,7 +217,9 @@ pub enum LogEvent {
         side: Side,
         token_id: String,
         notional: f64,
-        move_bps: f64,
+        score: f64,
+        fast_move_bps: f64,
+        basis_dev_bps: f64,
     },
     EntryFilled {
         ts_ms: i64,

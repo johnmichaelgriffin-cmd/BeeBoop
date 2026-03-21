@@ -13,10 +13,28 @@ use crate::config_v2::Config;
 use crate::state::SharedState;
 use crate::types_v2::*;
 
-/// Compute dynamic notional based on score strength and confirmations.
-fn compute_notional(score_abs: f64, base: f64, max: f64, all_three_confirm: bool) -> f64 {
-    let mut n = base * (0.75 + 0.75 * score_abs.min(2.0));
-    if all_three_confirm {
+fn sign_matches(side: Side, x: f64) -> bool {
+    match side {
+        Side::Up => x > 0.0,
+        Side::Down => x < 0.0,
+    }
+}
+
+/// Compute dynamic notional based on score strength + feature alignment bonus.
+fn compute_notional(signal: &Signal, base: f64, max: f64) -> f64 {
+    let mut n = base * (0.8 + 0.8 * signal.score.abs().min(2.0));
+
+    // Aligned bonus: r2s, basis_dev, dbasis all agree AND OBI not strongly opposite
+    let obi_not_opposite = match signal.side {
+        Side::Up => signal.obi_ema >= -0.50,
+        Side::Down => signal.obi_ema <= 0.50,
+    };
+    let aligned = sign_matches(signal.side, signal.r2000_bps)
+        && sign_matches(signal.side, signal.basis_dev_bps)
+        && sign_matches(signal.side, signal.dbasis_bps)
+        && obi_not_opposite;
+
+    if aligned {
         n *= 1.25;
     }
     n.clamp(base, max)
@@ -110,22 +128,15 @@ pub async fn run_strategy_task(
             continue;
         }
 
-        // Dynamic sizing
-        let all_confirm = signal.confirms_r2s && signal.confirms_basis && signal.confirms_obi;
-        let notional = compute_notional(
-            signal.score.abs(),
-            config.base_notional,
-            config.max_notional,
-            all_confirm,
-        );
+        // Dynamic sizing — corrected production version
+        let notional = compute_notional(&signal, config.base_notional, config.max_notional);
 
         let side_label = if signal.side == Side::Up { "UP" } else { "DN" };
         let shares_est = (notional / ask_price) as u32;
 
-        info!(">>> ENTRY FOK: {} ${:.0} ~{}sh @ {:.0}c | score={:.2} fast={:.1}bps basis={:.1}bps conf={}/3",
+        info!(">>> ENTRY FOK: {} ${:.0} ~{}sh @ {:.0}c | score={:.3} fast={:.1}bps r2s={:.1}bps bdev={:.1}bps db={:.1}bps obi={:.2}",
             side_label, notional, shares_est, ask_price * 100.0,
-            signal.score, signal.fast_move_bps, signal.basis_bps,
-            signal.confirms_r2s as u8 + signal.confirms_basis as u8 + signal.confirms_obi as u8,
+            signal.score, signal.fast_move_bps, signal.r2000_bps, signal.basis_dev_bps, signal.dbasis_bps, signal.obi_ema,
         );
 
         // Transition to Entering
@@ -136,7 +147,9 @@ pub async fn run_strategy_task(
             side: signal.side,
             token_id: token_id.clone(),
             notional,
-            move_bps: signal.fast_move_bps,
+            score: signal.score,
+            fast_move_bps: signal.fast_move_bps,
+            basis_dev_bps: signal.basis_dev_bps,
         }).await;
 
         let _ = exec_cmd_tx.send(ExecutionCommand::EnterTaker {

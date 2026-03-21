@@ -9,6 +9,9 @@ pub struct Config {
 
     // Signal params
     pub lookback_ms: i64,
+    pub basis_slope_lookback_ms: i64,
+    pub basis_ema_tau_ms: f64,
+    pub obi_ema_tau_ms: f64,
     pub trigger_min_fast_move_bps: f64,
     pub maker_score_min: f64,
     pub taker_score_min: f64,
@@ -55,29 +58,32 @@ impl Default for Config {
             mode: BotMode::DryRun,
             market: "btc".to_string(),
 
-            // Signal — production defaults from spec
+            // Signal — corrected production defaults
             lookback_ms: 800,
-            trigger_min_fast_move_bps: 1.25,
-            maker_score_min: 0.85,
-            taker_score_min: 1.35,
-            max_signal_age_ms: 1100,
-            maker_max_signal_age_ms: 700,
+            basis_slope_lookback_ms: 250,
+            basis_ema_tau_ms: 60_000.0,
+            obi_ema_tau_ms: 250.0,
+            trigger_min_fast_move_bps: 0.70,
+            maker_score_min: 0.45,
+            taker_score_min: 0.90,
+            max_signal_age_ms: 1400,
+            maker_max_signal_age_ms: 900,
 
             // Exit — production defaults
             take_profit_cents: 4.0,
             stop_loss_cents: 3.0,
             max_hold_ms: 2_500,
-            cooldown_ms: 4_000,
+            cooldown_ms: 2_000,
             opposite_signal_exit_score: 1.2,
 
             // Sizing
             base_notional: 25.0,
-            max_notional: 125.0,
+            max_notional: 150.0,
 
             // Risk
             max_one_position: true,
             session_stop_loss: -200.0,
-            max_spread_cents: 3.0,
+            max_spread_cents: 4.0,
             max_entry_price: 0.97,
             min_time_to_expiry_s: 20,
             wallet_check_interval_s: 300,
