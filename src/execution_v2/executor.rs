@@ -168,6 +168,58 @@ pub async fn run_executor_task(
                 }
             }
 
+            ExecutionCommand::SyntheticExit { market_slug, opposite_token_id, opposite_side, notional, reason } => {
+                // Synthetic exit = BUY the opposite side to go economically flat.
+                // This is just a regular FOK BUY — USDC is always available, no settlement needed.
+                let sent_ts_ms = chrono::Utc::now().timestamp_millis();
+                let start = Instant::now();
+
+                let max_price = 0.99; // sweep the book
+
+                let result = if let Some((ref cli, ref signer)) = client {
+                    execute_fok_buy(cli, signer, &opposite_token_id, notional, max_price).await
+                } else {
+                    let shares = notional / 0.50; // dry run estimate
+                    Ok(FillResult {
+                        order_id: format!("dry-synth-{}", sent_ts_ms),
+                        filled_price: 0.50,
+                        filled_size: shares,
+                    })
+                };
+
+                let latency_ms = start.elapsed().as_millis() as i64;
+                let ack_ts_ms = chrono::Utc::now().timestamp_millis();
+
+                match result {
+                    Ok(fill) => {
+                        info!(">>> SYNTHETIC EXIT FILLED: bought {} {}sh @ {:.0}c | {}ms | {}",
+                            if opposite_side == Side::Up { "UP" } else { "DN" },
+                            fill.filled_size as u32,
+                            fill.filled_price * 100.0,
+                            latency_ms,
+                            reason,
+                        );
+                        let _ = evt_tx.send(ExecutionEvent::SyntheticExitFilled {
+                            ts_ms: ack_ts_ms,
+                            market_slug,
+                            opposite_token_id,
+                            opposite_side,
+                            filled_price: fill.filled_price,
+                            filled_size: fill.filled_size,
+                            notional,
+                            reason,
+                        }).await;
+                    }
+                    Err(e) => {
+                        warn!(">>> SYNTHETIC EXIT FAILED: {} | {}ms", e, latency_ms);
+                        let _ = evt_tx.send(ExecutionEvent::SyntheticExitRejected {
+                            ts_ms: ack_ts_ms,
+                            reason: e,
+                        }).await;
+                    }
+                }
+            }
+
             ExecutionCommand::CancelAll { reason } => {
                 if let Some((ref cli, _)) = client {
                     match cli.cancel_all_orders().await {

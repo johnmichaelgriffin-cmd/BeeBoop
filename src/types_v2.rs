@@ -156,6 +156,15 @@ pub enum ExecutionCommand {
         min_price: f64,
         reason: String,
     },
+    /// Synthetic exit: buy the OPPOSITE side to go economically flat instantly.
+    /// No settlement wait needed — USDC is always available for buying.
+    SyntheticExit {
+        market_slug: String,
+        opposite_token_id: String,
+        opposite_side: Side,
+        notional: f64,
+        reason: String,
+    },
     CancelAll {
         reason: String,
     },
@@ -191,6 +200,21 @@ pub enum ExecutionEvent {
         order_id: String,
     },
     ExitRejected {
+        ts_ms: i64,
+        reason: String,
+    },
+    /// Synthetic exit filled — we bought the opposite side to go flat
+    SyntheticExitFilled {
+        ts_ms: i64,
+        market_slug: String,
+        opposite_token_id: String,
+        opposite_side: Side,
+        filled_price: f64,
+        filled_size: f64,
+        notional: f64,
+        reason: String,
+    },
+    SyntheticExitRejected {
         ts_ms: i64,
         reason: String,
     },

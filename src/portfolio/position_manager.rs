@@ -138,11 +138,9 @@ pub async fn run_position_manager_task(
                         exit_attempts = 0;
                         position_held = true;
 
-                        // Blind 6s wait for settlement — the successful sell on 3/20 confirmed at 6s
-                        // The working v1 polled every 3s; first success was attempt 2 (6s)
-                        info!(">>> Waiting 6s for settlement...");
-                        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-                        info!(">>> Settlement done — SELLING IMMEDIATELY");
+                        // No settlement wait needed — exits use synthetic (buy opposite side)
+                        // which uses USDC (always available), not token inventory
+                        info!(">>> Position open — monitoring for exit (synthetic mode)");
 
                         // SELL RIGHT NOW — don't wait for signals or price targets
                         // This is a mechanic test: can we sell at all?
@@ -249,6 +247,87 @@ pub async fn run_position_manager_task(
                         }
                     }
 
+                    ExecutionEvent::SyntheticExitFilled {
+                        opposite_side, filled_price, filled_size, notional, reason, ..
+                    } => {
+                        // We're now economically flat — we hold both sides.
+                        // The original position + this hedge = ~$1 at resolution.
+                        if let Some(pos) = shared.get_position() {
+                            let hold_ms = chrono::Utc::now().timestamp_millis() - pos.entry_ts_ms;
+                            // Estimate P&L: we spent pos.notional on original + notional on hedge
+                            // At resolution one side pays $1 per share. Net ≈ shares - total_spent.
+                            let total_spent = pos.notional + notional;
+                            let est_payout = pos.size; // original shares → $1 each at resolution if we win
+                            // But we hedged, so we get ~$1 per pair regardless
+                            let est_pnl = pos.size - total_spent; // rough: shares minus total cost
+                            info!(">>> SYNTHETIC EXIT DONE: {} {:.0}sh hedge @ {:.0}c | est PnL ${:.2} | hold={}ms | {}",
+                                if opposite_side == Side::Up { "UP" } else { "DN" },
+                                filled_size, filled_price * 100.0,
+                                est_pnl, hold_ms, reason);
+
+                            let _ = log_tx.send(LogEvent::PositionClosed {
+                                ts_ms: chrono::Utc::now().timestamp_millis(),
+                                market_slug: pos.market_slug.clone(),
+                                side: pos.side,
+                                entry_price: pos.entry_price,
+                                exit_price: filled_price,
+                                size: pos.size,
+                                pnl_usdc: est_pnl,
+                                hold_ms,
+                                reason: format!("synthetic_{}", reason),
+                            }).await;
+                        }
+
+                        shared.clear_position();
+                        shared.set_cooldown(chrono::Utc::now().timestamp_millis() + config.cooldown_ms);
+                        shared.set_state(StrategyState::Cooldown);
+                        position_held = false;
+                        exit_attempts = 0;
+
+                        let cooldown = config.cooldown_ms as u64;
+                        let shared_clone = shared.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(cooldown)).await;
+                            if *shared_clone.strategy_state.read() == StrategyState::Cooldown {
+                                shared_clone.set_state(StrategyState::Idle);
+                                info!(">>> COOLDOWN EXPIRED — back to Idle");
+                            }
+                        });
+                    }
+
+                    ExecutionEvent::SyntheticExitRejected { reason, .. } => {
+                        exit_attempts += 1;
+                        if exit_attempts >= 3 {
+                            warn!(">>> SYNTHETIC EXIT FAILED 3x: {} — holding to resolution", reason);
+                            shared.clear_position();
+                            shared.set_cooldown(chrono::Utc::now().timestamp_millis() + config.cooldown_ms);
+                            shared.set_state(StrategyState::Cooldown);
+                            position_held = false;
+                        } else {
+                            warn!(">>> SYNTHETIC EXIT FAILED ({}/3): {} — retrying in 1s", exit_attempts, reason);
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            // Retry — reconstruct from position
+                            if let Some(pos) = shared.get_position() {
+                                let market = market_rx.borrow().clone();
+                                let opposite_token_id = match pos.side {
+                                    Side::Up => market.down_token_id.clone(),
+                                    Side::Down => market.up_token_id.clone(),
+                                };
+                                let opposite_side = match pos.side {
+                                    Side::Up => Side::Down,
+                                    Side::Down => Side::Up,
+                                };
+                                let _ = exec_cmd_tx.send(ExecutionCommand::SyntheticExit {
+                                    market_slug: pos.market_slug.clone(),
+                                    opposite_token_id,
+                                    opposite_side,
+                                    notional: pos.notional,
+                                    reason: format!("retry_{}", exit_attempts),
+                                }).await;
+                            }
+                        }
+                    }
+
                     ExecutionEvent::CancelAck { .. } => {}
                 }
             }
@@ -294,52 +373,70 @@ pub async fn run_position_manager_task(
                 if let Some(bid) = current_bid {
                     let pnl_cents = (bid - pos.entry_price) * 100.0;
 
-                    // ── Take profit: +4c ────────────────────
+                    // Helper: get opposite token for synthetic exit
+                    let market = market_rx.borrow().clone();
+                    let opposite_token_id = match pos.side {
+                        Side::Up => market.down_token_id.clone(),
+                        Side::Down => market.up_token_id.clone(),
+                    };
+                    let opposite_side = match pos.side {
+                        Side::Up => Side::Down,
+                        Side::Down => Side::Up,
+                    };
+
+                    // ── Take profit: +4c — SYNTHETIC EXIT (buy opposite side) ──
                     if pnl_cents >= config.take_profit_cents {
-                        info!(">>> EXIT: TAKE PROFIT +{:.1}c | entry={:.0}c bid={:.0}c | hold={}ms",
+                        info!(">>> TAKE PROFIT +{:.1}c | entry={:.0}c bid={:.0}c | hold={}ms — SYNTHETIC EXIT",
                             pnl_cents, pos.entry_price * 100.0, bid * 100.0, hold_ms);
 
                         shared.set_state(StrategyState::Exiting);
-                        let _ = exec_cmd_tx.send(ExecutionCommand::ExitTaker {
+                        let _ = exec_cmd_tx.send(ExecutionCommand::SyntheticExit {
                             market_slug: pos.market_slug.clone(),
-                            token_id: pos.token_id.clone(),
-                            side: pos.side,
-                            shares: pos.size,
-                            min_price: pos.entry_price, // floor = entry
+                            opposite_token_id,
+                            opposite_side,
+                            notional: pos.notional, // match our position size
                             reason: format!("take_profit +{:.1}c", pnl_cents),
                         }).await;
                         continue;
                     }
 
-                    // ── Stop loss: -3c — TRY to sell, hold if sell fails ──
+                    // ── Stop loss: -3c — SYNTHETIC EXIT ──
                     if pnl_cents <= -config.stop_loss_cents {
-                        info!(">>> STOP LOSS: {:.1}c | entry={:.0}c bid={:.0}c | hold={}ms — ATTEMPTING SELL",
+                        info!(">>> STOP LOSS {:.1}c | entry={:.0}c bid={:.0}c | hold={}ms — SYNTHETIC EXIT",
                             pnl_cents, pos.entry_price * 100.0, bid * 100.0, hold_ms);
 
                         shared.set_state(StrategyState::Exiting);
-                        let _ = exec_cmd_tx.send(ExecutionCommand::ExitTaker {
+                        let _ = exec_cmd_tx.send(ExecutionCommand::SyntheticExit {
                             market_slug: pos.market_slug.clone(),
-                            token_id: pos.token_id.clone(),
-                            side: pos.side,
-                            shares: pos.size,
-                            min_price: 0.01, // sell at ANY price to cut losses
+                            opposite_token_id,
+                            opposite_side,
+                            notional: pos.notional,
                             reason: format!("stop_loss {:.1}c", pnl_cents),
                         }).await;
                         continue;
                     }
                 }
 
-                // ── Time stop: 2.5s max hold — TRY to sell ────
+                // ── Time stop: 2.5s max hold — SYNTHETIC EXIT ──
                 if hold_ms >= config.max_hold_ms {
-                    info!(">>> TIME STOP: hold={}ms — ATTEMPTING SELL", hold_ms);
+                    let market = market_rx.borrow().clone();
+                    let opposite_token_id = match pos.side {
+                        Side::Up => market.down_token_id.clone(),
+                        Side::Down => market.up_token_id.clone(),
+                    };
+                    let opposite_side = match pos.side {
+                        Side::Up => Side::Down,
+                        Side::Down => Side::Up,
+                    };
+
+                    info!(">>> TIME STOP: hold={}ms — SYNTHETIC EXIT", hold_ms);
 
                     shared.set_state(StrategyState::Exiting);
-                    let _ = exec_cmd_tx.send(ExecutionCommand::ExitTaker {
+                    let _ = exec_cmd_tx.send(ExecutionCommand::SyntheticExit {
                         market_slug: pos.market_slug.clone(),
-                        token_id: pos.token_id.clone(),
-                        side: pos.side,
-                        shares: pos.size,
-                        min_price: 0.01, // sell at ANY price
+                        opposite_token_id,
+                        opposite_side,
+                        notional: pos.notional,
                         reason: format!("time_stop {}ms", hold_ms),
                     }).await;
                 }
