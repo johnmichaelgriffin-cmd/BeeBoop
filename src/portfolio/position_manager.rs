@@ -117,15 +117,11 @@ pub async fn run_position_manager_task(
                         exit_attempts = 0;
                         position_held = true;
 
-                        // Poll CLOB for trade settlement (MATCHED→MINED)
-                        // instead of blind wait — exit as soon as tokens are available
-                        info!(">>> POLLING for settlement...");
-                        let settled = poll_settlement(&order_id, 10, 500).await;
-                        if settled {
-                            info!(">>> Settlement CONFIRMED — monitoring for exit");
-                        } else {
-                            warn!(">>> Settlement not confirmed after 5s — proceeding anyway");
-                        }
+                        // Blind 3s wait for on-chain settlement (proven approach from v1)
+                        // Polling was unreliable and added 5s+ delay
+                        info!(">>> Waiting 3s for settlement...");
+                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        info!(">>> Settlement wait complete — monitoring for exit");
                     }
 
                     ExecutionEvent::EntryRejected { reason, .. } => {

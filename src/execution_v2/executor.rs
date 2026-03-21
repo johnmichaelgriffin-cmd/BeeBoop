@@ -291,18 +291,17 @@ async fn execute_fok_sell(
     let size_dec = Decimal::from_str(&format!("{:.2}", shares_rounded))
         .map_err(|e| format!("dec: {}", e))?;
 
-    // Sell via limit_order at floor price with FOK
-    // This ensures we NEVER sell below entry price
-    let price_rounded = (min_price * 100.0).round() / 100.0;
-    let price_dec = Decimal::from_str(&format!("{:.2}", price_rounded))
-        .map_err(|e| format!("dec: {}", e))?;
+    // Sell via market_order with Amount::shares — proven approach from v1
+    // This is what successfully sold on 2026-03-20
+    use polymarket_client_sdk::clob::types::Amount;
 
-    info!("FOK SELL: {:.2}sh @ floor {:.2}, token={}...", shares_rounded, price_rounded, &token_id[..16.min(token_id.len())]);
+    let amount = Amount::shares(size_dec).map_err(|e| format!("amount: {}", e))?;
 
-    let order = client.limit_order()
+    info!("FOK SELL: {:.2}sh market_order, token={}...", shares_rounded, &token_id[..16.min(token_id.len())]);
+
+    let order = client.market_order()
         .token_id(token_u256)
-        .size(size_dec)
-        .price(price_dec)
+        .amount(amount)
         .side(Side::Sell)
         .order_type(OrderType::FOK)
         .build().await
@@ -316,7 +315,7 @@ async fn execute_fok_sell(
     if resp.success {
         Ok(FillResult {
             order_id: resp.order_id,
-            filled_price: price_rounded,
+            filled_price: min_price, // approximate — actual fill may differ
             filled_size: shares_rounded,
         })
     } else {
