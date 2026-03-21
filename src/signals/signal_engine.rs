@@ -31,6 +31,9 @@ pub async fn run_signal_engine_task(
 ) {
     let mut buffer: VecDeque<MidEntry> = VecDeque::with_capacity(1000);
     let max_age_ms = 5_000i64; // keep 5s of history
+    let mut tick_count: u64 = 0;
+    let mut last_heartbeat_ms: i64 = 0;
+    let mut last_max_move: f64 = 0.0;
 
     info!("signal_engine: started (lookback={}ms, threshold={}bps)",
         config.lookback_ms, config.entry_threshold_bps);
@@ -73,12 +76,33 @@ pub async fn run_signal_engine_task(
 
         // Compute features
         let move_bps = compute_move_bps(tick.mid, past_mid);
+        tick_count += 1;
+
+        // Track max move for heartbeat
+        if move_bps.abs() > last_max_move.abs() {
+            last_max_move = move_bps;
+        }
 
         let chainlink = chainlink_rx.borrow().clone();
         let basis_bps = chainlink
             .as_ref()
             .map(|cl| compute_basis_bps(tick.mid, cl.price))
             .unwrap_or(0.0);
+
+        // Heartbeat every 30s
+        let now_ms_hb = chrono::Utc::now().timestamp_millis();
+        if now_ms_hb - last_heartbeat_ms > 30_000 {
+            let pm_top = pm_top_rx.borrow().clone();
+            let cl_price = chainlink.as_ref().map(|c| c.price).unwrap_or(0.0);
+            info!("HEARTBEAT: {} ticks | BN=${:.2} CL=${:.2} | max_move={:.1}bps | UP ask={} DN ask={} | state={:?}",
+                tick_count, tick.mid, cl_price, last_max_move,
+                pm_top.up_ask.map(|a| format!("{:.0}c", a*100.0)).unwrap_or("?".into()),
+                pm_top.down_ask.map(|a| format!("{:.0}c", a*100.0)).unwrap_or("?".into()),
+                shared.get_state(),
+            );
+            last_heartbeat_ms = now_ms_hb;
+            last_max_move = 0.0;
+        }
 
         // Check threshold
         if move_bps.abs() < config.entry_threshold_bps {
