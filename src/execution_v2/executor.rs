@@ -286,19 +286,20 @@ async fn execute_fok_buy(
     let token_u256 = U256::from_str(token_id).map_err(|e| format!("token: {}", e))?;
 
     // Lockprofit formula: floor(20 × ask_price) shares at 99c
-    // The matching engine fills at ~ask_price, spending all allocated $,
-    // and price improvement gives us ~20 tokens total.
-    let base_shares = 20.0_f64;
-    let shares = (base_shares * ask_price).floor().max(1.0);
-    let limit_price = 0.99;
+    // Posts N shares where N = floor(20 * ask). Willing to spend N * 0.99.
+    // Price improvement fills at ~ask, so total spend ≈ N * ask ≈ 20 * ask^2.
+    // Result: ~20 tokens per side.
+    let base = 20.0_f64;
+    let shares = (base * ask_price).floor().max(1.0);
 
-    let size_dec = Decimal::from_str(&format!("{:.2}", shares))
+    let size_str = format!("{:.0}", shares); // whole number, no decimals
+    let size_dec = Decimal::from_str(&size_str)
         .map_err(|e| format!("dec: {}", e))?;
     let price_dec = Decimal::from_str("0.99")
         .map_err(|e| format!("dec: {}", e))?;
 
-    info!("FOK BUY: {:.0}sh @ 99c (ask={:.0}c, base=20), token={}...{}",
-        shares, ask_price * 100.0,
+    info!("FOK BUY: {}sh @ 99c (ask={:.0}c, formula=floor(20*{:.2})={:.0}), token={}...{}",
+        size_str, ask_price * 100.0, ask_price, shares,
         &token_id[..8.min(token_id.len())], &token_id[token_id.len().saturating_sub(8)..]);
 
     let order = client.limit_order()

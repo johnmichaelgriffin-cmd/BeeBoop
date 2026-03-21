@@ -108,7 +108,7 @@ pub async fn run_position_manager_task(
                         let exec_tx = exec_cmd_tx.clone();
                         let market = market_rx.borrow().clone();
                         let shared_c = shared.clone();
-                        let pm_top_for_leg2 = _pm_top_rx.clone();
+                        let leg1_price = filled_price; // capture for leg 2 calc
 
                         // Determine opposite side token
                         let (opp_token, opp_side) = match side {
@@ -123,17 +123,14 @@ pub async fn run_position_manager_task(
                                 return; // state changed (window rolled), abort
                             }
 
-                            // Read the CURRENT ask of the opposite token (after repricing)
-                            let top = pm_top_for_leg2.borrow().clone();
-                            let opp_ask = match opp_side {
-                                Side::Up => top.up_ask.unwrap_or(0.50),
-                                Side::Down => top.down_ask.unwrap_or(0.50),
-                            };
+                            // Use 1 - leg1_price as the opposite ask.
+                            // Binary market: UP + DN = $1. Don't read stale book.
+                            let opp_ask = 1.0 - leg1_price;
 
                             let opp_label = if opp_side == Side::Up { "UP" } else { "DN" };
                             let shares_to_post = (20.0_f64 * opp_ask).floor();
-                            info!(">>> REPRICING DONE — buying LEG 2: {} {:.0}sh @ 99c (ask={:.0}c)",
-                                opp_label, shares_to_post, opp_ask * 100.0);
+                            info!(">>> REPRICING DONE — buying LEG 2: {} {:.0}sh @ 99c (price=1-{:.0}c={:.0}c)",
+                                opp_label, shares_to_post, leg1_price * 100.0, opp_ask * 100.0);
 
                             shared_c.set_state(StrategyState::BuyingSecondLeg);
 
