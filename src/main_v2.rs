@@ -161,6 +161,7 @@ async fn main() -> Result<()> {
     tokio::spawn(portfolio::position_manager::run_position_manager_task(
         config.clone(),
         shared.clone(),
+        market_watch_rx.clone(),
         pm_top_watch_rx,
         exec_evt_rx,
         exec_cmd_tx,

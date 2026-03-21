@@ -71,6 +71,7 @@ async fn poll_settlement(order_id: &str, max_attempts: u32, interval_ms: u64) ->
 pub async fn run_position_manager_task(
     config: Config,
     shared: SharedState,
+    market_rx: watch::Receiver<MarketDescriptor>,
     pm_top_rx: watch::Receiver<PolymarketTop>,
     mut exec_evt_rx: mpsc::Receiver<ExecutionEvent>,
     exec_cmd_tx: mpsc::Sender<ExecutionCommand>,
@@ -82,8 +83,28 @@ pub async fn run_position_manager_task(
     // Process execution events + poll for exit conditions
     let mut exit_attempts = 0u32;
     let mut position_held = false;
+    let mut last_window_ts: i64 = 0;
 
     loop {
+        // ── Window change detection: force reset to Idle on every new 5-min window ──
+        {
+            let market = market_rx.borrow().clone();
+            if market.window_start_ts > 0 && market.window_start_ts != last_window_ts {
+                if last_window_ts > 0 {
+                    let state = shared.get_state();
+                    if state != StrategyState::Idle {
+                        info!(">>> NEW WINDOW detected ({}→{}) — forcing state from {:?} to Idle",
+                            last_window_ts, market.window_start_ts, state);
+                        shared.clear_position();
+                        shared.set_state(StrategyState::Idle);
+                        position_held = false;
+                        exit_attempts = 0;
+                    }
+                }
+                last_window_ts = market.window_start_ts;
+            }
+        }
+
         tokio::select! {
             // Handle execution events
             evt = exec_evt_rx.recv() => {
