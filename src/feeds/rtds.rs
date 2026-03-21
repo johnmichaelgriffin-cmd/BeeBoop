@@ -75,7 +75,7 @@ async fn connect_and_stream(
                 }
             }
             _ = ping_interval.tick() => {
-                write.send(Message::Text("PING".to_string().into())).await?;
+                write.send(Message::Ping(vec![].into())).await?;
             }
         }
     }

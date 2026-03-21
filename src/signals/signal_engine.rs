@@ -96,6 +96,25 @@ pub async fn run_signal_engine_task(
             continue;
         }
 
+        // Window timing gate — don't enter too early or too late
+        {
+            let market = _market_rx.borrow().clone();
+            if market.window_end_ts > 0 {
+                let now_s = now_ms / 1000;
+                let elapsed = now_s - market.window_start_ts;
+                let time_to_end = market.window_end_ts - now_s;
+
+                // Don't enter before T+15s (let orderbook populate)
+                if elapsed < 15 {
+                    continue;
+                }
+                // Don't enter after T+240s (too close to resolution)
+                if elapsed >= 240 || time_to_end < 20 {
+                    continue;
+                }
+            }
+        }
+
         // Check Polymarket book exists
         let pm_top = pm_top_rx.borrow().clone();
         let has_book = if move_bps > 0.0 {

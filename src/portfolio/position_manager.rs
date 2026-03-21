@@ -61,6 +61,12 @@ pub async fn run_position_manager_task(
                         shared.set_state(StrategyState::InPosition);
                         exit_attempts = 0;
                         position_held = true;
+
+                        // Wait for on-chain settlement before allowing sells
+                        // CLOB returns Matched but tokens aren't available until Mined
+                        info!(">>> WAITING 6s for settlement...");
+                        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                        info!(">>> Settlement wait complete — monitoring for exit");
                     }
 
                     ExecutionEvent::EntryRejected { reason, .. } => {
