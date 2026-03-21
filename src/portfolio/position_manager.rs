@@ -44,8 +44,8 @@ pub async fn run_position_manager_task(
     info!("position_manager: target=20sh/side, cooldown={}ms", config.cooldown_ms);
 
     let mut current_pair: Option<PairTrade> = None;
-    let mut window_shares_bought: f64 = 0.0; // total shares bought this window (both sides)
-    let max_shares_per_side: f64 = 20.0;     // cap per window
+    let mut window_pair_done: bool = false;   // ONE pair per window, period
+    let mut window_shares_bought: f64 = 0.0;  // tracking only
     let mut last_window_ts: i64 = 0;
     let reprice_wait_ms: u64 = 2000;         // wait 2s for repricing before buying second leg
 
@@ -63,6 +63,7 @@ pub async fn run_position_manager_task(
                     shared.clear_position();
                     shared.set_state(StrategyState::Idle);
                     current_pair = None;
+                    window_pair_done = false;
                     window_shares_bought = 0.0;
                 }
                 last_window_ts = market.window_start_ts;
@@ -195,45 +196,20 @@ pub async fn run_position_manager_task(
                                 opp_label, filled_size, filled_price * 100.0);
                         }
 
-                        // Done — cooldown, then ready for next pair
+                        // ONE pair per window. Done. Wait for next window.
+                        window_pair_done = true;
                         shared.set_state(StrategyState::PairComplete);
                         current_pair = None;
-
-                        // Check if we've hit the per-window cap
-                        if window_shares_bought >= max_shares_per_side * 2.0 {
-                            info!(">>> WINDOW CAP HIT: {:.0}sh bought — done for this window", window_shares_bought);
-                            shared.set_state(StrategyState::PairComplete);
-                        } else {
-                            // Brief cooldown then ready for more
-                            let cooldown = config.cooldown_ms as u64;
-                            let shared_clone = shared.clone();
-                            tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(cooldown)).await;
-                                if *shared_clone.strategy_state.read() == StrategyState::PairComplete
-                                    || *shared_clone.strategy_state.read() == StrategyState::Cooldown {
-                                    shared_clone.set_state(StrategyState::Idle);
-                                    info!(">>> COOLDOWN DONE — ready for next pair");
-                                }
-                            });
-                        }
+                        info!(">>> DONE FOR THIS WINDOW — waiting for next window");
                     }
 
                     ExecutionEvent::SecondLegRejected { reason, .. } => {
                         warn!(">>> LEG 2 FAILED: {} — holding leg 1 to resolution", reason);
-                        // We have leg 1 but couldn't get leg 2.
-                        // That's OK — hold leg 1 to resolution. It's a directional bet now.
+                        // Done for this window even if leg 2 failed
+                        window_pair_done = true;
                         current_pair = None;
                         shared.set_state(StrategyState::PairComplete);
-
-                        let cooldown = config.cooldown_ms as u64;
-                        let shared_clone = shared.clone();
-                        tokio::spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(cooldown)).await;
-                            if *shared_clone.strategy_state.read() == StrategyState::PairComplete {
-                                shared_clone.set_state(StrategyState::Idle);
-                                info!(">>> COOLDOWN DONE — ready for next pair");
-                            }
-                        });
+                        info!(">>> DONE FOR THIS WINDOW (leg 2 failed) — waiting for next window");
                     }
 
                     // Legacy events — ignore
