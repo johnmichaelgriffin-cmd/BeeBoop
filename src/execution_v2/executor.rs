@@ -234,13 +234,19 @@ async fn execute_fok_buy(
 
     let token_u256 = U256::from_str(token_id).map_err(|e| format!("token: {}", e))?;
 
-    // Fixed 20 shares at 99c limit — simple, proven approach from v1
-    // Price improvement fills us at the actual ask, not 99c
+    // Buy 20 shares at ask + 3c limit (not 99c — that sweeps into expensive levels)
+    // Price improvement fills us at the actual ask, limit just caps the max we'll pay
     let shares = 20.0_f64;
-    let size_dec = Decimal::from_str("20.00").map_err(|e| format!("dec: {}", e))?;
-    let price_dec = Decimal::from_str("0.99").map_err(|e| format!("dec: {}", e))?;
+    let limit_price = (_max_price + 0.03).min(0.97);
+    let limit_price_rounded = (limit_price * 100.0).round() / 100.0;
 
-    info!("FOK BUY: 20sh limit@99c, token={}...{}",
+    let size_dec = Decimal::from_str(&format!("{:.2}", shares))
+        .map_err(|e| format!("dec: {}", e))?;
+    let price_dec = Decimal::from_str(&format!("{:.2}", limit_price_rounded))
+        .map_err(|e| format!("dec: {}", e))?;
+
+    info!("FOK BUY: {:.0}sh limit@{:.0}c, token={}...{}",
+        shares, limit_price_rounded * 100.0,
         &token_id[..8.min(token_id.len())], &token_id[token_id.len().saturating_sub(8)..]);
 
     let order = client.limit_order()
@@ -258,9 +264,9 @@ async fn execute_fok_buy(
         .map_err(|e| format!("post: {}", e))?;
 
     if resp.success {
-        // Estimate fill from spend / ask
-        let estimated_price = spend_usdc / 40.0; // rough estimate
-        let estimated_shares = spend_usdc / estimated_price.max(0.01);
+        // Estimate: 20 shares at approximately the ask price
+        let estimated_price = limit_price_rounded;
+        let estimated_shares = shares;
         Ok(FillResult {
             order_id: resp.order_id,
             filled_price: estimated_price,
