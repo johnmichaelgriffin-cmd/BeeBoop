@@ -120,8 +120,17 @@ pub async fn run_market_ws_task(
                             if let Ok(data) = serde_json::from_str::<Value>(&text) {
                                 events_received += 1;
 
-                                // price_change events carry best_bid and best_ask
-                                if let Some(asset_id) = data.get("asset_id").and_then(|v| v.as_str()) {
+                                // Try multiple event formats:
+                                // 1. price_change: has "asset_id", "best_bid", "best_ask"
+                                // 2. book: has "market" (condition_id), "bids", "asks" arrays
+                                // 3. last_trade_price: has "asset_id", "price"
+
+                                let asset_id = data.get("asset_id")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+
+                                // price_change events
+                                if let Some(ref aid) = asset_id {
                                     let best_ask_val = data.get("best_ask")
                                         .and_then(|v| v.as_str())
                                         .and_then(|s| s.parse::<f64>().ok());
@@ -129,30 +138,60 @@ pub async fn run_market_ws_task(
                                         .and_then(|v| v.as_str())
                                         .and_then(|s| s.parse::<f64>().ok());
 
-                                    if asset_id == up_token {
+                                    if aid == &up_token {
                                         if let Some(a) = best_ask_val { up_ask = Some(a); }
                                         if let Some(b) = best_bid_val { up_bid = Some(b); }
-                                    } else if asset_id == dn_token {
+                                    } else if aid == &dn_token {
                                         if let Some(a) = best_ask_val { dn_ask = Some(a); }
                                         if let Some(b) = best_bid_val { dn_bid = Some(b); }
                                     }
 
-                                    // Also check "price" field for last_trade_price events
+                                    // last_trade_price events — use as fallback
                                     if best_ask_val.is_none() && best_bid_val.is_none() {
                                         if let Some(price) = data.get("price")
                                             .and_then(|v| v.as_str())
                                             .and_then(|s| s.parse::<f64>().ok())
                                         {
-                                            // Use trade price as approximate ask if we have nothing
-                                            if asset_id == up_token && up_ask.is_none() {
+                                            if aid == &up_token && up_ask.is_none() {
                                                 up_ask = Some(price);
-                                            } else if asset_id == dn_token && dn_ask.is_none() {
+                                            } else if aid == &dn_token && dn_ask.is_none() {
                                                 dn_ask = Some(price);
                                             }
                                         }
                                     }
+                                }
 
-                                    // Update shared state
+                                // book snapshot events — have "asks" and "bids" arrays
+                                if let (Some(asks), Some(bids)) = (
+                                    data.get("asks").and_then(|v| v.as_array()),
+                                    data.get("bids").and_then(|v| v.as_array()),
+                                ) {
+                                    // Get the asset_id from the book event
+                                    // Book events may use "asset_id" or we match by "market" condition_id
+                                    let book_asset = data.get("asset_id")
+                                        .and_then(|v| v.as_str())
+                                        .map(|s| s.to_string());
+
+                                    let best_ask = asks.iter()
+                                        .filter_map(|a| a.get("price")?.as_str()?.parse::<f64>().ok())
+                                        .reduce(f64::min);
+                                    let best_bid = bids.iter()
+                                        .filter_map(|b| b.get("price")?.as_str()?.parse::<f64>().ok())
+                                        .reduce(f64::max);
+
+                                    if let Some(ref baid) = book_asset {
+                                        if baid == &up_token {
+                                            if let Some(a) = best_ask { up_ask = Some(a); }
+                                            if let Some(b) = best_bid { up_bid = Some(b); }
+                                        } else if baid == &dn_token {
+                                            if let Some(a) = best_ask { dn_ask = Some(a); }
+                                            if let Some(b) = best_bid { dn_bid = Some(b); }
+                                        }
+                                    }
+                                }
+
+                                // Update shared state on any price change
+                                if up_ask.is_some() || dn_ask.is_some() {
                                     let top = PolymarketTop {
                                         recv_ts_ms: chrono::Utc::now().timestamp_millis(),
                                         up_ask,
@@ -163,10 +202,15 @@ pub async fn run_market_ws_task(
                                     let _ = latest_tx.send(top);
                                 }
 
-                                // Log first few events for debugging
-                                if events_received <= 3 || events_received % 100 == 0 {
-                                    info!("market_ws: event #{} — {}", events_received,
-                                        &text[..80.min(text.len())]);
+                                // Log sparingly — first 3 events then every 5000
+                                if events_received <= 3 || events_received % 5000 == 0 {
+                                    info!("market_ws: #{} | UP ask={} bid={} | DN ask={} bid={}",
+                                        events_received,
+                                        up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
+                                        up_bid.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
+                                        dn_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
+                                        dn_bid.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
+                                    );
                                 }
                             }
                         }
