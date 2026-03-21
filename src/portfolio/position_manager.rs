@@ -244,46 +244,37 @@ pub async fn run_position_manager_task(
                         continue;
                     }
 
-                    // ── Stop loss: -3c ──────────────────────
+                    // ── Stop loss: -3c — TRY to sell, hold if sell fails ──
                     if pnl_cents <= -config.stop_loss_cents {
-                        // Don't panic sell — hold to resolution
-                        info!(">>> STOP LOSS: {:.1}c | entry={:.0}c bid={:.0}c | hold={}ms — holding to resolution",
+                        info!(">>> STOP LOSS: {:.1}c | entry={:.0}c bid={:.0}c | hold={}ms — ATTEMPTING SELL",
                             pnl_cents, pos.entry_price * 100.0, bid * 100.0, hold_ms);
 
-                        let _ = log_tx.send(LogEvent::HoldToResolution {
-                            ts_ms: now_ms,
+                        shared.set_state(StrategyState::Exiting);
+                        let _ = exec_cmd_tx.send(ExecutionCommand::ExitTaker {
                             market_slug: pos.market_slug.clone(),
+                            token_id: pos.token_id.clone(),
                             side: pos.side,
-                            entry_price: pos.entry_price,
-                            size: pos.size,
+                            shares: pos.size,
+                            min_price: 0.01, // sell at ANY price to cut losses
                             reason: format!("stop_loss {:.1}c", pnl_cents),
                         }).await;
-
-                        shared.clear_position();
-                        shared.set_cooldown(now_ms + config.cooldown_ms);
-                        shared.set_state(StrategyState::Cooldown);
-                        position_held = false;
                         continue;
                     }
                 }
 
-                // ── Time stop: 2.5s max hold ────────────────
+                // ── Time stop: 2.5s max hold — TRY to sell ────
                 if hold_ms >= config.max_hold_ms {
-                    info!(">>> TIME STOP: hold={}ms — holding to resolution", hold_ms);
+                    info!(">>> TIME STOP: hold={}ms — ATTEMPTING SELL", hold_ms);
 
-                    let _ = log_tx.send(LogEvent::HoldToResolution {
-                        ts_ms: now_ms,
+                    shared.set_state(StrategyState::Exiting);
+                    let _ = exec_cmd_tx.send(ExecutionCommand::ExitTaker {
                         market_slug: pos.market_slug.clone(),
+                        token_id: pos.token_id.clone(),
                         side: pos.side,
-                        entry_price: pos.entry_price,
-                        size: pos.size,
+                        shares: pos.size,
+                        min_price: 0.01, // sell at ANY price
                         reason: format!("time_stop {}ms", hold_ms),
                     }).await;
-
-                    shared.clear_position();
-                    shared.set_cooldown(now_ms + config.cooldown_ms);
-                    shared.set_state(StrategyState::Cooldown);
-                    position_held = false;
                 }
             }
         }
