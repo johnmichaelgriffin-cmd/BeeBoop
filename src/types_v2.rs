@@ -18,11 +18,12 @@ pub enum BotMode {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum StrategyState {
-    Idle,
-    Entering,
-    InPosition,
-    Exiting,
-    Cooldown,
+    Idle,           // ready to trade
+    Entering,       // first leg (momentum side) being bought
+    WaitForReprice, // first leg filled, waiting ~2s for repricing
+    BuyingSecondLeg,// buying the opposite side
+    PairComplete,   // both sides held — done for this cycle
+    Cooldown,       // brief pause before next pair
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
