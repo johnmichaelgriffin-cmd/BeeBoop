@@ -165,7 +165,7 @@ pub async fn run_strategy_task(
             market_slug: market.slug.clone(),
             token_id: token_id.clone(),
             side: signal.side,
-            max_price: (ask_price + 0.02).min(config.max_entry_price),
+            max_price: ask_price, // used as ask_price for lockprofit formula: floor(20 * ask) shares @ 99c
             notional,
             signal,
         }).await;

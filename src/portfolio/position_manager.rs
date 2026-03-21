@@ -107,7 +107,7 @@ pub async fn run_position_manager_task(
                         let exec_tx = exec_cmd_tx.clone();
                         let market = market_rx.borrow().clone();
                         let shared_c = shared.clone();
-                        let notional_for_leg2 = notional; // match first leg size
+                        let pm_top_for_leg2 = _pm_top_rx.clone();
 
                         // Determine opposite side token
                         let (opp_token, opp_side) = match side {
@@ -122,16 +122,25 @@ pub async fn run_position_manager_task(
                                 return; // state changed (window rolled), abort
                             }
 
+                            // Read the CURRENT ask of the opposite token (after repricing)
+                            let top = pm_top_for_leg2.borrow().clone();
+                            let opp_ask = match opp_side {
+                                Side::Up => top.up_ask.unwrap_or(0.50),
+                                Side::Down => top.down_ask.unwrap_or(0.50),
+                            };
+
                             let opp_label = if opp_side == Side::Up { "UP" } else { "DN" };
-                            info!(">>> REPRICING DONE — buying LEG 2: {} ${:.2}", opp_label, notional_for_leg2);
+                            let shares_to_post = (20.0_f64 * opp_ask).floor();
+                            info!(">>> REPRICING DONE — buying LEG 2: {} {:.0}sh @ 99c (ask={:.0}c)",
+                                opp_label, shares_to_post, opp_ask * 100.0);
 
                             shared_c.set_state(StrategyState::BuyingSecondLeg);
 
-                            let _ = exec_tx.send(ExecutionCommand::SyntheticExit {
+                            let _ = exec_tx.send(ExecutionCommand::BuySecondLeg {
                                 market_slug,
                                 opposite_token_id: opp_token,
                                 opposite_side: opp_side,
-                                notional: notional_for_leg2,
+                                ask_price: opp_ask,
                                 reason: "leg2_pair".to_string(),
                             }).await;
                         });
@@ -143,19 +152,20 @@ pub async fn run_position_manager_task(
                         current_pair = None;
                     }
 
-                    // ── Second leg filled (synthetic exit = buy opposite) ──
-                    ExecutionEvent::SyntheticExitFilled {
-                        opposite_side, filled_price, filled_size, notional, reason, ..
+                    // ── Second leg filled ──
+                    ExecutionEvent::SecondLegFilled {
+                        opposite_side, filled_price, filled_size, reason, ..
                     } => {
                         let opp_label = if opposite_side == Side::Up { "UP" } else { "DN" };
+                        let leg2_notional = filled_size * filled_price; // estimate cost
 
                         if let Some(ref mut pair) = current_pair {
                             pair.leg2_side = Some(opposite_side);
                             pair.leg2_price = Some(filled_price);
                             pair.leg2_shares = Some(filled_size);
-                            pair.leg2_notional = Some(notional);
+                            pair.leg2_notional = Some(leg2_notional);
 
-                            let total_cost = pair.leg1_notional + notional;
+                            let total_cost = pair.leg1_notional + leg2_notional;
                             let pair_shares = pair.leg1_shares.min(filled_size);
                             let guaranteed_payout = pair_shares; // $1 per pair at resolution
                             let est_profit = guaranteed_payout - total_cost;
@@ -208,7 +218,7 @@ pub async fn run_position_manager_task(
                         }
                     }
 
-                    ExecutionEvent::SyntheticExitRejected { reason, .. } => {
+                    ExecutionEvent::SecondLegRejected { reason, .. } => {
                         warn!(">>> LEG 2 FAILED: {} — holding leg 1 to resolution", reason);
                         // We have leg 1 but couldn't get leg 2.
                         // That's OK — hold leg 1 to resolution. It's a directional bet now.

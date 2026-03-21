@@ -168,21 +168,18 @@ pub async fn run_executor_task(
                 }
             }
 
-            ExecutionCommand::SyntheticExit { market_slug, opposite_token_id, opposite_side, notional, reason } => {
-                // Synthetic exit = BUY the opposite side to go economically flat.
-                // This is just a regular FOK BUY — USDC is always available, no settlement needed.
+            ExecutionCommand::BuySecondLeg { market_slug, opposite_token_id, opposite_side, ask_price, reason } => {
+                // Second leg of pair — just another FOK BUY using the same lockprofit formula.
                 let sent_ts_ms = chrono::Utc::now().timestamp_millis();
                 let start = Instant::now();
 
-                let max_price = 0.99; // sweep the book
-
                 let result = if let Some((ref cli, ref signer)) = client {
-                    execute_fok_buy(cli, signer, &opposite_token_id, notional, max_price).await
+                    execute_fok_buy(cli, signer, &opposite_token_id, 0.0, ask_price).await
                 } else {
-                    let shares = notional / 0.50; // dry run estimate
+                    let shares = (20.0 * ask_price).floor();
                     Ok(FillResult {
-                        order_id: format!("dry-synth-{}", sent_ts_ms),
-                        filled_price: 0.50,
+                        order_id: format!("dry-leg2-{}", sent_ts_ms),
+                        filled_price: ask_price,
                         filled_size: shares,
                     })
                 };
@@ -192,27 +189,26 @@ pub async fn run_executor_task(
 
                 match result {
                     Ok(fill) => {
-                        info!(">>> SYNTHETIC EXIT FILLED: bought {} {}sh @ {:.0}c | {}ms | {}",
+                        info!(">>> LEG 2 FILLED: {} {:.0}sh @ {:.0}c | {}ms | {}",
                             if opposite_side == Side::Up { "UP" } else { "DN" },
                             fill.filled_size as u32,
                             fill.filled_price * 100.0,
                             latency_ms,
                             reason,
                         );
-                        let _ = evt_tx.send(ExecutionEvent::SyntheticExitFilled {
+                        let _ = evt_tx.send(ExecutionEvent::SecondLegFilled {
                             ts_ms: ack_ts_ms,
                             market_slug,
                             opposite_token_id,
                             opposite_side,
                             filled_price: fill.filled_price,
                             filled_size: fill.filled_size,
-                            notional,
                             reason,
                         }).await;
                     }
                     Err(e) => {
-                        warn!(">>> SYNTHETIC EXIT FAILED: {} | {}ms", e, latency_ms);
-                        let _ = evt_tx.send(ExecutionEvent::SyntheticExitRejected {
+                        warn!(">>> LEG 2 FAILED: {} | {}ms", e, latency_ms);
+                        let _ = evt_tx.send(ExecutionEvent::SecondLegRejected {
                             ts_ms: ack_ts_ms,
                             reason: e,
                         }).await;
@@ -275,30 +271,34 @@ async fn authenticate(config: &Config) -> Result<(AuthedClient, PrivateKeySigner
     Ok((authed, signer))
 }
 
+/// Buy using lockprofit formula: floor(20 × ask_price) shares at 99c limit.
+/// The matching engine spends all allocated $ and gives ~20 tokens via price improvement.
+/// Example: ask=60c → floor(20×0.60) = 12sh @ 99c → fills at ~60c → ~20 tokens.
 async fn execute_fok_buy(
     client: &AuthedClient,
     signer: &PrivateKeySigner,
     token_id: &str,
-    spend_usdc: f64,
-    _max_price: f64,
+    _spend_usdc: f64, // ignored — we use ask_price to compute shares
+    ask_price: f64,    // current ask price for this token
 ) -> Result<FillResult, String> {
     use polymarket_client_sdk::clob::types::{OrderType, Side};
 
     let token_u256 = U256::from_str(token_id).map_err(|e| format!("token: {}", e))?;
 
-    // Buy 20 shares at ask + 3c limit (not 99c — that sweeps into expensive levels)
-    // Price improvement fills us at the actual ask, limit just caps the max we'll pay
-    let shares = 20.0_f64;
-    let limit_price = (_max_price + 0.03).min(0.97);
-    let limit_price_rounded = (limit_price * 100.0).round() / 100.0;
+    // Lockprofit formula: floor(20 × ask_price) shares at 99c
+    // The matching engine fills at ~ask_price, spending all allocated $,
+    // and price improvement gives us ~20 tokens total.
+    let base_shares = 20.0_f64;
+    let shares = (base_shares * ask_price).floor().max(1.0);
+    let limit_price = 0.99;
 
     let size_dec = Decimal::from_str(&format!("{:.2}", shares))
         .map_err(|e| format!("dec: {}", e))?;
-    let price_dec = Decimal::from_str(&format!("{:.2}", limit_price_rounded))
+    let price_dec = Decimal::from_str("0.99")
         .map_err(|e| format!("dec: {}", e))?;
 
-    info!("FOK BUY: {:.0}sh limit@{:.0}c, token={}...{}",
-        shares, limit_price_rounded * 100.0,
+    info!("FOK BUY: {:.0}sh @ 99c (ask={:.0}c, base=20), token={}...{}",
+        shares, ask_price * 100.0,
         &token_id[..8.min(token_id.len())], &token_id[token_id.len().saturating_sub(8)..]);
 
     let order = client.limit_order()
@@ -316,13 +316,10 @@ async fn execute_fok_buy(
         .map_err(|e| format!("post: {}", e))?;
 
     if resp.success {
-        // Estimate: 20 shares at approximately the ask price
-        let estimated_price = limit_price_rounded;
-        let estimated_shares = shares;
         Ok(FillResult {
             order_id: resp.order_id,
-            filled_price: estimated_price,
-            filled_size: estimated_shares,
+            filled_price: ask_price, // estimate — actual fill is at or near ask
+            filled_size: shares,     // shares posted — actual tokens received may be ~20
         })
     } else {
         Err(format!("rejected: {:?} {:?}", resp.status, resp.error_msg))

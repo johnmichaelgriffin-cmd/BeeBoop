@@ -157,13 +157,13 @@ pub enum ExecutionCommand {
         min_price: f64,
         reason: String,
     },
-    /// Synthetic exit: buy the OPPOSITE side to go economically flat instantly.
+    /// Buy the OPPOSITE side (second leg of pair).
     /// No settlement wait needed — USDC is always available for buying.
-    SyntheticExit {
+    BuySecondLeg {
         market_slug: String,
         opposite_token_id: String,
         opposite_side: Side,
-        notional: f64,
+        ask_price: f64, // current ask of the opposite token
         reason: String,
     },
     CancelAll {
@@ -204,18 +204,17 @@ pub enum ExecutionEvent {
         ts_ms: i64,
         reason: String,
     },
-    /// Synthetic exit filled — we bought the opposite side to go flat
-    SyntheticExitFilled {
+    /// Second leg filled — pair is complete
+    SecondLegFilled {
         ts_ms: i64,
         market_slug: String,
         opposite_token_id: String,
         opposite_side: Side,
         filled_price: f64,
         filled_size: f64,
-        notional: f64,
         reason: String,
     },
-    SyntheticExitRejected {
+    SecondLegRejected {
         ts_ms: i64,
         reason: String,
     },
