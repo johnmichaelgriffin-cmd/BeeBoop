@@ -64,8 +64,9 @@ pub async fn run_position_manager_task(
 
                         // Wait for on-chain settlement before allowing sells
                         // CLOB returns Matched but tokens aren't available until Mined
-                        info!(">>> WAITING 6s for settlement...");
-                        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                        // TODO: replace blind wait with CLOB trade status polling (MATCHED→MINED)
+                        info!(">>> WAITING 2s for settlement...");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         info!(">>> Settlement wait complete — monitoring for exit");
                     }
 
