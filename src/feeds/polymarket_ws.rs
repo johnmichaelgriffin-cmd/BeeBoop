@@ -1,16 +1,15 @@
-//! Polymarket token price feed — REST polling for reliability.
+//! Polymarket token price feed — fast REST polling.
 //!
-//! Polls GET /book?token_id={id} every 500ms for UP and DOWN tokens.
-//! Updates PolymarketTop watch channel on every poll.
-//! WS was too flaky — REST is reliable and fast enough.
+//! Polls GET /price for best ask/bid every 200ms for UP and DOWN tokens.
+//! Uses /price endpoint (lighter than /book), no-cache headers, 1s timeout.
 
 use tokio::sync::{broadcast, mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{warn};
 
 use crate::types_v2::{LogEvent, MarketDescriptor, PolymarketTop};
 
 const CLOB_BASE: &str = "https://clob.polymarket.com";
-const POLL_INTERVAL_MS: u64 = 500;
+const POLL_INTERVAL_MS: u64 = 200;
 
 pub async fn run_polymarket_ws_task(
     market_rx: watch::Receiver<MarketDescriptor>,
@@ -19,8 +18,8 @@ pub async fn run_polymarket_ws_task(
     _log_tx: mpsc::Sender<LogEvent>,
 ) {
     let client = reqwest::Client::builder()
-        .pool_max_idle_per_host(5)
-        .timeout(std::time::Duration::from_secs(3))
+        .pool_max_idle_per_host(2)
+        .timeout(std::time::Duration::from_millis(1000))
         .build()
         .expect("http client");
 
@@ -36,46 +35,43 @@ pub async fn run_polymarket_ws_task(
 
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        // Fetch both books concurrently
-        let (up_result, dn_result) = tokio::join!(
-            fetch_best_ask_bid(&client, &market.up_token_id),
-            fetch_best_ask_bid(&client, &market.down_token_id),
+        // Fetch both prices concurrently — /price is much lighter than /book
+        let (up_ask, up_bid, dn_ask, dn_bid) = tokio::join!(
+            fetch_price(&client, &market.up_token_id, "buy"),  // buy side = ask
+            fetch_price(&client, &market.up_token_id, "sell"), // sell side = bid
+            fetch_price(&client, &market.down_token_id, "buy"),
+            fetch_price(&client, &market.down_token_id, "sell"),
         );
 
-        let mut top = PolymarketTop {
+        let top = PolymarketTop {
             recv_ts_ms: now_ms,
-            ..Default::default()
+            up_ask: up_ask,
+            up_bid: up_bid,
+            down_ask: dn_ask,
+            down_bid: dn_bid,
         };
-
-        if let Some((ask, bid)) = up_result {
-            top.up_ask = Some(ask);
-            top.up_bid = Some(bid);
-        }
-        if let Some((ask, bid)) = dn_result {
-            top.down_ask = Some(ask);
-            top.down_bid = Some(bid);
-        }
 
         let _ = latest_tx.send(top.clone());
         let _ = tx.send(top);
     }
 }
 
-async fn fetch_best_ask_bid(client: &reqwest::Client, token_id: &str) -> Option<(f64, f64)> {
-    let url = format!("{}/book?token_id={}", CLOB_BASE, token_id);
-    let resp = client.get(&url).send().await.ok()?;
+/// Fetch best price from GET /price?token_id={id}&side={side}
+/// side="buy" returns the best ask (what you'd pay to buy)
+/// side="sell" returns the best bid (what you'd get selling)
+async fn fetch_price(client: &reqwest::Client, token_id: &str, side: &str) -> Option<f64> {
+    let url = format!("{}/price?token_id={}&side={}", CLOB_BASE, token_id, side);
+    let resp = client.get(&url)
+        .header("Cache-Control", "no-cache, no-store")
+        .header("Pragma", "no-cache")
+        .send()
+        .await
+        .ok()?;
+
     let body: serde_json::Value = resp.json().await.ok()?;
 
-    let asks = body.get("asks")?.as_array()?;
-    let bids = body.get("bids")?.as_array()?;
-
-    let best_ask = asks.iter()
-        .filter_map(|a| a.get("price")?.as_str()?.parse::<f64>().ok())
-        .reduce(f64::min)?;
-
-    let best_bid = bids.iter()
-        .filter_map(|b| b.get("price")?.as_str()?.parse::<f64>().ok())
-        .reduce(f64::max)?;
-
-    Some((best_ask, best_bid))
+    // /price returns {"price": "0.55"}
+    body.get("price")
+        .and_then(|p| p.as_str())
+        .and_then(|s| s.parse::<f64>().ok())
 }
