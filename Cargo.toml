@@ -55,6 +55,12 @@ base64 = "0.22"
 # Config
 dotenvy = "0.15"
 
+# Fast RwLock (no poisoning, smaller, faster than std)
+parking_lot = "0.12"
+
+# Error handling
+anyhow = "1"
+
 # Metrics histograms
 hdrhistogram = "7"
 
@@ -63,6 +69,14 @@ uuid = { version = "1", features = ["v4"] }
 
 # URL handling
 url = "2"
+
+[[bin]]
+name = "beeboop"
+path = "src/main.rs"
+
+[[bin]]
+name = "beeboop-v2"
+path = "src/main_v2.rs"
 
 [profile.release]
 opt-level = 3
