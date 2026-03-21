@@ -50,7 +50,7 @@ impl Default for Config {
             market: "btc".to_string(),
 
             lookback_ms: 800,
-            entry_threshold_bps: 5.0,
+            entry_threshold_bps: 3.0,
             max_signal_age_ms: 1200,
 
             take_profit_pct: 0.10,
