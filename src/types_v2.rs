@@ -27,7 +27,8 @@ pub enum StrategyState {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum EntryMode {
-    Taker, // FOK — only mode we support for now
+    Maker, // postOnly GTC — medium signal
+    Taker, // FOK — strong signal
 }
 
 // ── Market Data Types ───────────────────────────────────────────
@@ -39,6 +40,7 @@ pub struct BinanceTick {
     pub bid: f64,
     pub ask: f64,
     pub mid: f64,
+    pub obi: Option<f64>, // order book imbalance from depth, if available
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,12 +95,26 @@ pub struct FeatureSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signal {
     pub created_ts_ms: i64,
-    pub move_bps: f64,
-    pub basis_bps: f64,
-    pub confidence: f64,
     pub side: Side,
     pub entry_mode: EntryMode,
-    pub reason: String,
+
+    // Raw features
+    pub r200_bps: f64,
+    pub r500_bps: f64,
+    pub r800_bps: f64,
+    pub r2000_bps: f64,
+    pub fast_move_bps: f64,
+    pub basis_bps: f64,
+    pub obi: f64,
+
+    // Combined score
+    pub score: f64,
+    pub confidence: f64,
+
+    // Confirmation flags
+    pub confirms_r2s: bool,
+    pub confirms_basis: bool,
+    pub confirms_obi: bool,
 }
 
 // ── Position Types ──────────────────────────────────────────────

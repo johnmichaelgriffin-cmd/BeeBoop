@@ -65,5 +65,6 @@ fn parse_book_ticker(text: &str, recv_ts_ms: i64) -> Option<BinanceTick> {
         bid,
         ask,
         mid,
+        obi: None, // populated from depth stream via watch channel
     })
 }

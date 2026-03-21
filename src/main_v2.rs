@@ -64,14 +64,16 @@ async fn main() -> Result<()> {
     config.mode = mode;
     config.load_credentials();
 
-    info!("=== BeeBoop v2.0.0 ===");
+    info!("=== BeeBoop v2.1.0 — Production Signal Engine ===");
     info!("Mode: {:?}", config.mode);
     info!("Market: {}", config.market);
-    info!("Entry threshold: {}bps", config.entry_threshold_bps);
-    info!("Take profit: {:.0}%", config.take_profit_pct * 100.0);
-    info!("Max hold: {}ms", config.max_hold_ms);
-    info!("Notional: ${:.0}", config.base_notional);
-    info!("Session stop-loss: ${:.0}", config.session_stop_loss);
+    info!("Signal: trigger={:.2}bps, maker={:.2}, taker={:.2}",
+        config.trigger_min_fast_move_bps, config.maker_score_min, config.taker_score_min);
+    info!("Exit: TP=+{:.0}c, SL=-{:.0}c, hold={}ms, cooldown={}ms",
+        config.take_profit_cents, config.stop_loss_cents, config.max_hold_ms, config.cooldown_ms);
+    info!("Sizing: ${:.0}-${:.0}", config.base_notional, config.max_notional);
+    info!("Risk: stop-loss=${:.0}, spread<{:.0}c, max_ask={:.0}c",
+        config.session_stop_loss, config.max_spread_cents, config.max_entry_price * 100.0);
 
     if config.mode == BotMode::Live && !config.has_credentials() {
         tracing::error!("Live mode requires POLY_PRIVATE_KEY, POLY_API_KEY, POLY_SECRET, POLY_PASSPHRASE in .env");

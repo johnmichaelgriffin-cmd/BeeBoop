@@ -77,7 +77,7 @@ pub async fn run_position_manager_task(
     log_tx: mpsc::Sender<LogEvent>,
 ) {
     info!("position_manager: started (tp={:.0}%, max_hold={}ms, cooldown={}ms)",
-        config.take_profit_pct * 100.0, config.max_hold_ms, config.cooldown_ms);
+        config.take_profit_cents, config.max_hold_ms, config.cooldown_ms);
 
     // Process execution events + poll for exit conditions
     let mut exit_attempts = 0u32;
@@ -101,15 +101,15 @@ pub async fn run_position_manager_task(
                             entry_price: filled_price,
                             size: filled_size,
                             notional,
-                            signal_bps: signal.move_bps,
+                            signal_bps: signal.fast_move_bps,
                             signal_confidence: signal.confidence,
                         };
 
                         info!(">>> POSITION OPENED: {} {:.0}sh @ {:.0}c | target sell @ {:.0}c (+{:.0}%)",
                             if side == Side::Up { "UP" } else { "DN" },
                             filled_size, filled_price * 100.0,
-                            filled_price * (1.0 + config.take_profit_pct) * 100.0,
-                            config.take_profit_pct * 100.0,
+                            (filled_price + config.take_profit_cents / 100.0) * 100.0,
+                            config.take_profit_cents,
                         );
 
                         shared.set_position(pos);
@@ -212,8 +212,8 @@ pub async fn run_position_manager_task(
                 }
             }
 
-            // Check exit conditions every 100ms while in position
-            _ = tokio::time::sleep(std::time::Duration::from_millis(100)), if position_held => {
+            // Check exit conditions every 50ms while in position
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)), if position_held => {
                 if shared.get_state() != StrategyState::InPosition {
                     continue;
                 }
@@ -230,12 +230,12 @@ pub async fn run_position_manager_task(
                 };
 
                 if let Some(bid) = current_bid {
-                    let profit_pct = (bid - pos.entry_price) / pos.entry_price;
+                    let pnl_cents = (bid - pos.entry_price) * 100.0;
 
-                    // Take profit
-                    if profit_pct >= config.take_profit_pct {
-                        info!(">>> EXIT: TARGET HIT {:.1}% | entry={:.0}c bid={:.0}c | hold={}ms",
-                            profit_pct * 100.0, pos.entry_price * 100.0, bid * 100.0, hold_ms);
+                    // ── Take profit: +4c ────────────────────
+                    if pnl_cents >= config.take_profit_cents {
+                        info!(">>> EXIT: TAKE PROFIT +{:.1}c | entry={:.0}c bid={:.0}c | hold={}ms",
+                            pnl_cents, pos.entry_price * 100.0, bid * 100.0, hold_ms);
 
                         shared.set_state(StrategyState::Exiting);
                         let _ = exec_cmd_tx.send(ExecutionCommand::ExitTaker {
@@ -243,30 +243,48 @@ pub async fn run_position_manager_task(
                             token_id: pos.token_id.clone(),
                             side: pos.side,
                             shares: pos.size,
-                            min_price: pos.entry_price, // floor = entry, never sell at loss
-                            reason: format!("take_profit {:.1}%", profit_pct * 100.0),
+                            min_price: pos.entry_price, // floor = entry
+                            reason: format!("take_profit +{:.1}c", pnl_cents),
                         }).await;
                         continue;
                     }
-                }
 
-                // Time stop — hold to resolution, don't panic sell
-                if hold_ms >= config.max_hold_ms {
-                    info!(">>> TIME STOP: hold={}ms >= {}ms — holding to resolution",
-                        hold_ms, config.max_hold_ms);
+                    // ── Stop loss: -3c ──────────────────────
+                    if pnl_cents <= -config.stop_loss_cents {
+                        // Don't panic sell — hold to resolution
+                        info!(">>> STOP LOSS: {:.1}c | entry={:.0}c bid={:.0}c | hold={}ms — holding to resolution",
+                            pnl_cents, pos.entry_price * 100.0, bid * 100.0, hold_ms);
 
-                    if let Some(pos) = shared.get_position() {
                         let _ = log_tx.send(LogEvent::HoldToResolution {
                             ts_ms: now_ms,
                             market_slug: pos.market_slug.clone(),
                             side: pos.side,
                             entry_price: pos.entry_price,
                             size: pos.size,
-                            reason: format!("time_stop {}ms", hold_ms),
+                            reason: format!("stop_loss {:.1}c", pnl_cents),
                         }).await;
-                    }
 
-                    // Reset to allow next trade
+                        shared.clear_position();
+                        shared.set_cooldown(now_ms + config.cooldown_ms);
+                        shared.set_state(StrategyState::Cooldown);
+                        position_held = false;
+                        continue;
+                    }
+                }
+
+                // ── Time stop: 2.5s max hold ────────────────
+                if hold_ms >= config.max_hold_ms {
+                    info!(">>> TIME STOP: hold={}ms — holding to resolution", hold_ms);
+
+                    let _ = log_tx.send(LogEvent::HoldToResolution {
+                        ts_ms: now_ms,
+                        market_slug: pos.market_slug.clone(),
+                        side: pos.side,
+                        entry_price: pos.entry_price,
+                        size: pos.size,
+                        reason: format!("time_stop {}ms", hold_ms),
+                    }).await;
+
                     shared.clear_position();
                     shared.set_cooldown(now_ms + config.cooldown_ms);
                     shared.set_state(StrategyState::Cooldown);
