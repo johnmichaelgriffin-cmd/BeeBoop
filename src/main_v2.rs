@@ -38,6 +38,11 @@ use types_v2::*;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install TLS crypto provider FIRST — before any WebSocket/HTTP connections
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls crypto provider");
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_target(false)
