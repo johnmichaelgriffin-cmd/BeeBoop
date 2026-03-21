@@ -117,10 +117,9 @@ pub async fn run_position_manager_task(
                         exit_attempts = 0;
                         position_held = true;
 
-                        // Blind 3s wait for on-chain settlement (proven approach from v1)
-                        // Polling was unreliable and added 5s+ delay
-                        info!(">>> Waiting 3s for settlement...");
-                        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        // Blind 2s wait for settlement
+                        info!(">>> Waiting 2s for settlement...");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         info!(">>> Settlement wait complete — monitoring for exit");
                     }
 

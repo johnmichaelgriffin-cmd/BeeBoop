@@ -119,6 +119,15 @@ pub async fn run_strategy_task(
             continue;
         }
 
+        // Min entry price — don't buy tokens below 15c (market already decided)
+        if ask_price < config.min_entry_price {
+            let _ = log_tx.send(LogEvent::TradeSkipped {
+                ts_ms: now_ms,
+                reason: format!("ask {:.0}c < {:.0}c floor", ask_price * 100.0, config.min_entry_price * 100.0),
+            }).await;
+            continue;
+        }
+
         // Max entry price
         if ask_price > config.max_entry_price {
             let _ = log_tx.send(LogEvent::TradeSkipped {
