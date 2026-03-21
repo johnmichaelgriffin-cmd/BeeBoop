@@ -117,10 +117,23 @@ pub async fn run_position_manager_task(
                         exit_attempts = 0;
                         position_held = true;
 
-                        // Blind 2s wait for settlement
-                        info!(">>> Waiting 2s for settlement...");
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        info!(">>> Settlement wait complete — monitoring for exit");
+                        // Blind 6s wait for settlement — the successful sell on 3/20 confirmed at 6s
+                        // The working v1 polled every 3s; first success was attempt 2 (6s)
+                        info!(">>> Waiting 6s for settlement...");
+                        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                        info!(">>> Settlement done — SELLING IMMEDIATELY");
+
+                        // SELL RIGHT NOW — don't wait for signals or price targets
+                        // This is a mechanic test: can we sell at all?
+                        shared.set_state(StrategyState::Exiting);
+                        let _ = exec_cmd_tx.send(ExecutionCommand::ExitTaker {
+                            market_slug: market_slug.clone(),
+                            token_id: token_id.clone(),
+                            side,
+                            shares: filled_size,
+                            min_price: 0.01,
+                            reason: "immediate_sell_test".to_string(),
+                        }).await;
                     }
 
                     ExecutionEvent::EntryRejected { reason, .. } => {
