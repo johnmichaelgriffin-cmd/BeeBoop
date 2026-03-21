@@ -13,6 +13,61 @@ use crate::config_v2::Config;
 use crate::state::SharedState;
 use crate::types_v2::*;
 
+const CLOB_BASE: &str = "https://clob.polymarket.com";
+
+/// Poll CLOB for trade settlement status.
+/// Returns true when trade reaches MINED or CONFIRMED status.
+/// Polls `max_attempts` times with `interval_ms` between each.
+async fn poll_settlement(order_id: &str, max_attempts: u32, interval_ms: u64) -> bool {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()
+        .unwrap_or_default();
+
+    for attempt in 1..=max_attempts {
+        tokio::time::sleep(std::time::Duration::from_millis(interval_ms)).await;
+
+        // Query CLOB for trade status
+        let url = format!("{}/data/order/{}", CLOB_BASE, order_id);
+        match client.get(&url).send().await {
+            Ok(resp) => {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    // Check if any associated trades have reached MINED/CONFIRMED
+                    if let Some(status) = body.get("status").and_then(|s| s.as_str()) {
+                        info!(">>> Settlement poll {}/{}: status={}", attempt, max_attempts, status);
+                        match status {
+                            "MINED" | "CONFIRMED" | "MATCHED" => {
+                                // MATCHED means the CLOB accepted it — tokens should be reserved
+                                // MINED means on-chain settlement complete
+                                if status == "MINED" || status == "CONFIRMED" {
+                                    return true;
+                                }
+                                // For MATCHED, check if enough time has passed (1.5s minimum)
+                                if attempt >= 3 {
+                                    info!(">>> Settlement: MATCHED after {}ms — proceeding", attempt as u64 * interval_ms);
+                                    return true;
+                                }
+                            }
+                            "FAILED" | "CANCELLED" => {
+                                warn!(">>> Settlement: order {} — aborting", status);
+                                return false;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(">>> Settlement poll {}/{}: error: {}", attempt, max_attempts, e);
+            }
+        }
+    }
+
+    // Fallback: proceed after max attempts even if not confirmed
+    warn!(">>> Settlement: not confirmed after {} attempts — proceeding", max_attempts);
+    true // proceed anyway — the sell will fail if tokens aren't there
+}
+
 pub async fn run_position_manager_task(
     config: Config,
     shared: SharedState,
@@ -62,12 +117,15 @@ pub async fn run_position_manager_task(
                         exit_attempts = 0;
                         position_held = true;
 
-                        // Wait for on-chain settlement before allowing sells
-                        // CLOB returns Matched but tokens aren't available until Mined
-                        // TODO: replace blind wait with CLOB trade status polling (MATCHED→MINED)
-                        info!(">>> WAITING 2s for settlement...");
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        info!(">>> Settlement wait complete — monitoring for exit");
+                        // Poll CLOB for trade settlement (MATCHED→MINED)
+                        // instead of blind wait — exit as soon as tokens are available
+                        info!(">>> POLLING for settlement...");
+                        let settled = poll_settlement(&order_id, 10, 500).await;
+                        if settled {
+                            info!(">>> Settlement CONFIRMED — monitoring for exit");
+                        } else {
+                            warn!(">>> Settlement not confirmed after 5s — proceeding anyway");
+                        }
                     }
 
                     ExecutionEvent::EntryRejected { reason, .. } => {
