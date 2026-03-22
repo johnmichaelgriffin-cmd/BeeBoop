@@ -80,8 +80,8 @@ impl Default for Config {
             opposite_signal_exit_score: 1.2,
 
             // Sizing
-            share_base: 25.0,           // BTC default: 25sh
-            max_pairs_per_window: 40,   // BTC default: 40 snipes
+            share_base: 20.0,           // BTC default: 20sh
+            max_pairs_per_window: 50,   // BTC default: 50 snipes
             base_notional: 25.0,
             max_notional: 150.0,
 
