@@ -25,6 +25,7 @@ pub async fn run_market_discovery_task(
     let slug_prefix = match config.market.as_str() {
         "btc" => "btc-updown-5m",
         "eth" => "eth-updown-5m",
+        "sol" => "sol-updown-5m",
         _ => "btc-updown-5m",
     };
 
