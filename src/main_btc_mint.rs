@@ -173,36 +173,53 @@ async fn main() -> Result<()> {
                     MINT_AMOUNT_USDC, market.window_start_ts, &condition_id[..16.min(condition_id.len())]);
 
                 if config.mode == BotMode::Live {
-                    // Call Python minter
-                    let result = tokio::task::spawn_blocking(move || {
-                        Command::new("python3")
-                            .arg("mint_window.py")
-                            .arg(&condition_id)
-                            .arg(format!("{:.0}", MINT_AMOUNT_USDC))
-                            .output()
-                    }).await;
+                    // Call Python minter — retry up to 3 times
+                    for mint_attempt in 1..=3 {
+                        let cid = condition_id.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            Command::new("python3")
+                                .arg("mint_window.py")
+                                .arg(&cid)
+                                .arg(format!("{:.0}", MINT_AMOUNT_USDC))
+                                .output()
+                        }).await;
 
-                    match result {
-                        Ok(Ok(output)) => {
-                            let stdout = String::from_utf8_lossy(&output.stdout);
-                            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
-                                if json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
-                                    let elapsed = json.get("elapsed_ms").and_then(|v| v.as_i64()).unwrap_or(0);
-                                    info!(">>> MINT SUCCESS: ${:.0} in {}ms | UP={:.0} DN={:.0}",
-                                        MINT_AMOUNT_USDC, elapsed, MINT_AMOUNT_USDC, MINT_AMOUNT_USDC);
-                                    inventory_up = MINT_AMOUNT_USDC;
-                                    inventory_dn = MINT_AMOUNT_USDC;
-                                    minted_this_window = true;
-                                } else {
-                                    let err = json.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
-                                    error!(">>> MINT FAILED: {}", err);
+                        match result {
+                            Ok(Ok(output)) => {
+                                let stdout = String::from_utf8_lossy(&output.stdout);
+                                let stderr = String::from_utf8_lossy(&output.stderr);
+                                if !stderr.is_empty() {
+                                    warn!(">>> MINT stderr: {}", stderr);
                                 }
-                            } else {
-                                error!(">>> MINT: bad JSON response: {}", stdout);
+                                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&stdout) {
+                                    if json.get("success").and_then(|v| v.as_bool()).unwrap_or(false) {
+                                        let elapsed = json.get("elapsed_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                                        info!(">>> MINT SUCCESS: ${:.0} in {}ms | UP={:.0} DN={:.0}",
+                                            MINT_AMOUNT_USDC, elapsed, MINT_AMOUNT_USDC, MINT_AMOUNT_USDC);
+                                        inventory_up = MINT_AMOUNT_USDC;
+                                        inventory_dn = MINT_AMOUNT_USDC;
+                                        minted_this_window = true;
+                                        break;
+                                    } else {
+                                        let err = json.get("error").and_then(|v| v.as_str()).unwrap_or("unknown");
+                                        error!(">>> MINT FAILED (attempt {}/3): {}", mint_attempt, err);
+                                    }
+                                } else {
+                                    error!(">>> MINT: bad JSON (attempt {}/3): {}", mint_attempt, stdout);
+                                }
                             }
+                            Ok(Err(e)) => error!(">>> MINT: process error (attempt {}/3): {}", mint_attempt, e),
+                            Err(e) => error!(">>> MINT: spawn error (attempt {}/3): {}", mint_attempt, e),
                         }
-                        Ok(Err(e)) => error!(">>> MINT: process error: {}", e),
-                        Err(e) => error!(">>> MINT: spawn error: {}", e),
+
+                        if mint_attempt < 3 {
+                            info!(">>> Retrying mint in 3s...");
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        }
+                    }
+
+                    if !minted_this_window {
+                        error!(">>> MINT FAILED 3x — skipping this window");
                     }
                 } else {
                     info!(">>> DRY RUN — would mint ${:.0}", MINT_AMOUNT_USDC);

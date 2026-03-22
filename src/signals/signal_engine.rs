@@ -392,9 +392,10 @@ pub async fn run_signal_engine_task(
             EntryMode::Maker => { counters.signals_maker.fetch_add(1, Ordering::Relaxed); }
         }
 
-        info!(
-            ">>> SIGNAL: {:?} score={:.3} fast={:.2}bps r2s={:.2}bps basis_dev={:.2}bps dbasis={:.2}bps obi={:.3} | {}ask={:.0}c",
-            side, score, fast_move_bps, r2000, basis_dev_bps, dbasis_bps, obi_ema_value,
+        // Signals are frequent — only log to debug to avoid spam
+        tracing::debug!(
+            "SIGNAL: {:?} score={:.3} fast={:.2}bps | {}ask={:.0}c",
+            side, score, fast_move_bps,
             if side == Side::Up { "UP " } else { "DN " },
             ask * 100.0,
         );

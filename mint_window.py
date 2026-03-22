@@ -91,8 +91,8 @@ def main():
             "from": address,
             "nonce": nonce,
             "chainId": 137,
-            "maxFeePerGas": gas_price * 2,
-            "maxPriorityFeePerGas": w3.to_wei(50, "gwei"),
+            "maxFeePerGas": max(gas_price * 3, w3.to_wei(100, "gwei")),
+            "maxPriorityFeePerGas": w3.to_wei(80, "gwei"),
         })
 
         tx["gas"] = w3.eth.estimate_gas(tx)
