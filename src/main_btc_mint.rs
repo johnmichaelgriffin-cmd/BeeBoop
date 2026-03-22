@@ -291,9 +291,9 @@ async fn main() -> Result<()> {
             }
         }
 
-        // ── Wait 2s for repricing ──
-        info!(">>> Waiting 2s for repricing...");
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        // ── Wait 3s for repricing ──
+        info!(">>> Waiting 3s for repricing...");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
         // ── LEG 2: Sell the side that ROSE ──
         if let Some(ref handle) = exec {
