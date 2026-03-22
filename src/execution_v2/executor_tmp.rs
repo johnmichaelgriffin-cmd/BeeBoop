@@ -1,10 +1,10 @@
-//! Executor task — OWNS the authenticated SDK client.
+﻿//! Executor task â€” OWNS the authenticated SDK client.
 //!
 //! Receives ExecutionCommand via channel, executes on Polymarket CLOB.
-//! No locks on the SDK client — this task is the sole owner.
+//! No locks on the SDK client â€” this task is the sole owner.
 //! Emits ExecutionEvent for each result.
 //!
-//! FOK taker only — no GTC/maker logic.
+//! FOK taker only â€” no GTC/maker logic.
 
 use std::str::FromStr;
 use std::time::Instant;
@@ -36,16 +36,16 @@ pub async fn run_executor_task(
     let client = if config.mode == BotMode::Live && config.has_credentials() {
         match authenticate(&config).await {
             Ok((client, signer)) => {
-                info!("executor: authenticated — ready to trade");
+                info!("executor: authenticated â€” ready to trade");
                 Some((client, signer))
             }
             Err(e) => {
-                error!("executor: auth FAILED: {} — running dry-run only", e);
+                error!("executor: auth FAILED: {} â€” running dry-run only", e);
                 None
             }
         }
     } else {
-        info!("executor: DryRun mode — no auth needed");
+        info!("executor: DryRun mode â€” no auth needed");
         None
     };
 
@@ -64,7 +64,6 @@ pub async fn run_executor_task(
                         order_id: format!("dry-{}", sent_ts_ms),
                         filled_price: max_price,
                         filled_size: shares,
-                        latency_ms: 0,
                     })
                 };
 
@@ -126,7 +125,6 @@ pub async fn run_executor_task(
                         order_id: format!("dry-sell-{}", sent_ts_ms),
                         filled_price: bid,
                         filled_size: shares,
-                        latency_ms: 0,
                     })
                 };
 
@@ -171,7 +169,7 @@ pub async fn run_executor_task(
             }
 
             ExecutionCommand::BuySecondLeg { market_slug, opposite_token_id, opposite_side, ask_price, reason } => {
-                // Second leg of pair — just another FOK BUY using the same lockprofit formula.
+                // Second leg of pair â€” just another FOK BUY using the same lockprofit formula.
                 let sent_ts_ms = chrono::Utc::now().timestamp_millis();
                 let start = Instant::now();
 
@@ -183,7 +181,6 @@ pub async fn run_executor_task(
                         order_id: format!("dry-leg2-{}", sent_ts_ms),
                         filled_price: ask_price,
                         filled_size: shares,
-                        latency_ms: 0,
                     })
                 };
 
@@ -275,9 +272,9 @@ async fn authenticate(config: &Config) -> Result<(AuthedClient, PrivateKeySigner
     Ok((authed, signer))
 }
 
-/// Buy using lockprofit formula: floor(50 × ask_price) shares at 99c limit.
+/// Buy using lockprofit formula: floor(50 Ã— ask_price) shares at 99c limit.
 /// The matching engine spends all allocated $ and gives ~50 tokens via price improvement.
-/// Example: ask=60c → floor(50×0.60) = 30sh @ 99c → fills at ~60c → ~50 tokens.
+/// Example: ask=60c â†’ floor(50Ã—0.60) = 30sh @ 99c â†’ fills at ~60c â†’ ~50 tokens.
 async fn execute_fok_buy(
     client: &AuthedClient,
     signer: &PrivateKeySigner,
@@ -289,9 +286,9 @@ async fn execute_fok_buy(
 
     let token_u256 = U256::from_str(token_id).map_err(|e| format!("token: {}", e))?;
 
-    // Lockprofit formula: floor(50 × ask_price) shares at 99c
+    // Lockprofit formula: floor(50 Ã— ask_price) shares at 99c
     // Posts N shares where N = floor(50 * ask). Willing to spend N * 0.99.
-    // Price improvement fills at ~ask, so total spend ≈ N * ask ≈ base * ask^2.
+    // Price improvement fills at ~ask, so total spend â‰ˆ N * ask â‰ˆ base * ask^2.
     let base = share_base;
     let shares = (base * ask_price).floor().max(1.0);
 
@@ -322,8 +319,8 @@ async fn execute_fok_buy(
     if resp.success {
         Ok(FillResult {
             order_id: resp.order_id,
-            filled_price: ask_price, // estimate — actual fill is at or near ask
-            filled_size: shares,     // shares posted — actual tokens received may be ~20
+            filled_price: ask_price, // estimate â€” actual fill is at or near ask
+            filled_size: shares,     // shares posted â€” actual tokens received may be ~20
             latency_ms: 0,
         })
     } else {
@@ -351,9 +348,9 @@ async fn execute_fok_sell(
     let size_dec = Decimal::from_str(&format!("{:.2}", shares_rounded))
         .map_err(|e| format!("dec: {}", e))?;
 
-    // SELL via market_order with Amount::shares — THIS IS WHAT WORKED ON 2026-03-20
+    // SELL via market_order with Amount::shares â€” THIS IS WHAT WORKED ON 2026-03-20
     // SDK auto-calculates price by walking bids in the orderbook
-    // DO NOT use limit_order for sells — it doesn't work
+    // DO NOT use limit_order for sells â€” it doesn't work
     use polymarket_client_sdk::clob::types::Amount;
 
     let amount = Amount::shares(size_dec).map_err(|e| format!("amount: {}", e))?;
@@ -376,7 +373,7 @@ async fn execute_fok_sell(
     if resp.success {
         Ok(FillResult {
             order_id: resp.order_id,
-            filled_price: min_price, // approximate — actual fill may differ
+            filled_price: min_price, // approximate â€” actual fill may differ
             filled_size: shares_rounded,
             latency_ms: 0,
         })
@@ -386,7 +383,7 @@ async fn execute_fok_sell(
 }
 
 /// Simple handle for direct sell/buy calls from mint+sell bot.
-/// Owns the authenticated SDK client — no channels needed.
+/// Owns the authenticated SDK client â€” no channels needed.
 pub struct ExecutorHandle {
     client: AuthedClient,
     signer: PrivateKeySigner,
@@ -396,7 +393,7 @@ impl ExecutorHandle {
     pub async fn new(config: &Config) -> Option<Self> {
         match authenticate(config).await {
             Ok((client, signer)) => {
-                info!("executor: authenticated — ready to trade");
+                info!("executor: authenticated â€” ready to trade");
                 Some(Self { client, signer })
             }
             Err(e) => {

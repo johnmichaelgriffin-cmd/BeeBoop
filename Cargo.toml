@@ -86,6 +86,10 @@ path = "src/main_eth.rs"
 name = "beebosol"
 path = "src/main_sol.rs"
 
+[[bin]]
+name = "beeboop-btc-mint"
+path = "src/main_btc_mint.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
