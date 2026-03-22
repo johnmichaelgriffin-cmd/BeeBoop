@@ -81,6 +81,25 @@ pub async fn run_strategy_task(
             }
         }
 
+        // Cheap-side gate: only buy when signal side is the cheap token (<50c)
+        // This ensures we always load the cheap side first
+        {
+            let pm_top = pm_top_rx.borrow().clone();
+            let signal_ask = match signal.side {
+                Side::Up => pm_top.up_ask,
+                Side::Down => pm_top.down_ask,
+            };
+            if let Some(ask) = signal_ask {
+                if ask >= 0.50 {
+                    let _ = log_tx.send(LogEvent::TradeSkipped {
+                        ts_ms: now_ms,
+                        reason: format!("cheap_gate: {:?} ask={:.0}c >= 50c (not cheap side)", signal.side, ask * 100.0),
+                    }).await;
+                    continue;
+                }
+            }
+        }
+
         // Double-check state
         if !shared.is_idle() {
             let _ = log_tx.send(LogEvent::TradeSkipped {

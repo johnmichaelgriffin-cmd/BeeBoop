@@ -82,6 +82,10 @@ path = "src/main_v2.rs"
 name = "boobeeth"
 path = "src/main_eth.rs"
 
+[[bin]]
+name = "beebosol"
+path = "src/main_sol.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
