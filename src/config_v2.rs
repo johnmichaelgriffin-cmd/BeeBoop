@@ -97,7 +97,7 @@ impl Default for Config {
             // Window
             window_seconds: 300,
             start_delay_s: 15,
-            cancel_at_s: 270,
+            cancel_at_s: 180,
 
             // Credentials
             poly_private_key: String::new(),
