@@ -78,6 +78,10 @@ path = "src/main.rs"
 name = "beeboop-v2"
 path = "src/main_v2.rs"
 
+[[bin]]
+name = "boobeeth"
+path = "src/main_eth.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

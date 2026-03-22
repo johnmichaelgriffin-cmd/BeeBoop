@@ -56,7 +56,7 @@ pub async fn run_executor_task(
                 let start = Instant::now();
 
                 let result = if let Some((ref cli, ref signer)) = client {
-                    execute_fok_buy(cli, signer, &token_id, notional, max_price).await
+                    execute_fok_buy(cli, signer, &token_id, config.share_base, max_price).await
                 } else {
                     // Dry run
                     let shares = notional / max_price;
@@ -174,9 +174,9 @@ pub async fn run_executor_task(
                 let start = Instant::now();
 
                 let result = if let Some((ref cli, ref signer)) = client {
-                    execute_fok_buy(cli, signer, &opposite_token_id, 0.0, ask_price).await
+                    execute_fok_buy(cli, signer, &opposite_token_id, config.share_base, ask_price).await
                 } else {
-                    let shares = (50.0 * ask_price).floor();
+                    let shares = (config.share_base * ask_price).floor();
                     Ok(FillResult {
                         order_id: format!("dry-leg2-{}", sent_ts_ms),
                         filled_price: ask_price,
@@ -278,7 +278,7 @@ async fn execute_fok_buy(
     client: &AuthedClient,
     signer: &PrivateKeySigner,
     token_id: &str,
-    _spend_usdc: f64, // ignored — we use ask_price to compute shares
+    share_base: f64,   // lockprofit formula base (e.g. 25 for BTC, 10 for ETH)
     ask_price: f64,    // current ask price for this token
 ) -> Result<FillResult, String> {
     use polymarket_client_sdk::clob::types::{OrderType, Side};
@@ -287,9 +287,8 @@ async fn execute_fok_buy(
 
     // Lockprofit formula: floor(50 × ask_price) shares at 99c
     // Posts N shares where N = floor(50 * ask). Willing to spend N * 0.99.
-    // Price improvement fills at ~ask, so total spend ≈ N * ask ≈ 20 * ask^2.
-    // Result: ~25 tokens per side.
-    let base = 25.0_f64;
+    // Price improvement fills at ~ask, so total spend ≈ N * ask ≈ base * ask^2.
+    let base = share_base;
     let shares = (base * ask_price).floor().max(1.0);
 
     let size_str = format!("{:.0}", shares); // whole number, no decimals
@@ -298,8 +297,8 @@ async fn execute_fok_buy(
     let price_dec = Decimal::from_str("0.99")
         .map_err(|e| format!("dec: {}", e))?;
 
-    info!("FOK BUY: {}sh @ 99c (ask={:.0}c, formula=floor(50*{:.2})={:.0}), token={}...{}",
-        size_str, ask_price * 100.0, ask_price, shares,
+    info!("FOK BUY: {}sh @ 99c (ask={:.0}c, formula=floor({:.0}*{:.2})={:.0}), token={}...{}",
+        size_str, ask_price * 100.0, base, ask_price, shares,
         &token_id[..8.min(token_id.len())], &token_id[token_id.len().saturating_sub(8)..]);
 
     let order = client.limit_order()

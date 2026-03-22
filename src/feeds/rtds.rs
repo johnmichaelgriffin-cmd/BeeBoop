@@ -17,9 +17,19 @@ pub async fn run_rtds_task(
     latest_tx: watch::Sender<Option<ChainlinkTick>>,
     _log_tx: mpsc::Sender<LogEvent>,
 ) {
+    run_rtds_task_for("btc/usd", tx, latest_tx, _log_tx).await;
+}
+
+pub async fn run_rtds_task_for(
+    symbol: &str,
+    tx: broadcast::Sender<ChainlinkTick>,
+    latest_tx: watch::Sender<Option<ChainlinkTick>>,
+    _log_tx: mpsc::Sender<LogEvent>,
+) {
+    let sym = symbol.to_string();
     loop {
-        info!("rtds: connecting to {}", RTDS_WS);
-        match connect_and_stream(&tx, &latest_tx).await {
+        info!("rtds: connecting to {} for {}", RTDS_WS, sym);
+        match connect_and_stream_sym(&sym, &tx, &latest_tx).await {
             Ok(()) => warn!("rtds: disconnected, reconnecting..."),
             Err(e) => error!("rtds: error: {}, reconnecting in 2s...", e),
         }
@@ -31,23 +41,31 @@ async fn connect_and_stream(
     tx: &broadcast::Sender<ChainlinkTick>,
     latest_tx: &watch::Sender<Option<ChainlinkTick>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_and_stream_sym("btc/usd", tx, latest_tx).await
+}
+
+async fn connect_and_stream_sym(
+    symbol: &str,
+    tx: &broadcast::Sender<ChainlinkTick>,
+    latest_tx: &watch::Sender<Option<ChainlinkTick>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (ws, _) = connect_async(RTDS_WS).await?;
     let (mut write, mut read) = ws.split();
     info!("rtds: connected");
 
-    // Subscribe to Chainlink BTC/USD
+    let filter = format!("{{\"symbol\":\"{}\"}}", symbol);
     let sub = serde_json::json!({
         "action": "subscribe",
         "subscriptions": [
             {
                 "topic": "crypto_prices_chainlink",
                 "type": "*",
-                "filters": "{\"symbol\":\"btc/usd\"}"
+                "filters": filter
             }
         ]
     });
     write.send(Message::Text(sub.to_string().into())).await?;
-    info!("rtds: subscribed to chainlink btc/usd");
+    info!("rtds: subscribed to chainlink {}", symbol);
 
     // Ping every 5s
     let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(5));

@@ -26,6 +26,8 @@ pub struct Config {
     pub opposite_signal_exit_score: f64,
 
     // Sizing
+    pub share_base: f64,            // lockprofit formula base: floor(share_base * ask) shares @ 99c
+    pub max_pairs_per_window: u32,  // max snipes per window
     pub base_notional: f64,
     pub max_notional: f64,
 
@@ -78,6 +80,8 @@ impl Default for Config {
             opposite_signal_exit_score: 1.2,
 
             // Sizing
+            share_base: 25.0,           // BTC default: 25sh
+            max_pairs_per_window: 40,   // BTC default: 40 snipes
             base_notional: 25.0,
             max_notional: 150.0,
 

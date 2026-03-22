@@ -10,15 +10,22 @@ use tracing::{error, info, warn};
 
 use crate::types_v2::{BinanceTick, LogEvent};
 
-const BINANCE_WS: &str = "wss://fstream.binance.com/ws/btcusdt@bookTicker";
-
 pub async fn run_binance_feed_task(
     tx: broadcast::Sender<BinanceTick>,
     log_tx: mpsc::Sender<LogEvent>,
 ) {
+    run_binance_feed_task_for("btcusdt", tx, log_tx).await;
+}
+
+pub async fn run_binance_feed_task_for(
+    symbol: &str,
+    tx: broadcast::Sender<BinanceTick>,
+    log_tx: mpsc::Sender<LogEvent>,
+) {
+    let url = format!("wss://fstream.binance.com/ws/{}@bookTicker", symbol);
     loop {
-        info!("binance: connecting to {}", BINANCE_WS);
-        match connect_and_stream(&tx, &log_tx).await {
+        info!("binance: connecting to {}", url);
+        match connect_and_stream(&url, &tx, &log_tx).await {
             Ok(()) => warn!("binance: disconnected, reconnecting..."),
             Err(e) => error!("binance: error: {}, reconnecting in 1s...", e),
         }
@@ -27,10 +34,11 @@ pub async fn run_binance_feed_task(
 }
 
 async fn connect_and_stream(
+    url: &str,
     tx: &broadcast::Sender<BinanceTick>,
     _log_tx: &mpsc::Sender<LogEvent>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (ws, _) = connect_async(BINANCE_WS).await?;
+    let (ws, _) = connect_async(url).await?;
     let (mut write, mut read) = ws.split();
     info!("binance: connected");
 
