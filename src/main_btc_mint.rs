@@ -236,10 +236,7 @@ async fn main() -> Result<()> {
         let elapsed_s = now_ms / 1000 - market.window_start_ts;
         if elapsed_s > config.cancel_at_s as i64 { continue; }
 
-        // Direction lock
-        if let Some(locked) = window_locked_side {
-            if signal.side != locked { continue; }
-        }
+        // No direction lock — we hold equal inventory, any direction is fine
 
         // Signal says UP → sell DN first (about to drop), then sell UP (now higher)
         // Signal says DN → sell UP first (about to drop), then sell DN (now higher)
@@ -255,12 +252,6 @@ async fn main() -> Result<()> {
                 (&market.up_token_id, "UP", &market.down_token_id, "DN")
             }
         };
-
-        // Lock direction on first signal
-        if window_locked_side.is_none() {
-            info!(">>> DIRECTION LOCKED: {:?} for this window", signal.side);
-            window_locked_side = Some(signal.side);
-        }
 
         let side_label = if signal.side == Side::Up { "UP" } else { "DN" };
         info!(">>> SNIPE {}/{}: signal={} score={:.3} | sell {} then {}",
