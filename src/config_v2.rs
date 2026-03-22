@@ -74,7 +74,7 @@ impl Default for Config {
             take_profit_cents: 4.0,
             stop_loss_cents: 3.0,
             max_hold_ms: 2_500,
-            cooldown_ms: 2_000,
+            cooldown_ms: 1_500,
             opposite_signal_exit_score: 1.2,
 
             // Sizing
@@ -93,7 +93,7 @@ impl Default for Config {
             // Window
             window_seconds: 300,
             start_delay_s: 15,
-            cancel_at_s: 240,
+            cancel_at_s: 270,
 
             // Credentials
             poly_private_key: String::new(),
