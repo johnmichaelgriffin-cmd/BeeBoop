@@ -87,7 +87,7 @@ impl Default for Config {
             max_spread_cents: 4.0,
             min_entry_price: 0.15,
             max_entry_price: 0.97,
-            min_time_to_expiry_s: 20,
+            min_time_to_expiry_s: 60,
             wallet_check_interval_s: 300,
 
             // Window

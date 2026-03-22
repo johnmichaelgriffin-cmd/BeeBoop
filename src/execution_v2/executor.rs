@@ -271,9 +271,9 @@ async fn authenticate(config: &Config) -> Result<(AuthedClient, PrivateKeySigner
     Ok((authed, signer))
 }
 
-/// Buy using lockprofit formula: floor(20 × ask_price) shares at 99c limit.
-/// The matching engine spends all allocated $ and gives ~20 tokens via price improvement.
-/// Example: ask=60c → floor(20×0.60) = 12sh @ 99c → fills at ~60c → ~20 tokens.
+/// Buy using lockprofit formula: floor(50 × ask_price) shares at 99c limit.
+/// The matching engine spends all allocated $ and gives ~50 tokens via price improvement.
+/// Example: ask=60c → floor(50×0.60) = 30sh @ 99c → fills at ~60c → ~50 tokens.
 async fn execute_fok_buy(
     client: &AuthedClient,
     signer: &PrivateKeySigner,
@@ -285,11 +285,11 @@ async fn execute_fok_buy(
 
     let token_u256 = U256::from_str(token_id).map_err(|e| format!("token: {}", e))?;
 
-    // Lockprofit formula: floor(20 × ask_price) shares at 99c
-    // Posts N shares where N = floor(20 * ask). Willing to spend N * 0.99.
-    // Price improvement fills at ~ask, so total spend ≈ N * ask ≈ 20 * ask^2.
-    // Result: ~20 tokens per side.
-    let base = 20.0_f64;
+    // Lockprofit formula: floor(50 × ask_price) shares at 99c
+    // Posts N shares where N = floor(50 * ask). Willing to spend N * 0.99.
+    // Price improvement fills at ~ask, so total spend ≈ N * ask ≈ 50 * ask^2.
+    // Result: ~50 tokens per side.
+    let base = 50.0_f64;
     let shares = (base * ask_price).floor().max(1.0);
 
     let size_str = format!("{:.0}", shares); // whole number, no decimals
@@ -298,7 +298,7 @@ async fn execute_fok_buy(
     let price_dec = Decimal::from_str("0.99")
         .map_err(|e| format!("dec: {}", e))?;
 
-    info!("FOK BUY: {}sh @ 99c (ask={:.0}c, formula=floor(20*{:.2})={:.0}), token={}...{}",
+    info!("FOK BUY: {}sh @ 99c (ask={:.0}c, formula=floor(50*{:.2})={:.0}), token={}...{}",
         size_str, ask_price * 100.0, ask_price, shares,
         &token_id[..8.min(token_id.len())], &token_id[token_id.len().saturating_sub(8)..]);
 

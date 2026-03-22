@@ -44,7 +44,8 @@ pub async fn run_position_manager_task(
     info!("position_manager: target=20sh/side, cooldown={}ms", config.cooldown_ms);
 
     let mut current_pair: Option<PairTrade> = None;
-    let mut window_pair_done: bool = false;   // ONE pair per window, period
+    let mut pairs_this_window: u32 = 0;       // max 5 pairs per window
+    let max_pairs_per_window: u32 = 5;
     let mut window_shares_bought: f64 = 0.0;  // tracking only
     let mut last_window_ts: i64 = 0;
     let reprice_wait_ms: u64 = 2000;         // wait 2s for repricing before buying second leg
@@ -63,7 +64,7 @@ pub async fn run_position_manager_task(
                     shared.clear_position();
                     shared.set_state(StrategyState::Idle);
                     current_pair = None;
-                    window_pair_done = false;
+                    pairs_this_window = 0;
                     window_shares_bought = 0.0;
                 }
                 last_window_ts = market.window_start_ts;
@@ -193,20 +194,30 @@ pub async fn run_position_manager_task(
                                 opp_label, filled_size, filled_price * 100.0);
                         }
 
-                        // ONE pair per window. Done. Wait for next window.
-                        window_pair_done = true;
-                        shared.set_state(StrategyState::PairComplete);
+                        pairs_this_window += 1;
                         current_pair = None;
-                        info!(">>> DONE FOR THIS WINDOW — waiting for next window");
+                        if pairs_this_window >= max_pairs_per_window {
+                            shared.set_state(StrategyState::PairComplete);
+                            info!(">>> PAIR {}/{} COMPLETE — max reached, done for this window", pairs_this_window, max_pairs_per_window);
+                        } else {
+                            shared.set_state(StrategyState::Idle);
+                            shared.set_cooldown(chrono::Utc::now().timestamp_millis() + config.cooldown_ms);
+                            info!(">>> PAIR {}/{} COMPLETE — back to Idle, hunting for next signal", pairs_this_window, max_pairs_per_window);
+                        }
                     }
 
                     ExecutionEvent::SecondLegRejected { reason, .. } => {
                         warn!(">>> LEG 2 FAILED: {} — holding leg 1 to resolution", reason);
-                        // Done for this window even if leg 2 failed
-                        window_pair_done = true;
+                        pairs_this_window += 1; // counts as an attempt
                         current_pair = None;
-                        shared.set_state(StrategyState::PairComplete);
-                        info!(">>> DONE FOR THIS WINDOW (leg 2 failed) — waiting for next window");
+                        if pairs_this_window >= max_pairs_per_window {
+                            shared.set_state(StrategyState::PairComplete);
+                            info!(">>> PAIR {}/{} (leg 2 failed) — max reached, done for window", pairs_this_window, max_pairs_per_window);
+                        } else {
+                            shared.set_state(StrategyState::Idle);
+                            shared.set_cooldown(chrono::Utc::now().timestamp_millis() + config.cooldown_ms);
+                            info!(">>> PAIR {}/{} (leg 2 failed) — back to Idle", pairs_this_window, max_pairs_per_window);
+                        }
                     }
 
                     // Legacy events — ignore
