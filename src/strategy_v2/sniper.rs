@@ -52,8 +52,34 @@ pub async fn run_strategy_task(
     info!("strategy: started (FOK taker, base=${:.0}, max=${:.0})",
         config.base_notional, config.max_notional);
 
+    let mut window_locked_side: Option<Side> = None;
+    let mut last_window_ts: i64 = 0;
+
     while let Some(signal) = signal_rx.recv().await {
         let now_ms = chrono::Utc::now().timestamp_millis();
+
+        // Reset direction lock on new window
+        {
+            let market = market_rx.borrow().clone();
+            if market.window_start_ts > 0 && market.window_start_ts != last_window_ts {
+                if window_locked_side.is_some() {
+                    info!("strategy: NEW WINDOW — clearing direction lock");
+                }
+                window_locked_side = None;
+                last_window_ts = market.window_start_ts;
+            }
+        }
+
+        // Direction lock: only trade same side as first signal in this window
+        if let Some(locked) = window_locked_side {
+            if signal.side != locked {
+                let _ = log_tx.send(LogEvent::TradeSkipped {
+                    ts_ms: now_ms,
+                    reason: format!("wrong_direction: signal={:?} locked={:?}", signal.side, locked),
+                }).await;
+                continue;
+            }
+        }
 
         // Double-check state
         if !shared.is_idle() {
@@ -147,6 +173,12 @@ pub async fn run_strategy_task(
             side_label, notional, shares_est, ask_price * 100.0,
             signal.score, signal.fast_move_bps, signal.r2000_bps, signal.basis_dev_bps, signal.dbasis_bps, signal.obi_ema,
         );
+
+        // Lock direction for this window
+        if window_locked_side.is_none() {
+            info!(">>> DIRECTION LOCKED: {:?} for this window", signal.side);
+            window_locked_side = Some(signal.side);
+        }
 
         // Transition to Entering
         shared.set_state(StrategyState::Entering);

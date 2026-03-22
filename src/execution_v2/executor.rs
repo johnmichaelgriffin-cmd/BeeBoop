@@ -176,7 +176,7 @@ pub async fn run_executor_task(
                 let result = if let Some((ref cli, ref signer)) = client {
                     execute_fok_buy(cli, signer, &opposite_token_id, 0.0, ask_price).await
                 } else {
-                    let shares = (20.0 * ask_price).floor();
+                    let shares = (50.0 * ask_price).floor();
                     Ok(FillResult {
                         order_id: format!("dry-leg2-{}", sent_ts_ms),
                         filled_price: ask_price,
