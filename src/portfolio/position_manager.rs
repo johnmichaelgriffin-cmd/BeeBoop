@@ -44,8 +44,8 @@ pub async fn run_position_manager_task(
     info!("position_manager: target=50sh/side, max=5 pairs/window, direction-locked, cooldown={}ms", config.cooldown_ms);
 
     let mut current_pair: Option<PairTrade> = None;
-    let mut pairs_this_window: u32 = 0;       // max 5 pairs per window
-    let max_pairs_per_window: u32 = 5;         // 5 snipes per window
+    let mut pairs_this_window: u32 = 0;       // max 20 pairs per window
+    let max_pairs_per_window: u32 = 20;        // 20 snipes per window
     let mut window_shares_bought: f64 = 0.0;  // tracking only
     let mut last_window_ts: i64 = 0;
     let reprice_wait_ms: u64 = 2000;         // wait 2s for repricing before buying second leg

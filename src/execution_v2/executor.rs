@@ -287,9 +287,9 @@ async fn execute_fok_buy(
 
     // Lockprofit formula: floor(50 × ask_price) shares at 99c
     // Posts N shares where N = floor(50 * ask). Willing to spend N * 0.99.
-    // Price improvement fills at ~ask, so total spend ≈ N * ask ≈ 50 * ask^2.
-    // Result: ~50 tokens per side.
-    let base = 50.0_f64;
+    // Price improvement fills at ~ask, so total spend ≈ N * ask ≈ 20 * ask^2.
+    // Result: ~20 tokens per side.
+    let base = 20.0_f64;
     let shares = (base * ask_price).floor().max(1.0);
 
     let size_str = format!("{:.0}", shares); // whole number, no decimals
