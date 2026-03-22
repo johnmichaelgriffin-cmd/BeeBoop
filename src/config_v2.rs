@@ -83,7 +83,7 @@ impl Default for Config {
 
             // Risk
             max_one_position: true,
-            session_stop_loss: -200.0,
+            session_stop_loss: -500.0,
             max_spread_cents: 4.0,
             min_entry_price: 0.15,
             max_entry_price: 0.97,
