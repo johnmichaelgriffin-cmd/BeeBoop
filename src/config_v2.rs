@@ -66,9 +66,9 @@ impl Default for Config {
             basis_slope_lookback_ms: 250,
             basis_ema_tau_ms: 60_000.0,
             obi_ema_tau_ms: 250.0,
-            trigger_min_fast_move_bps: 0.55,
-            maker_score_min: 0.35,
-            taker_score_min: 0.80,
+            trigger_min_fast_move_bps: 0.85,
+            maker_score_min: 0.55,
+            taker_score_min: 1.00,
             max_signal_age_ms: 1400,
             maker_max_signal_age_ms: 900,
 
