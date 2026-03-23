@@ -194,6 +194,10 @@ async fn run_vidarx_strategy(
     let mut exp_cost: f64 = 0.0;
     let mut quotes_posted: u32 = 0;
     let mut fills_this_window: u32 = 0;
+    // Track shares POSTED as a worst-case inventory estimate
+    // (assumes all posted orders fill — conservative for balancing)
+    let mut up_shares_posted: f64 = 0.0;
+    let mut dn_shares_posted: f64 = 0.0;
     let mut last_quote_ts: i64 = 0;
     let mut last_signal: Option<Signal> = None;
     let mut window_active = false;
@@ -281,6 +285,8 @@ async fn run_vidarx_strategy(
                 exp_cost = 0.0;
                 quotes_posted = 0;
                 fills_this_window = 0;
+                up_shares_posted = 0.0;
+                dn_shares_posted = 0.0;
                 last_quote_ts = 0;
                 last_signal = None;
                 window_active = false;
@@ -521,9 +527,10 @@ async fn run_vidarx_strategy(
                 let score = last_signal.as_ref().map_or(0.0, |s| s.score);
                 let skew = (score * 0.25).clamp(-0.5, 0.5);
 
-                // Inventory ratio from FILL-TIME classification (not current asks)
-                let total_fill_shares = cheap_shares + exp_shares;
-                let cheap_ratio = if total_fill_shares > 0.0 { cheap_shares / total_fill_shares } else { 0.55 };
+                // Inventory ratio from fills (user WS or reconciliation)
+                let total_fill_shares = up_shares + dn_shares;
+                let cheap_eff = if cheap_side == Side::Up { up_shares } else { dn_shares };
+                let cheap_ratio = if total_fill_shares > 0.0 { cheap_eff / total_fill_shares } else { 0.55 };
 
                 // Inventory correction: if cheap ratio outside 0.45-0.65, adjust ladder sizes
                 let mut cheap_size_mult = 1.0_f64;
@@ -665,6 +672,13 @@ async fn run_vidarx_strategy(
                         was_cheap: is_cheap_order,
                     }).await;
                     quotes_posted += 1;
+
+                    // Track posted shares for balancing (worst-case: assume all fill)
+                    if *side == Side::Up {
+                        up_shares_posted += *size;
+                    } else {
+                        dn_shares_posted += *size;
+                    }
                 }
             }
         }
