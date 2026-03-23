@@ -555,7 +555,7 @@ async fn run_vidarx_strategy(
                 let cheap_tick = if cheap_side == Side::Up { up_tick_size } else { dn_tick_size };
 
                 for (level, &base_size) in cheap_ladder.iter().enumerate() {
-                    let size = (base_size * cheap_size_mult * late_mult * (1.0 + skew.abs() * 0.3)).round().max(1.0);
+                    let size = (base_size * cheap_size_mult * late_mult * (1.0 + skew.abs() * 0.3)).round().max(5.0);
                     let price = match level {
                         0 => (cheap_bid + cheap_tick).min(cheap_ask_price - cheap_tick),
                         1 => cheap_bid,
@@ -588,7 +588,7 @@ async fn run_vidarx_strategy(
                 };
 
                 for (level, &base_size) in exp_ladder.iter().enumerate() {
-                    let size = (base_size * exp_size_mult * late_mult).round().max(1.0);
+                    let size = (base_size * exp_size_mult * late_mult).round().max(5.0);
                     let price = match level {
                         0 => (exp_bid + exp_tick + exp_skew).min(exp_ask_price - exp_tick),
                         1 => exp_bid + exp_skew,
