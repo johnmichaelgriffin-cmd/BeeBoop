@@ -197,6 +197,8 @@ async fn run_vidarx_strategy(
     let mut last_quote_ts: i64 = 0;
     let mut last_signal: Option<Signal> = None;
     let mut window_active = false;
+    let mut last_reconcile_ts: i64 = 0;
+    let reconcile_interval_ms: i64 = 10_000; // reconcile every 10 seconds
     // Track last known prices for staleness detection
     let mut last_price_update_ms: i64 = 0;
 
@@ -263,10 +265,23 @@ async fn run_vidarx_strategy(
                 last_signal = Some(signal);
             }
 
-            // Receive execution events (from executor — mostly for cancel acks)
-            Some(_evt) = exec_evt_rx.recv() => {
-                // GTC postOnly bids don't emit EntryFilled from executor.
-                // Real fills come from the user WS channel below.
+            // Receive execution events (cancel acks, reconciliation results)
+            Some(evt) = exec_evt_rx.recv() => {
+                match evt {
+                    ExecutionEvent::ReconcileResult(recon) => {
+                        info!("RECONCILE: open_orders={} CLOB_fills: UP={:.1} DN={:.1} | local: UP={:.1} DN={:.1} | drift: UP={:.1} DN={:.1}",
+                            recon.open_order_count,
+                            recon.up_size_matched, recon.down_size_matched,
+                            up_shares, dn_shares,
+                            recon.up_size_matched - up_shares, recon.down_size_matched - dn_shares,
+                        );
+                        // If CLOB shows more fills than local, we missed user WS events — log warning
+                        if recon.up_size_matched > up_shares + 1.0 || recon.down_size_matched > dn_shares + 1.0 {
+                            warn!("RECONCILE DRIFT DETECTED — CLOB has more fills than local state");
+                        }
+                    }
+                    _ => {} // ignore other events (cancel acks etc)
+                }
             }
 
             // Receive REAL fills from user WebSocket (authenticated trade events)
@@ -387,6 +402,15 @@ async fn run_vidarx_strategy(
                 }
                 last_quote_ts = now_ms;
 
+                // Periodic reconciliation — every 10 seconds
+                if now_ms - last_reconcile_ts >= reconcile_interval_ms {
+                    last_reconcile_ts = now_ms;
+                    let _ = exec_cmd_tx.send(ExecutionCommand::Reconcile {
+                        up_token_id: market.up_token_id.clone(),
+                        down_token_id: market.down_token_id.clone(),
+                    }).await;
+                }
+
                 // Get current book
                 let top = pm_top_rx.borrow().clone();
                 let (up_bid, up_ask) = match (top.up_bid, top.up_ask) {
@@ -407,6 +431,20 @@ async fn run_vidarx_strategy(
                     warn!("STALE PRICES: {}ms since last update — skipping quotes", price_age_ms);
                     continue;
                 }
+
+                // Compute fair values — signal shifts our estimate of true value
+                let up_mid = (up_bid + up_ask) / 2.0;
+                let dn_mid = (dn_bid + dn_ask) / 2.0;
+                let score = last_signal.as_ref().map_or(0.0, |s| s.score);
+                let k = 0.03; // 3 cents per unit score
+                let fair_up = (up_mid + k * score).clamp(0.02, 0.98);
+                let fair_dn = (1.0 - fair_up).clamp(0.02, 0.98);
+
+                // Min required edge per ladder level (quote must be below fair value by at least this much)
+                let min_edge_l1 = 0.015; // 1.5 cents
+                let min_edge_l2 = 0.010; // 1.0 cent
+                let min_edge_l3 = 0.005; // 0.5 cent
+                let min_edges = [min_edge_l1, min_edge_l2, min_edge_l3];
 
                 // Determine cheap vs expensive
                 let (cheap_side, exp_side) = if up_ask < dn_ask {
@@ -451,6 +489,8 @@ async fn run_vidarx_strategy(
                 let cheap_bid = if cheap_side == Side::Up { up_bid } else { dn_bid };
                 let cheap_ask_price = if cheap_side == Side::Up { up_ask } else { dn_ask };
 
+                let cheap_fair = if cheap_side == Side::Up { fair_up } else { fair_dn };
+
                 for (level, &base_size) in cheap_ladder.iter().enumerate() {
                     let size = (base_size * cheap_size_mult * late_mult * (1.0 + skew.abs() * 0.3)).round().max(1.0);
                     let price = match level {
@@ -460,6 +500,10 @@ async fn run_vidarx_strategy(
                     };
 
                     if price <= 0.01 || price >= cheap_ask_price { continue; } // would cross or invalid
+
+                    // Quote-edge filter: only post if bid has enough edge vs fair value
+                    let edge = cheap_fair - price;
+                    if edge < min_edges[level] { continue; }
 
                     let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                         market_slug: market.slug.clone(),
@@ -484,6 +528,8 @@ async fn run_vidarx_strategy(
                     0.0
                 };
 
+                let exp_fair = if exp_side == Side::Up { fair_up } else { fair_dn };
+
                 for (level, &base_size) in exp_ladder.iter().enumerate() {
                     let size = (base_size * exp_size_mult * late_mult).round().max(1.0);
                     let price = match level {
@@ -493,6 +539,10 @@ async fn run_vidarx_strategy(
                     };
 
                     if price <= 0.01 || price >= exp_ask_price { continue; }
+
+                    // Quote-edge filter: only post if bid has enough edge vs fair value
+                    let edge = exp_fair - price;
+                    if edge < min_edges[level] { continue; }
 
                     let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                         market_slug: market.slug.clone(),

@@ -224,6 +224,7 @@ pub async fn run_position_manager_task(
                     ExecutionEvent::ExitFilled { .. } => {}
                     ExecutionEvent::ExitRejected { .. } => {}
                     ExecutionEvent::CancelAck { .. } => {}
+                    ExecutionEvent::ReconcileResult(_) => {} // handled in vidarx strategy
                 }
             }
 

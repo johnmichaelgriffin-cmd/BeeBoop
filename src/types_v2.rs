@@ -178,6 +178,20 @@ pub enum ExecutionCommand {
         size: f64,
         post_only: bool,
     },
+    /// Reconcile: fetch open orders to verify local state
+    Reconcile {
+        up_token_id: String,
+        down_token_id: String,
+    },
+}
+
+/// Reconciliation data
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReconciliationResult {
+    pub open_order_count: usize,
+    pub up_size_matched: f64,
+    pub down_size_matched: f64,
+    pub ts_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +245,7 @@ pub enum ExecutionEvent {
         ts_ms: i64,
         count: usize,
     },
+    ReconcileResult(ReconciliationResult),
 }
 
 // ── Logging Types ───────────────────────────────────────────────
