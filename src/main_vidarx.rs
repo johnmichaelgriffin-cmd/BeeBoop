@@ -557,14 +557,15 @@ async fn run_vidarx_strategy(
                 for (level, &base_size) in cheap_ladder.iter().enumerate() {
                     let size = (base_size * cheap_size_mult * late_mult * (1.0 + skew.abs() * 0.3)).round().max(5.0);
                     let price = match level {
-                        0 => (cheap_bid + cheap_tick).min(cheap_ask_price - cheap_tick),
-                        1 => cheap_bid,
-                        _ => (cheap_bid - cheap_tick).max(cheap_tick),
+                        0 => cheap_bid, // L1: at best bid (NOT bid+tick — that crosses)
+                        1 => cheap_bid - cheap_tick,
+                        _ => cheap_bid - 2.0 * cheap_tick,
                     };
                     // Round price to tick size
                     let price = (price / cheap_tick).round() * cheap_tick;
 
-                    if price <= cheap_tick || price >= cheap_ask_price { continue; }
+                    // Must be strictly below ask and above zero
+                    if price <= cheap_tick || price >= cheap_ask_price - cheap_tick { continue; }
 
                     let edge = cheap_fair - price;
                     if edge < min_edges[level] { continue; }
@@ -590,13 +591,14 @@ async fn run_vidarx_strategy(
                 for (level, &base_size) in exp_ladder.iter().enumerate() {
                     let size = (base_size * exp_size_mult * late_mult).round().max(5.0);
                     let price = match level {
-                        0 => (exp_bid + exp_tick + exp_skew).min(exp_ask_price - exp_tick),
-                        1 => exp_bid + exp_skew,
-                        _ => (exp_bid - exp_tick + exp_skew).max(exp_tick),
+                        0 => exp_bid + exp_skew, // L1: at best bid (with signal skew)
+                        1 => exp_bid - exp_tick + exp_skew,
+                        _ => exp_bid - 2.0 * exp_tick + exp_skew,
                     };
                     let price = (price / exp_tick).round() * exp_tick;
 
-                    if price <= exp_tick || price >= exp_ask_price { continue; }
+                    // Must be strictly below ask and above zero
+                    if price <= exp_tick || price >= exp_ask_price - exp_tick { continue; }
 
                     let edge = exp_fair - price;
                     if edge < min_edges[level] { continue; }
@@ -605,20 +607,50 @@ async fn run_vidarx_strategy(
                     desired_quotes.insert(key, (price, size, exp_token.clone(), exp_side));
                 }
 
-                // Cancel ALL existing orders before reposting fresh ladder.
-                // This prevents duplicate ladder accumulation.
-                // Queue priority is sacrificed but safety is guaranteed.
+                // Selective refresh: compare desired vs live orders.
+                // Only cancel+repost orders whose price actually changed.
+                // Orders at the same price keep their queue position.
+                let tick_threshold = cheap_tick.min(exp_tick) * 0.5;
+                let mut needs_cancel = false;
+
+                // Check if ANY quote price moved enough to warrant a refresh
+                for (key, (desired_price, _desired_size, _, _)) in &desired_quotes {
+                    if let Some((_live_id, live_price, _live_size)) = live_orders.get(key) {
+                        if (*desired_price - *live_price).abs() > tick_threshold {
+                            needs_cancel = true;
+                            break;
+                        }
+                    } else {
+                        // New level that didn't exist before
+                        needs_cancel = true;
+                        break;
+                    }
+                }
+
+                // Also check if any live orders are no longer desired
+                for key in live_orders.keys() {
+                    if !desired_quotes.contains_key(key) {
+                        needs_cancel = true;
+                        break;
+                    }
+                }
+
+                // If nothing changed, skip this cycle — orders keep resting
+                if !needs_cancel && !live_orders.is_empty() {
+                    continue;
+                }
+
+                // Something changed — cancel all and repost
                 if !live_orders.is_empty() {
                     let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                        reason: "refresh_cycle".into(),
+                        reason: "selective_refresh".into(),
                     }).await;
                     live_orders.clear();
                     order_meta.clear();
-                    // Brief pause for cancels to process
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
 
-                // Post fresh ladder — all desired quotes
+                // Post fresh ladder
                 for (key, (price, size, token_id, side)) in &desired_quotes {
                     let is_cheap_order = key.starts_with("cheap");
 
