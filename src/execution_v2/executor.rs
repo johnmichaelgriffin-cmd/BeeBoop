@@ -549,16 +549,8 @@ async fn post_heartbeat(client: &AuthedClient, prev_id: Option<&str>) -> Result<
         .and_then(|id| Uuid::parse_str(id).ok());
     match client.post_heartbeat(hb_uuid).await {
         Ok(resp) => {
-            // Extract the heartbeat ID from the response.
-            // Use Debug format but strip quotes to get the raw value.
-            let raw = format!("{:?}", resp);
-            // Try to find a UUID pattern in the debug output
-            let id = raw.chars()
-                .filter(|c| c.is_alphanumeric() || *c == '-')
-                .collect::<String>();
-            // If we can't parse it cleanly, use the raw debug string
-            // The next heartbeat call will get a 400 and reset
-            Ok(if id.len() >= 32 { id } else { raw })
+            // HeartbeatResponse has .heartbeat_id: Uuid — extract it directly
+            Ok(resp.heartbeat_id.to_string())
         }
         Err(e) => Err(format!("heartbeat: {}", e)),
     }
