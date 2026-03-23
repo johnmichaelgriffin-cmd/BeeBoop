@@ -185,11 +185,18 @@ async fn run_vidarx_strategy(
     let mut dn_shares: f64 = 0.0;
     let mut up_cost: f64 = 0.0;
     let mut dn_cost: f64 = 0.0;
+    // Fill-time cheap/exp classification (not refresh-time)
+    let mut cheap_shares: f64 = 0.0;
+    let mut exp_shares: f64 = 0.0;
+    let mut cheap_cost: f64 = 0.0;
+    let mut exp_cost: f64 = 0.0;
     let mut quotes_posted: u32 = 0;
     let mut fills_this_window: u32 = 0;
     let mut last_quote_ts: i64 = 0;
     let mut last_signal: Option<Signal> = None;
     let mut window_active = false;
+    // Track last known prices for staleness detection
+    let mut last_price_update_ms: i64 = 0;
 
     // Quote refresh interval — every 2 seconds
     let quote_refresh_ms: i64 = 2000;
@@ -227,11 +234,16 @@ async fn run_vidarx_strategy(
                 dn_shares = 0.0;
                 up_cost = 0.0;
                 dn_cost = 0.0;
+                cheap_shares = 0.0;
+                exp_shares = 0.0;
+                cheap_cost = 0.0;
+                exp_cost = 0.0;
                 quotes_posted = 0;
                 fills_this_window = 0;
                 last_quote_ts = 0;
                 last_signal = None;
                 window_active = false;
+                last_price_update_ms = 0;
                 last_window_ts = market.window_start_ts;
 
                 // Cancel any leftover orders from previous window
@@ -281,10 +293,29 @@ async fn run_vidarx_strategy(
                     dn_cost += fill.size * fill.price;
                 }
 
+                // Classify cheap/exp at FILL TIME using current book (not refresh time)
+                let top = pm_top_rx.borrow().clone();
+                let is_cheap = match (top.up_ask, top.down_ask) {
+                    (Some(ua), Some(da)) => {
+                        if is_up { ua < da } else { da < ua }
+                    }
+                    _ => fill.price < 0.50, // fallback: below 50c = cheap
+                };
+
+                if is_cheap {
+                    cheap_shares += fill.size;
+                    cheap_cost += fill.size * fill.price;
+                } else {
+                    exp_shares += fill.size;
+                    exp_cost += fill.size * fill.price;
+                }
+
                 let matched = up_shares.min(dn_shares);
                 let total_shares = up_shares + dn_shares;
                 let up_pct = if total_shares > 0.0 { up_shares / total_shares * 100.0 } else { 0.0 };
+                let cheap_pct = if total_shares > 0.0 { cheap_shares / total_shares * 100.0 } else { 55.0 };
                 let side_label = if is_up { "UP" } else { "DN" };
+                let ce_label = if is_cheap { "cheap" } else { "exp" };
 
                 // Compute live pair cost on matched shares
                 let pair_cost = if matched > 0.0 {
@@ -293,9 +324,9 @@ async fn run_vidarx_strategy(
                     up_avg + dn_avg
                 } else { 0.0 };
 
-                info!(">>> FILL (user_ws): {} {:.1}sh @ {:.2} [{}] | UP={:.0} DN={:.0} ({:.0}%UP) matched={:.0} pcost={:.0}c | fills={}",
-                    side_label, fill.size, fill.price, fill.status,
-                    up_shares, dn_shares, up_pct, matched, pair_cost * 100.0, fills_this_window);
+                info!(">>> FILL: {} {} {:.1}sh @ {:.2} [{}] | UP={:.0} DN={:.0} ({:.0}%UP) cheap={:.0}% matched={:.0} pcost={:.0}c | fills={}",
+                    side_label, ce_label, fill.size, fill.price, fill.status,
+                    up_shares, dn_shares, up_pct, cheap_pct, matched, pair_cost * 100.0, fills_this_window);
             }
 
             // Heartbeat
@@ -365,6 +396,16 @@ async fn run_vidarx_strategy(
                     _ => continue,
                 };
 
+                // Staleness watchdog — don't quote off stale prices
+                if top.recv_ts_ms > last_price_update_ms {
+                    last_price_update_ms = top.recv_ts_ms;
+                }
+                let price_age_ms = now_ms - last_price_update_ms;
+                if price_age_ms > 5000 && last_price_update_ms > 0 {
+                    warn!("STALE PRICES: {}ms since last update — skipping quotes", price_age_ms);
+                    continue;
+                }
+
                 // Determine cheap vs expensive
                 let (cheap_side, exp_side) = if up_ask < dn_ask {
                     (Side::Up, Side::Down)
@@ -376,10 +417,9 @@ async fn run_vidarx_strategy(
                 let score = last_signal.as_ref().map_or(0.0, |s| s.score);
                 let skew = (score * 0.25).clamp(-0.5, 0.5);
 
-                // Inventory ratio check — are we too heavy on one side?
-                let total_shares = up_shares + dn_shares;
-                let cheap_shares = if cheap_side == Side::Up { up_shares } else { dn_shares };
-                let cheap_ratio = if total_shares > 0.0 { cheap_shares / total_shares } else { 0.55 };
+                // Inventory ratio from FILL-TIME classification (not current asks)
+                let total_fill_shares = cheap_shares + exp_shares;
+                let cheap_ratio = if total_fill_shares > 0.0 { cheap_shares / total_fill_shares } else { 0.55 };
 
                 // Inventory correction: if cheap ratio outside 0.45-0.65, adjust ladder sizes
                 let mut cheap_size_mult = 1.0_f64;

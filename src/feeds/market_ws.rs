@@ -222,7 +222,21 @@ pub async fn run_market_ws_task(
                                     }
                                 }
 
-                                // ── FORMAT 5: last_trade_price fallback ──
+                                // ── FORMAT 5: tick_size_change ──
+                                if event_type == "tick_size_change" {
+                                    if let Some(tick_sizes) = data.get("tick_sizes").and_then(|v| v.as_array()) {
+                                        for ts in tick_sizes {
+                                            let aid = ts.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                                            let tick = ts.get("tick_size").and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.01);
+                                            if aid == up_token || aid == dn_token {
+                                                info!("market_ws: TICK SIZE CHANGE: {} -> {}", &aid[..16.min(aid.len())], tick);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // ── FORMAT 6: last_trade_price fallback ──
                                 if !updated {
                                     if let Some(aid) = data.get("asset_id").and_then(|v| v.as_str()) {
                                         if let Some(price) = data.get("price")

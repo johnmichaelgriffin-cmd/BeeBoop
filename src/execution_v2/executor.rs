@@ -49,7 +49,29 @@ pub async fn run_executor_task(
         None
     };
 
-    while let Some(cmd) = cmd_rx.recv().await {
+    // Order heartbeat — must be called every 5s or open orders get cancelled
+    let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut heartbeat_id: Option<String> = None;
+
+    loop {
+        tokio::select! {
+            // Heartbeat tick — keep orders alive
+            _ = heartbeat_interval.tick() => {
+                if let Some((ref cli, _)) = client {
+                    match post_heartbeat(cli, heartbeat_id.as_deref()).await {
+                        Ok(new_id) => {
+                            heartbeat_id = Some(new_id);
+                        }
+                        Err(e) => {
+                            warn!("heartbeat failed: {} — orders may be cancelled", e);
+                            heartbeat_id = None; // will get a fresh one next tick
+                        }
+                    }
+                }
+            }
+
+            // Process execution commands
+            Some(cmd) = cmd_rx.recv() => {
         match cmd {
             ExecutionCommand::EnterTaker { market_slug, token_id, side, max_price, notional, signal } => {
                 let sent_ts_ms = chrono::Utc::now().timestamp_millis();
@@ -269,7 +291,9 @@ pub async fn run_executor_task(
                 }
             }
         }
-    }
+            } // end Some(cmd) = cmd_rx.recv()
+        } // end tokio::select!
+    } // end loop
 }
 
 pub struct FillResult {
@@ -514,5 +538,17 @@ async fn execute_gtc_bid(
         })
     } else {
         Err(format!("rejected: {:?} {:?}", resp.status, resp.error_msg))
+    }
+}
+
+/// Post order heartbeat to keep resting GTC orders alive.
+/// Polymarket cancels all open orders if heartbeat not received within ~10s.
+async fn post_heartbeat(client: &AuthedClient, prev_id: Option<&str>) -> Result<String, String> {
+    use polymarket_client_sdk::auth::Uuid;
+    let hb_uuid = prev_id
+        .and_then(|id| Uuid::parse_str(id).ok());
+    match client.post_heartbeat(hb_uuid).await {
+        Ok(resp) => Ok(format!("{:?}", resp)),
+        Err(e) => Err(format!("heartbeat: {}", e)),
     }
 }
