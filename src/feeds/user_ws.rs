@@ -1,12 +1,15 @@
 //! Polymarket User WebSocket — authenticated feed for order/trade events.
 //!
-//! Connects to wss://ws-subscriptions-clob.polymarket.com/ws/user
-//! Subscribes with auth + specific condition_id.
-//! Parses maker_orders[] for precise fill attribution.
-//! Dedupes fills to prevent inflation on reconnect/replay.
+//! TWO-STEP AUTH FLOW (per API reference):
+//! 1. Send: {"auth":{...},"type":"user"}
+//! 2. Send: {"operation":"subscribe","markets":["<condition_id>"]}
+//!
+//! PRIMARY fill tracking: order UPDATE events with size_matched deltas
+//! SECONDARY: trade events as audit trail
+//!
 //! Reconnects on market window change.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -18,22 +21,20 @@ const USER_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
 const HEARTBEAT_SECS: u64 = 8;
 const RECONNECT_DELAY_MS: u64 = 2000;
 
-/// A fill event from the user channel
+/// A fill event derived from order UPDATE size_matched deltas
 #[derive(Debug, Clone)]
 pub struct UserFillEvent {
     pub order_id: String,
     pub asset_id: String,
     pub side: String,
     pub price: f64,
-    pub size: f64,
-    pub status: String,
+    pub size: f64,       // delta: new fills since last update
+    pub status: String,  // "ORDER_UPDATE" or "TRADE_MATCHED"
     pub ts_ms: i64,
 }
 
-/// Run the authenticated user WebSocket.
-/// Watches market_rx for window changes — reconnects when condition_id changes.
-/// Parses maker_orders[] for precise fill sizes.
-/// Dedupes fills across reconnects.
+/// Run the authenticated user WebSocket with two-step auth flow.
+/// Tracks order size_matched deltas as primary fill signal.
 pub async fn run_user_ws_task(
     api_key: String,
     api_secret: String,
@@ -41,8 +42,6 @@ pub async fn run_user_ws_task(
     mut market_rx: tokio::sync::watch::Receiver<crate::types_v2::MarketDescriptor>,
     fill_tx: mpsc::Sender<UserFillEvent>,
 ) {
-    // P0.3: Dedupe set — prevents double-counting fills across reconnects
-    let mut seen_fills: HashSet<String> = HashSet::new();
     let mut current_condition_id = String::new();
 
     loop {
@@ -50,20 +49,16 @@ pub async fn run_user_ws_task(
         let market = market_rx.borrow().clone();
         let condition_id = market.condition_id.clone();
 
-        // Wait for a valid condition_id before connecting
         if condition_id.is_empty() {
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
 
-        // If condition changed, clear dedupe set for new window
+        // Clear order tracking on condition change
         if condition_id != current_condition_id {
             if !current_condition_id.is_empty() {
-                info!("user_ws: condition changed {} -> {} — clearing dedupe",
-                    &current_condition_id[..16.min(current_condition_id.len())],
-                    &condition_id[..16.min(condition_id.len())]);
+                info!("user_ws: condition changed — reconnecting");
             }
-            seen_fills.clear();
             current_condition_id = condition_id.clone();
         }
 
@@ -74,7 +69,7 @@ pub async fn run_user_ws_task(
         let (ws_stream, _) = match ws_result {
             Ok(s) => s,
             Err(e) => {
-                error!("user_ws: connect failed: {} — retrying", e);
+                error!("user_ws: connect failed: {}", e);
                 tokio::time::sleep(Duration::from_millis(RECONNECT_DELAY_MS)).await;
                 continue;
             }
@@ -82,7 +77,9 @@ pub async fn run_user_ws_task(
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Authenticate with specific market condition
+        // ═══ TWO-STEP AUTH FLOW (per API reference) ═══
+
+        // Step 1: Auth handshake
         let auth_msg = json!({
             "auth": {
                 "apiKey": api_key,
@@ -90,7 +87,6 @@ pub async fn run_user_ws_task(
                 "passphrase": api_passphrase,
             },
             "type": "user",
-            "markets": [&condition_id],
         });
 
         if let Err(e) = write.send(Message::Text(auth_msg.to_string())).await {
@@ -99,7 +95,22 @@ pub async fn run_user_ws_task(
             continue;
         }
 
-        info!("user_ws: connected and authenticated for condition {}", &condition_id[..16.min(condition_id.len())]);
+        // Brief pause for auth to process
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // Step 2: Subscribe to specific market condition
+        let sub_msg = json!({
+            "operation": "subscribe",
+            "markets": [&condition_id],
+        });
+
+        if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
+            error!("user_ws: subscribe send failed: {}", e);
+            tokio::time::sleep(Duration::from_millis(RECONNECT_DELAY_MS)).await;
+            continue;
+        }
+
+        info!("user_ws: authenticated + subscribed to {}", &condition_id[..16.min(condition_id.len())]);
 
         // Writer task — text "PING" heartbeat
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Message>();
@@ -121,17 +132,20 @@ pub async fn run_user_ws_task(
             }
         });
 
+        // ═══ ORDER TRACKING STATE ═══
+        // Track size_matched per order_id — delta = fill
+        let mut order_matched: HashMap<String, f64> = HashMap::new();
         let mut events_received: u64 = 0;
 
-        // P0.1: Reader loop with market_rx.changed() watch for resubscribe
+        // Reader loop with market change detection
         loop {
             tokio::select! {
-                // Watch for market window change — reconnect if condition changes
+                // Watch for market window change
                 _ = market_rx.changed() => {
                     let new_market = market_rx.borrow().clone();
                     if new_market.condition_id != condition_id && !new_market.condition_id.is_empty() {
                         info!("user_ws: market changed — breaking to reconnect");
-                        break; // will reconnect with new condition in outer loop
+                        break;
                     }
                 }
 
@@ -145,111 +159,112 @@ pub async fn run_user_ws_task(
                             if let Ok(data) = serde_json::from_str::<Value>(&text) {
                                 events_received += 1;
 
-                                if events_received <= 5 {
-                                    info!("user_ws: event #{} — {}", events_received, &text[..200.min(text.len())]);
+                                // Log first events for debugging
+                                if events_received <= 10 {
+                                    info!("user_ws: event #{} — {}", events_received,
+                                        &text[..300.min(text.len())]);
                                 }
 
-                                let event_type = data.get("event_type").and_then(|v| v.as_str()).unwrap_or("");
+                                let event_type = data.get("event_type")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("");
 
-                                // P0.2: Parse maker_orders[] for precise fill attribution
-                                if event_type == "trade" {
-                                    let status = data.get("status")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("UNKNOWN");
-
-                                    // Only process MATCHED status
-                                    if status != "MATCHED" { continue; }
-
-                                    let trade_id = data.get("id")
-                                        .or_else(|| data.get("trade_id"))
+                                // ═══ PRIMARY: Order UPDATE events ═══
+                                // Track size_matched deltas for fill accounting
+                                if event_type == "order" {
+                                    let order_type = data.get("type")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("");
+
+                                    let order_id = data.get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
 
                                     let asset_id = data.get("asset_id")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("")
                                         .to_string();
 
-                                    // Try maker_orders[] first — more precise for our fills
-                                    let maker_orders = data.get("maker_orders")
-                                        .and_then(|v| v.as_array());
+                                    let price = data.get("price")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
 
-                                    if let Some(orders) = maker_orders {
-                                        for mo in orders {
-                                            let order_id = mo.get("order_id")
-                                                .and_then(|v| v.as_str())
-                                                .unwrap_or("")
-                                                .to_string();
+                                    let size_matched = data.get("size_matched")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok())
+                                        .unwrap_or(0.0);
 
-                                            let matched_amount = mo.get("matched_amount")
-                                                .and_then(|v| v.as_str())
-                                                .and_then(|s| s.parse::<f64>().ok())
-                                                .unwrap_or(0.0);
+                                    let side = data.get("side")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("BUY")
+                                        .to_string();
 
-                                            let price = mo.get("price")
-                                                .and_then(|v| v.as_str())
-                                                .and_then(|s| s.parse::<f64>().ok())
-                                                .unwrap_or(0.0);
-
-                                            if matched_amount <= 0.0 { continue; }
-
-                                            // P0.3: Dedupe — unique key per maker fill
-                                            let dedupe_key = format!("{}:{}:{:.4}:{:.2}",
-                                                trade_id, order_id, matched_amount, price);
-
-                                            if seen_fills.contains(&dedupe_key) {
-                                                continue; // already counted
-                                            }
-                                            seen_fills.insert(dedupe_key);
-
-                                            let fill = UserFillEvent {
-                                                order_id,
-                                                asset_id: asset_id.clone(),
-                                                side: "BUY".to_string(), // we only post buys
-                                                price,
-                                                size: matched_amount,
-                                                status: status.to_string(),
-                                                ts_ms: chrono::Utc::now().timestamp_millis(),
-                                            };
-                                            let _ = fill_tx.send(fill).await;
+                                    match order_type {
+                                        "PLACEMENT" => {
+                                            // Order placed — register with 0 matched
+                                            order_matched.insert(order_id.clone(), 0.0);
                                         }
-                                    } else {
-                                        // Fallback: use top-level fields if no maker_orders
-                                        let order_id = data.get("id")
-                                            .or_else(|| data.get("order_id"))
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("")
-                                            .to_string();
+                                        "UPDATE" => {
+                                            // Check for new fills via size_matched delta
+                                            let prev_matched = order_matched.get(&order_id).copied().unwrap_or(0.0);
+                                            let delta = size_matched - prev_matched;
 
+                                            if delta > 0.01 {
+                                                // New fill detected!
+                                                order_matched.insert(order_id.clone(), size_matched);
+
+                                                info!("user_ws: ORDER FILL: {} {:.1}sh @ {:.2} (delta={:.1}, total_matched={:.1})",
+                                                    if side == "BUY" { "BUY" } else { "SELL" },
+                                                    delta, price, delta, size_matched);
+
+                                                let fill = UserFillEvent {
+                                                    order_id,
+                                                    asset_id,
+                                                    side,
+                                                    price,
+                                                    size: delta, // only the NEW fill amount
+                                                    status: "ORDER_UPDATE".to_string(),
+                                                    ts_ms: chrono::Utc::now().timestamp_millis(),
+                                                };
+                                                let _ = fill_tx.send(fill).await;
+                                            } else {
+                                                // size_matched didn't increase — just a status update
+                                                order_matched.insert(order_id, size_matched);
+                                            }
+                                        }
+                                        "CANCELLATION" => {
+                                            // Order cancelled — remove from tracking
+                                            order_matched.remove(&order_id);
+                                        }
+                                        _ => {}
+                                    }
+                                }
+
+                                // ═══ SECONDARY: Trade events as audit trail ═══
+                                if event_type == "trade" {
+                                    let status = data.get("status")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("");
+
+                                    // Only log MATCHED trades for visibility
+                                    if status == "MATCHED" {
+                                        let asset_id = data.get("asset_id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+                                        let size = data.get("size")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                            .unwrap_or(0.0);
                                         let price = data.get("price")
                                             .and_then(|v| v.as_str())
                                             .and_then(|s| s.parse::<f64>().ok())
                                             .unwrap_or(0.0);
 
-                                        let size = data.get("size")
-                                            .or_else(|| data.get("size_matched"))
-                                            .and_then(|v| v.as_str())
-                                            .and_then(|s| s.parse::<f64>().ok())
-                                            .unwrap_or(0.0);
-
-                                        if size <= 0.0 { continue; }
-
-                                        // Dedupe
-                                        let dedupe_key = format!("{}:{}:{:.4}:{:.2}",
-                                            trade_id, order_id, size, price);
-                                        if seen_fills.contains(&dedupe_key) { continue; }
-                                        seen_fills.insert(dedupe_key);
-
-                                        let fill = UserFillEvent {
-                                            order_id,
-                                            asset_id,
-                                            side: "BUY".to_string(),
-                                            price,
-                                            size,
-                                            status: status.to_string(),
-                                            ts_ms: chrono::Utc::now().timestamp_millis(),
-                                        };
-                                        let _ = fill_tx.send(fill).await;
+                                        info!("user_ws: TRADE: {:.1}sh @ {:.2} [{}] asset={}...",
+                                            size, price, status,
+                                            &asset_id[..16.min(asset_id.len())]);
                                     }
                                 }
                             }
@@ -272,8 +287,8 @@ pub async fn run_user_ws_task(
         }
 
         writer.abort();
-        warn!("user_ws: disconnected ({} events, {} unique fills) — reconnecting",
-            events_received, seen_fills.len());
+        warn!("user_ws: disconnected ({} events, {} tracked orders) — reconnecting",
+            events_received, order_matched.len());
         tokio::time::sleep(Duration::from_millis(RECONNECT_DELAY_MS)).await;
     }
 }
