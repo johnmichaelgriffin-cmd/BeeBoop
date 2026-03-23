@@ -105,6 +105,19 @@ async fn main() -> Result<()> {
         log_tx.clone(),
     ));
 
+    // 4b. User WebSocket — authenticated feed for fill tracking
+    let (fill_tx, fill_rx) = mpsc::channel::<feeds::user_ws::UserFillEvent>(1_000);
+    if config.has_credentials() {
+        let api_key = config.poly_api_key.clone();
+        let api_secret = config.poly_api_secret.clone();
+        let api_passphrase = config.poly_api_passphrase.clone();
+        tokio::spawn(feeds::user_ws::run_user_ws_task(
+            api_key, api_secret, api_passphrase, fill_tx,
+        ));
+    } else {
+        info!("No credentials — user WS disabled (fills won't be tracked)");
+    }
+
     // 5. Signal engine (same as before — computes score from Binance/Chainlink/OBI)
     tokio::spawn(signals::signal_engine::run_signal_engine_task(
         config.clone(),
@@ -125,7 +138,7 @@ async fn main() -> Result<()> {
         log_tx.clone(),
     ));
 
-    // 7. Vidarx strategy — the new brain
+    // 7. Vidarx strategy — the new brain (with user WS fill tracking)
     tokio::spawn(run_vidarx_strategy(
         config.clone(),
         shared.clone(),
@@ -134,6 +147,7 @@ async fn main() -> Result<()> {
         signal_rx,
         exec_cmd_tx,
         exec_evt_rx,
+        fill_rx,
         log_tx.clone(),
     ));
 
@@ -160,6 +174,7 @@ async fn run_vidarx_strategy(
     mut signal_rx: mpsc::Receiver<Signal>,
     exec_cmd_tx: mpsc::Sender<ExecutionCommand>,
     mut exec_evt_rx: mpsc::Receiver<ExecutionEvent>,
+    mut fill_rx: mpsc::Receiver<feeds::user_ws::UserFillEvent>,
     log_tx: mpsc::Sender<LogEvent>,
 ) {
     info!("vidarx_strategy: started");
@@ -234,32 +249,53 @@ async fn run_vidarx_strategy(
                 last_signal = Some(signal);
             }
 
-            // Receive execution events (fills from our GTC bids)
-            Some(evt) = exec_evt_rx.recv() => {
-                match evt {
-                    ExecutionEvent::EntryFilled { side, filled_price, filled_size, .. } => {
-                        fills_this_window += 1;
-                        match side {
-                            Side::Up => {
-                                up_shares += filled_size;
-                                up_cost += filled_size * filled_price;
-                            }
-                            Side::Down => {
-                                dn_shares += filled_size;
-                                dn_cost += filled_size * filled_price;
-                            }
-                        }
-                        let matched = up_shares.min(dn_shares);
-                        let total_shares = up_shares + dn_shares;
-                        let up_pct = if total_shares > 0.0 { up_shares / total_shares * 100.0 } else { 0.0 };
-                        let side_label = if side == Side::Up { "UP" } else { "DN" };
+            // Receive execution events (from executor — mostly for cancel acks)
+            Some(_evt) = exec_evt_rx.recv() => {
+                // GTC postOnly bids don't emit EntryFilled from executor.
+                // Real fills come from the user WS channel below.
+            }
 
-                        info!(">>> FILL: {} {:.0}sh @ {:.0}c | totals: UP={:.0} DN={:.0} ({:.0}%UP) | matched={:.0} | fills={}",
-                            side_label, filled_size, filled_price * 100.0,
-                            up_shares, dn_shares, up_pct, matched, fills_this_window);
-                    }
-                    _ => {} // ignore other events
+            // Receive REAL fills from user WebSocket (authenticated trade events)
+            Some(fill) = fill_rx.recv() => {
+                let market = market_rx.borrow().clone();
+
+                // Determine which side this fill is for
+                let is_up = fill.asset_id == market.up_token_id;
+                let is_dn = fill.asset_id == market.down_token_id;
+
+                if !is_up && !is_dn {
+                    // Fill for a different market / old window — ignore
+                    continue;
                 }
+
+                // Only count BUY fills (we're buy-only)
+                if fill.side != "BUY" { continue; }
+
+                fills_this_window += 1;
+
+                if is_up {
+                    up_shares += fill.size;
+                    up_cost += fill.size * fill.price;
+                } else {
+                    dn_shares += fill.size;
+                    dn_cost += fill.size * fill.price;
+                }
+
+                let matched = up_shares.min(dn_shares);
+                let total_shares = up_shares + dn_shares;
+                let up_pct = if total_shares > 0.0 { up_shares / total_shares * 100.0 } else { 0.0 };
+                let side_label = if is_up { "UP" } else { "DN" };
+
+                // Compute live pair cost on matched shares
+                let pair_cost = if matched > 0.0 {
+                    let up_avg = up_cost / up_shares.max(0.001);
+                    let dn_avg = dn_cost / dn_shares.max(0.001);
+                    up_avg + dn_avg
+                } else { 0.0 };
+
+                info!(">>> FILL (user_ws): {} {:.1}sh @ {:.2} [{}] | UP={:.0} DN={:.0} ({:.0}%UP) matched={:.0} pcost={:.0}c | fills={}",
+                    side_label, fill.size, fill.price, fill.status,
+                    up_shares, dn_shares, up_pct, matched, pair_cost * 100.0, fills_this_window);
             }
 
             // Heartbeat

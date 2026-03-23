@@ -61,10 +61,11 @@ pub async fn run_market_ws_task(
         // Split read and write — critical for heartbeat not to starve
         let (mut write, mut read) = ws_stream.split();
 
-        // Send initial subscribe — NOT "operation":"subscribe", just "type":"market"
+        // Send initial subscribe with custom_feature_enabled for best_bid_ask events
         let sub_msg = json!({
             "assets_ids": [&up_token, &dn_token],
-            "type": "market"
+            "type": "market",
+            "custom_feature_enabled": true
         });
 
         if let Err(e) = write.send(Message::Text(sub_msg.to_string())).await {
@@ -120,78 +121,122 @@ pub async fn run_market_ws_task(
                             if let Ok(data) = serde_json::from_str::<Value>(&text) {
                                 events_received += 1;
 
-                                // Try multiple event formats:
-                                // 1. price_change: has "asset_id", "best_bid", "best_ask"
-                                // 2. book: has "market" (condition_id), "bids", "asks" arrays
-                                // 3. last_trade_price: has "asset_id", "price"
-
-                                let asset_id = data.get("asset_id")
+                                // Determine event type
+                                let event_type = data.get("event_type")
                                     .and_then(|v| v.as_str())
-                                    .map(|s| s.to_string());
+                                    .unwrap_or("");
 
-                                // price_change events
-                                if let Some(ref aid) = asset_id {
-                                    let best_ask_val = data.get("best_ask")
-                                        .and_then(|v| v.as_str())
-                                        .and_then(|s| s.parse::<f64>().ok());
-                                    let best_bid_val = data.get("best_bid")
-                                        .and_then(|v| v.as_str())
-                                        .and_then(|s| s.parse::<f64>().ok());
+                                let mut updated = false;
 
-                                    if aid == &up_token {
-                                        if let Some(a) = best_ask_val { up_ask = Some(a); }
-                                        if let Some(b) = best_bid_val { up_bid = Some(b); }
-                                    } else if aid == &dn_token {
-                                        if let Some(a) = best_ask_val { dn_ask = Some(a); }
-                                        if let Some(b) = best_bid_val { dn_bid = Some(b); }
-                                    }
+                                // ── FORMAT 1: price_change with nested price_changes[] array ──
+                                // Doc format: {"market":"...","price_changes":[{"asset_id":"...","price":"0.5","size":"200","side":"BUY","best_bid":"0.5","best_ask":"1"}],"timestamp":"...","event_type":"price_change"}
+                                if event_type == "price_change" || data.get("price_changes").is_some() {
+                                    if let Some(changes) = data.get("price_changes").and_then(|v| v.as_array()) {
+                                        for change in changes {
+                                            let aid = change.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                                            let best_ask_val = change.get("best_ask")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse::<f64>().ok());
+                                            let best_bid_val = change.get("best_bid")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse::<f64>().ok());
 
-                                    // last_trade_price events — use as fallback
-                                    if best_ask_val.is_none() && best_bid_val.is_none() {
-                                        if let Some(price) = data.get("price")
-                                            .and_then(|v| v.as_str())
-                                            .and_then(|s| s.parse::<f64>().ok())
-                                        {
-                                            if aid == &up_token && up_ask.is_none() {
-                                                up_ask = Some(price);
-                                            } else if aid == &dn_token && dn_ask.is_none() {
-                                                dn_ask = Some(price);
+                                            if aid == up_token {
+                                                if let Some(a) = best_ask_val { up_ask = Some(a); updated = true; }
+                                                if let Some(b) = best_bid_val { up_bid = Some(b); updated = true; }
+                                            } else if aid == dn_token {
+                                                if let Some(a) = best_ask_val { dn_ask = Some(a); updated = true; }
+                                                if let Some(b) = best_bid_val { dn_bid = Some(b); updated = true; }
                                             }
                                         }
                                     }
                                 }
 
-                                // book snapshot events — have "asks" and "bids" arrays
-                                if let (Some(asks), Some(bids)) = (
-                                    data.get("asks").and_then(|v| v.as_array()),
-                                    data.get("bids").and_then(|v| v.as_array()),
-                                ) {
-                                    // Get the asset_id from the book event
-                                    // Book events may use "asset_id" or we match by "market" condition_id
-                                    let book_asset = data.get("asset_id")
-                                        .and_then(|v| v.as_str())
-                                        .map(|s| s.to_string());
+                                // ── FORMAT 2: best_bid_ask event (requires custom_feature_enabled) ──
+                                if event_type == "best_bid_ask" {
+                                    if let Some(changes) = data.get("changes").and_then(|v| v.as_array()) {
+                                        for change in changes {
+                                            let aid = change.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                                            let best_ask_val = change.get("best_ask")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse::<f64>().ok());
+                                            let best_bid_val = change.get("best_bid")
+                                                .and_then(|v| v.as_str())
+                                                .and_then(|s| s.parse::<f64>().ok());
 
-                                    let best_ask = asks.iter()
-                                        .filter_map(|a| a.get("price")?.as_str()?.parse::<f64>().ok())
-                                        .reduce(f64::min);
-                                    let best_bid = bids.iter()
-                                        .filter_map(|b| b.get("price")?.as_str()?.parse::<f64>().ok())
-                                        .reduce(f64::max);
-
-                                    if let Some(ref baid) = book_asset {
-                                        if baid == &up_token {
-                                            if let Some(a) = best_ask { up_ask = Some(a); }
-                                            if let Some(b) = best_bid { up_bid = Some(b); }
-                                        } else if baid == &dn_token {
-                                            if let Some(a) = best_ask { dn_ask = Some(a); }
-                                            if let Some(b) = best_bid { dn_bid = Some(b); }
+                                            if aid == up_token {
+                                                if let Some(a) = best_ask_val { up_ask = Some(a); updated = true; }
+                                                if let Some(b) = best_bid_val { up_bid = Some(b); updated = true; }
+                                            } else if aid == dn_token {
+                                                if let Some(a) = best_ask_val { dn_ask = Some(a); updated = true; }
+                                                if let Some(b) = best_bid_val { dn_bid = Some(b); updated = true; }
+                                            }
                                         }
                                     }
                                 }
 
-                                // Update shared state on any price change
-                                if up_ask.is_some() || dn_ask.is_some() {
+                                // ── FORMAT 3: top-level asset_id (older/fallback format) ──
+                                if !updated {
+                                    if let Some(aid) = data.get("asset_id").and_then(|v| v.as_str()) {
+                                        let best_ask_val = data.get("best_ask")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<f64>().ok());
+                                        let best_bid_val = data.get("best_bid")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<f64>().ok());
+
+                                        if aid == up_token {
+                                            if let Some(a) = best_ask_val { up_ask = Some(a); updated = true; }
+                                            if let Some(b) = best_bid_val { up_bid = Some(b); updated = true; }
+                                        } else if aid == dn_token {
+                                            if let Some(a) = best_ask_val { dn_ask = Some(a); updated = true; }
+                                            if let Some(b) = best_bid_val { dn_bid = Some(b); updated = true; }
+                                        }
+                                    }
+                                }
+
+                                // ── FORMAT 4: book snapshot — "asks" and "bids" arrays ──
+                                if !updated {
+                                    if let (Some(asks), Some(bids)) = (
+                                        data.get("asks").and_then(|v| v.as_array()),
+                                        data.get("bids").and_then(|v| v.as_array()),
+                                    ) {
+                                        let book_asset = data.get("asset_id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("");
+
+                                        let best_ask = asks.iter()
+                                            .filter_map(|a| a.get("price")?.as_str()?.parse::<f64>().ok())
+                                            .reduce(f64::min);
+                                        let best_bid = bids.iter()
+                                            .filter_map(|b| b.get("price")?.as_str()?.parse::<f64>().ok())
+                                            .reduce(f64::max);
+
+                                        if book_asset == up_token {
+                                            if let Some(a) = best_ask { up_ask = Some(a); updated = true; }
+                                            if let Some(b) = best_bid { up_bid = Some(b); updated = true; }
+                                        } else if book_asset == dn_token {
+                                            if let Some(a) = best_ask { dn_ask = Some(a); updated = true; }
+                                            if let Some(b) = best_bid { dn_bid = Some(b); updated = true; }
+                                        }
+                                    }
+                                }
+
+                                // ── FORMAT 5: last_trade_price fallback ──
+                                if !updated {
+                                    if let Some(aid) = data.get("asset_id").and_then(|v| v.as_str()) {
+                                        if let Some(price) = data.get("price")
+                                            .and_then(|v| v.as_str())
+                                            .and_then(|s| s.parse::<f64>().ok())
+                                        {
+                                            if aid == up_token && up_ask.is_none() { up_ask = Some(price); updated = true; }
+                                            else if aid == dn_token && dn_ask.is_none() { dn_ask = Some(price); updated = true; }
+                                        }
+                                    }
+                                }
+
+                                // Update shared state if anything changed
+                                if updated {
                                     let top = PolymarketTop {
                                         recv_ts_ms: chrono::Utc::now().timestamp_millis(),
                                         up_ask,
