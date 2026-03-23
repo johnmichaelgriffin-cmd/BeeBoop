@@ -90,6 +90,10 @@ path = "src/main_sol.rs"
 name = "beeboop-btc-mint"
 path = "src/main_btc_mint.rs"
 
+[[bin]]
+name = "beeboop-v3"
+path = "src/main_vidarx.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

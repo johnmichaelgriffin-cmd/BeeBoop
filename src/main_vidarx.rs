@@ -1,0 +1,432 @@
+//! BeeBoop Vidarx — Buy-only, maker-only, pair-cost-minimizing accumulator.
+//!
+//! Strategy: post GTC postOnly bids on BOTH sides, skewed by signal.
+//! ~55% cheap / 45% expensive target fill ratio.
+//! Hold everything to resolution. Never sell intrawindow.
+//!
+//! Usage: beeboop-vidarx live
+
+mod config_v2;
+mod types_v2;
+mod state;
+mod feeds;
+mod signals;
+mod execution_v2;
+mod strategy_v2;
+mod market;
+mod portfolio;
+mod risk;
+mod logging;
+
+use anyhow::Result;
+use tracing::{info, warn, error};
+use tokio::sync::{broadcast, mpsc, watch};
+
+use config_v2::Config;
+use state::SharedState;
+use types_v2::*;
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Install crypto provider for TLS
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("crypto provider");
+
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_timer(tracing_subscriber::fmt::time::UtcTime::rfc_3339())
+        .init();
+
+    let mode = std::env::args().nth(1).unwrap_or("dryrun".into());
+    let mut config = Config::default();
+    config.market = "btc".to_string();
+
+    // Vidarx-specific config overrides
+    config.start_delay_s = 5;           // start quoting at T+5s
+    config.cancel_at_s = 240;           // stop quoting at T+240s
+    config.cooldown_ms = 500;           // fast cooldown between quote refreshes
+    config.max_pairs_per_window = 999;  // no limit — accumulate as much as possible
+    config.share_base = 20.0;           // ladder sizing base
+
+    if mode == "live" {
+        config.mode = BotMode::Live;
+        dotenvy::dotenv().ok();
+        config.load_credentials();
+    }
+
+    info!("=== BEEBOOP VIDARX — BUY-ONLY MAKER BTC 5M ===");
+    info!("Mode: {:?}", config.mode);
+    info!("Strategy: postOnly GTC bids on BOTH sides, signal-skewed");
+    info!("Target mix: 55% cheap / 45% expensive");
+    info!("Ladder: cheap 20/15/10sh, exp 15/12/8sh (3 levels each)");
+    info!("Timing: T+5s start, T+180s reduce, T+240s stop");
+    info!("No selling. Hold to resolution.");
+
+    let shared = SharedState::new();
+
+    // Channels
+    let (binance_tx, _) = broadcast::channel::<BinanceTick>(10_000);
+    let (polymarket_tx, _) = broadcast::channel::<PolymarketTop>(10_000);
+    let (chainlink_tx, _) = broadcast::channel::<ChainlinkTick>(10_000);
+    let (market_watch_tx, market_watch_rx) = watch::channel::<MarketDescriptor>(MarketDescriptor::default());
+    let (pm_top_watch_tx, pm_top_watch_rx) = watch::channel::<PolymarketTop>(PolymarketTop::default());
+    let (chainlink_watch_tx, chainlink_watch_rx) = watch::channel::<Option<ChainlinkTick>>(None);
+    let (signal_tx, signal_rx) = mpsc::channel::<Signal>(1_000);
+    let (exec_cmd_tx, exec_cmd_rx) = mpsc::channel::<ExecutionCommand>(1_000);
+    let (exec_evt_tx, exec_evt_rx) = mpsc::channel::<ExecutionEvent>(1_000);
+    let (log_tx, log_rx) = mpsc::channel::<LogEvent>(10_000);
+
+    // 1. Market discovery
+    tokio::spawn(market::discovery::run_market_discovery_task(
+        config.clone(),
+        market_watch_tx,
+        log_tx.clone(),
+    ));
+
+    // 2. Binance feed
+    tokio::spawn(feeds::binance::run_binance_feed_task(
+        binance_tx.clone(),
+        log_tx.clone(),
+    ));
+
+    // 3. Polymarket WebSocket — ride or die, no REST fallback
+    tokio::spawn(feeds::market_ws::run_market_ws_task(
+        market_watch_rx.clone(),
+        polymarket_tx,
+        pm_top_watch_tx.clone(),
+        log_tx.clone(),
+    ));
+
+    // 4. RTDS / Chainlink
+    tokio::spawn(feeds::rtds::run_rtds_task(
+        chainlink_tx,
+        chainlink_watch_tx,
+        log_tx.clone(),
+    ));
+
+    // 5. Signal engine (same as before — computes score from Binance/Chainlink/OBI)
+    tokio::spawn(signals::signal_engine::run_signal_engine_task(
+        config.clone(),
+        shared.clone(),
+        binance_tx.subscribe(),
+        market_watch_rx.clone(),
+        pm_top_watch_rx.clone(),
+        chainlink_watch_rx,
+        signal_tx,
+        log_tx.clone(),
+    ));
+
+    // 6. Executor — handles GTC postOnly bids + cancel_all
+    tokio::spawn(execution_v2::executor::run_executor_task(
+        config.clone(),
+        exec_cmd_rx,
+        exec_evt_tx,
+        log_tx.clone(),
+    ));
+
+    // 7. Vidarx strategy — the new brain
+    tokio::spawn(run_vidarx_strategy(
+        config.clone(),
+        shared.clone(),
+        market_watch_rx.clone(),
+        pm_top_watch_rx,
+        signal_rx,
+        exec_cmd_tx,
+        exec_evt_rx,
+        log_tx.clone(),
+    ));
+
+    // 8. Logger
+    tokio::spawn(logging::trade_log::run_trade_log_task(
+        config.clone(),
+        log_rx,
+    ));
+
+    tokio::signal::ctrl_c().await?;
+    info!("Shutting down...");
+    Ok(())
+}
+
+/// Vidarx Strategy — buy-only maker accumulator
+///
+/// Posts GTC postOnly bids on both sides, skewed by signal.
+/// Tracks inventory, manages quote lifecycle, holds to resolution.
+async fn run_vidarx_strategy(
+    config: Config,
+    shared: SharedState,
+    market_rx: watch::Receiver<MarketDescriptor>,
+    pm_top_rx: watch::Receiver<PolymarketTop>,
+    mut signal_rx: mpsc::Receiver<Signal>,
+    exec_cmd_tx: mpsc::Sender<ExecutionCommand>,
+    mut exec_evt_rx: mpsc::Receiver<ExecutionEvent>,
+    log_tx: mpsc::Sender<LogEvent>,
+) {
+    info!("vidarx_strategy: started");
+
+    // Per-window tracking
+    let mut last_window_ts: i64 = 0;
+    let mut up_shares: f64 = 0.0;
+    let mut dn_shares: f64 = 0.0;
+    let mut up_cost: f64 = 0.0;
+    let mut dn_cost: f64 = 0.0;
+    let mut quotes_posted: u32 = 0;
+    let mut fills_this_window: u32 = 0;
+    let mut last_quote_ts: i64 = 0;
+    let mut last_signal: Option<Signal> = None;
+    let mut window_active = false;
+
+    // Quote refresh interval — every 2 seconds
+    let quote_refresh_ms: i64 = 2000;
+    // Ladder sizes
+    let cheap_ladder = [20.0_f64, 15.0, 10.0]; // L1, L2, L3
+    let exp_ladder = [15.0_f64, 12.0, 8.0];
+
+    let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
+
+    loop {
+        // Window change detection
+        {
+            let market = market_rx.borrow().clone();
+            if market.window_start_ts > 0 && market.window_start_ts != last_window_ts {
+                // New window — log previous window results if any
+                if last_window_ts > 0 && (up_shares > 0.0 || dn_shares > 0.0) {
+                    let matched = up_shares.min(dn_shares);
+                    let pair_cost = if matched > 0.0 {
+                        let up_avg = if up_shares > 0.0 { up_cost / up_shares } else { 0.0 };
+                        let dn_avg = if dn_shares > 0.0 { dn_cost / dn_shares } else { 0.0 };
+                        up_avg + dn_avg
+                    } else { 0.0 };
+                    let cheap_ratio = if up_shares + dn_shares > 0.0 {
+                        up_shares.min(dn_shares) / (up_shares + dn_shares) * 2.0 // approximate
+                    } else { 0.0 };
+
+                    info!(">>> WINDOW COMPLETE: UP {:.0}sh (${:.2}) DN {:.0}sh (${:.2}) | matched={:.0} pair_cost={:.2}c | fills={} quotes={}",
+                        up_shares, up_cost, dn_shares, dn_cost,
+                        matched, pair_cost * 100.0,
+                        fills_this_window, quotes_posted);
+                }
+
+                // Reset for new window
+                up_shares = 0.0;
+                dn_shares = 0.0;
+                up_cost = 0.0;
+                dn_cost = 0.0;
+                quotes_posted = 0;
+                fills_this_window = 0;
+                last_quote_ts = 0;
+                last_signal = None;
+                window_active = false;
+                last_window_ts = market.window_start_ts;
+
+                // Cancel any leftover orders from previous window
+                let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                    reason: "new_window".into(),
+                }).await;
+
+                info!(">>> NEW WINDOW {} — ready to accumulate", market.window_start_ts);
+            }
+        }
+
+        tokio::select! {
+            // Receive signals — just save the latest, don't act immediately
+            Some(signal) = signal_rx.recv() => {
+                last_signal = Some(signal);
+            }
+
+            // Receive execution events (fills from our GTC bids)
+            Some(evt) = exec_evt_rx.recv() => {
+                match evt {
+                    ExecutionEvent::EntryFilled { side, filled_price, filled_size, .. } => {
+                        fills_this_window += 1;
+                        match side {
+                            Side::Up => {
+                                up_shares += filled_size;
+                                up_cost += filled_size * filled_price;
+                            }
+                            Side::Down => {
+                                dn_shares += filled_size;
+                                dn_cost += filled_size * filled_price;
+                            }
+                        }
+                        let matched = up_shares.min(dn_shares);
+                        let total_shares = up_shares + dn_shares;
+                        let up_pct = if total_shares > 0.0 { up_shares / total_shares * 100.0 } else { 0.0 };
+                        let side_label = if side == Side::Up { "UP" } else { "DN" };
+
+                        info!(">>> FILL: {} {:.0}sh @ {:.0}c | totals: UP={:.0} DN={:.0} ({:.0}%UP) | matched={:.0} | fills={}",
+                            side_label, filled_size, filled_price * 100.0,
+                            up_shares, dn_shares, up_pct, matched, fills_this_window);
+                    }
+                    _ => {} // ignore other events
+                }
+            }
+
+            // Heartbeat
+            _ = heartbeat_interval.tick() => {
+                let market = market_rx.borrow().clone();
+                let top = pm_top_rx.borrow().clone();
+                let matched = up_shares.min(dn_shares);
+                let pair_cost = if matched > 0.0 {
+                    let up_avg = up_cost / up_shares.max(0.001);
+                    let dn_avg = dn_cost / dn_shares.max(0.001);
+                    up_avg + dn_avg
+                } else { 0.0 };
+
+                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh matched={:.0} pcost={:.0}c | fills={} quotes={} | signal={} | window_active={}",
+                    top.up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
+                    top.down_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
+                    up_shares, dn_shares, matched, pair_cost * 100.0,
+                    fills_this_window, quotes_posted,
+                    last_signal.as_ref().map_or("none".into(), |s| format!("{:.2}", s.score)),
+                    window_active,
+                );
+            }
+
+            // Quote refresh — every 2 seconds, post new bid ladders
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let market = market_rx.borrow().clone();
+
+                if market.up_token_id.is_empty() { continue; }
+
+                // Window timing
+                let elapsed_s = (now_ms / 1000) - market.window_start_ts;
+
+                // Not yet time to start
+                if elapsed_s < config.start_delay_s as i64 {
+                    continue;
+                }
+
+                // Past cutoff — cancel and stop
+                if elapsed_s >= config.cancel_at_s as i64 {
+                    if window_active {
+                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                            reason: "window_cutoff".into(),
+                        }).await;
+                        window_active = false;
+                        info!(">>> T+{}s — STOPPED QUOTING, holding to resolution", elapsed_s);
+                    }
+                    continue;
+                }
+
+                window_active = true;
+
+                // Only refresh quotes every 2 seconds
+                if now_ms - last_quote_ts < quote_refresh_ms {
+                    continue;
+                }
+                last_quote_ts = now_ms;
+
+                // Get current book
+                let top = pm_top_rx.borrow().clone();
+                let (up_bid, up_ask) = match (top.up_bid, top.up_ask) {
+                    (Some(b), Some(a)) => (b, a),
+                    _ => continue, // no prices yet
+                };
+                let (dn_bid, dn_ask) = match (top.down_bid, top.down_ask) {
+                    (Some(b), Some(a)) => (b, a),
+                    _ => continue,
+                };
+
+                // Determine cheap vs expensive
+                let (cheap_side, exp_side) = if up_ask < dn_ask {
+                    (Side::Up, Side::Down)
+                } else {
+                    (Side::Down, Side::Up)
+                };
+
+                // Signal skew — mild adjustment to bid aggressiveness
+                let score = last_signal.as_ref().map_or(0.0, |s| s.score);
+                let skew = (score * 0.25).clamp(-0.5, 0.5);
+
+                // Inventory ratio check — are we too heavy on one side?
+                let total_shares = up_shares + dn_shares;
+                let cheap_shares = if cheap_side == Side::Up { up_shares } else { dn_shares };
+                let cheap_ratio = if total_shares > 0.0 { cheap_shares / total_shares } else { 0.55 };
+
+                // Inventory correction: if cheap ratio outside 0.45-0.65, adjust ladder sizes
+                let mut cheap_size_mult = 1.0_f64;
+                let mut exp_size_mult = 1.0_f64;
+                if cheap_ratio > 0.60 {
+                    cheap_size_mult = 0.7; // reduce cheap
+                    exp_size_mult = 1.2;   // boost exp
+                } else if cheap_ratio < 0.50 {
+                    cheap_size_mult = 1.2; // boost cheap
+                    exp_size_mult = 0.7;   // reduce exp
+                }
+
+                // Late window — reduce aggressiveness
+                let late_mult = if elapsed_s >= 180 { 0.5 } else { 1.0 };
+
+                // Cancel existing orders before posting new ones
+                let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                    reason: "quote_refresh".into(),
+                }).await;
+
+                // Small delay to let cancels process
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // Build bid ladders for BOTH sides
+                // Cheap side ladder
+                let cheap_token = if cheap_side == Side::Up { &market.up_token_id } else { &market.down_token_id };
+                let cheap_bid = if cheap_side == Side::Up { up_bid } else { dn_bid };
+                let cheap_ask_price = if cheap_side == Side::Up { up_ask } else { dn_ask };
+
+                for (level, &base_size) in cheap_ladder.iter().enumerate() {
+                    let size = (base_size * cheap_size_mult * late_mult * (1.0 + skew.abs() * 0.3)).round().max(1.0);
+                    let price = match level {
+                        0 => (cheap_bid + 0.01).min(cheap_ask_price - 0.01), // L1: bid+1tick, below ask
+                        1 => cheap_bid,                                       // L2: at best bid
+                        _ => (cheap_bid - 0.01).max(0.01),                   // L3: bid-1tick
+                    };
+
+                    if price <= 0.01 || price >= cheap_ask_price { continue; } // would cross or invalid
+
+                    let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                        market_slug: market.slug.clone(),
+                        token_id: cheap_token.clone(),
+                        side: cheap_side,
+                        price,
+                        size,
+                        post_only: true,
+                    }).await;
+                    quotes_posted += 1;
+                }
+
+                // Expensive side ladder
+                let exp_token = if exp_side == Side::Up { &market.up_token_id } else { &market.down_token_id };
+                let exp_bid = if exp_side == Side::Up { up_bid } else { dn_bid };
+                let exp_ask_price = if exp_side == Side::Up { up_ask } else { dn_ask };
+
+                // Apply signal skew to expensive side
+                let exp_skew = if (exp_side == Side::Up && score > 0.0) || (exp_side == Side::Down && score < 0.0) {
+                    0.01 // tighten bid by 1c when signal favors this side
+                } else {
+                    0.0
+                };
+
+                for (level, &base_size) in exp_ladder.iter().enumerate() {
+                    let size = (base_size * exp_size_mult * late_mult).round().max(1.0);
+                    let price = match level {
+                        0 => (exp_bid + 0.01 + exp_skew).min(exp_ask_price - 0.01),
+                        1 => exp_bid + exp_skew,
+                        _ => (exp_bid - 0.01 + exp_skew).max(0.01),
+                    };
+
+                    if price <= 0.01 || price >= exp_ask_price { continue; }
+
+                    let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                        market_slug: market.slug.clone(),
+                        token_id: exp_token.clone(),
+                        side: exp_side,
+                        price,
+                        size,
+                        post_only: true,
+                    }).await;
+                    quotes_posted += 1;
+                }
+            }
+        }
+    }
+}

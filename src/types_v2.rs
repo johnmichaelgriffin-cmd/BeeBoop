@@ -169,6 +169,15 @@ pub enum ExecutionCommand {
     CancelAll {
         reason: String,
     },
+    /// Vidarx: post a GTC postOnly BUY bid at a specific price/size
+    PostMakerBid {
+        market_slug: String,
+        token_id: String,
+        side: Side,
+        price: f64,
+        size: f64,
+        post_only: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -219,6 +219,41 @@ pub async fn run_executor_task(
                 }
             }
 
+            ExecutionCommand::PostMakerBid { market_slug, token_id, side, price, size, post_only } => {
+                let sent_ts_ms = chrono::Utc::now().timestamp_millis();
+                let start = Instant::now();
+
+                let result = if let Some((ref cli, ref signer)) = client {
+                    execute_gtc_bid(cli, signer, &token_id, size, price, post_only).await
+                } else {
+                    // Dry run
+                    Ok(FillResult {
+                        order_id: format!("dry-maker-{}", sent_ts_ms),
+                        filled_price: price,
+                        filled_size: 0.0, // GTC doesn't fill immediately
+                        latency_ms: 0,
+                    })
+                };
+
+                let latency_ms = start.elapsed().as_millis() as i64;
+
+                match result {
+                    Ok(fill) => {
+                        // GTC posted — it won't fill immediately, it rests on the book
+                        // Fills come later via user WS or when someone hits our bid
+                        // For now, we treat the post as success and wait for fills
+                    }
+                    Err(e) => {
+                        if !e.contains("would cross") && !e.contains("post-only") {
+                            warn!("MAKER BID FAILED: {} @ {:.2} {:.0}sh — {}",
+                                if side == Side::Up { "UP" } else { "DN" },
+                                price, size, e);
+                        }
+                        // post-only rejections are expected and normal — just means price crossed
+                    }
+                }
+            }
+
             ExecutionCommand::CancelAll { reason } => {
                 if let Some((ref cli, _)) = client {
                     match cli.cancel_all_orders().await {
@@ -424,5 +459,60 @@ impl ExecutorHandle {
             fill.latency_ms = latency;
         }
         result
+    }
+}
+
+/// Post a GTC postOnly BUY bid — rests on the book, earns maker rebates.
+/// Returns immediately — the order ID is for later tracking/cancellation.
+async fn execute_gtc_bid(
+    client: &AuthedClient,
+    signer: &PrivateKeySigner,
+    token_id: &str,
+    size: f64,
+    price: f64,
+    post_only: bool,
+) -> Result<FillResult, String> {
+    use polymarket_client_sdk::clob::types::{OrderType, Side};
+
+    let token_u256 = U256::from_str(token_id).map_err(|e| format!("token: {}", e))?;
+
+    let size_rounded = (size * 100.0).floor() / 100.0;
+    if size_rounded <= 0.0 {
+        return Err("size rounds to 0".to_string());
+    }
+
+    let size_dec = Decimal::from_str(&format!("{:.2}", size_rounded))
+        .map_err(|e| format!("dec: {}", e))?;
+    let price_dec = Decimal::from_str(&format!("{:.2}", price))
+        .map_err(|e| format!("dec: {}", e))?;
+
+    let mut builder = client.limit_order()
+        .token_id(token_u256)
+        .size(size_dec)
+        .price(price_dec)
+        .side(Side::Buy)
+        .order_type(OrderType::GTC);
+
+    if post_only {
+        builder = builder.post_only(true);
+    }
+
+    let order = builder.build().await
+        .map_err(|e| format!("build: {}", e))?;
+
+    let signed = client.sign(signer, order).await
+        .map_err(|e| format!("sign: {}", e))?;
+    let resp = client.post_order(signed).await
+        .map_err(|e| format!("post: {}", e))?;
+
+    if resp.success {
+        Ok(FillResult {
+            order_id: resp.order_id,
+            filled_price: price,
+            filled_size: 0.0, // GTC doesn't fill immediately
+            latency_ms: 0,
+        })
+    } else {
+        Err(format!("rejected: {:?} {:?}", resp.status, resp.error_msg))
     }
 }
