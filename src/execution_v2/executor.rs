@@ -570,49 +570,47 @@ async fn post_heartbeat(client: &AuthedClient, prev_id: Option<&str>) -> Result<
 /// Reconcile local fill state against CLOB via REST.
 /// Fetches open orders and recent trades to verify local state.
 async fn reconcile_fills(
-    _client: &AuthedClient,
+    client: &AuthedClient,
     up_token_id: &str,
     down_token_id: &str,
-    wallet_address: &str,
+    _wallet_address: &str,
 ) -> Result<crate::types_v2::ReconciliationResult, String> {
-    // Use REST directly — simpler than fighting SDK type mismatches
-    let http = reqwest::Client::new();
+    use polymarket_client_sdk::clob::types::request::OrdersRequest;
 
-    let mut up_total = 0.0_f64;
-    let mut dn_total = 0.0_f64;
-    let open_count = 0_usize;
+    let mut open_count = 0_usize;
+    let mut up_matched = 0.0_f64;
+    let mut dn_matched = 0.0_f64;
 
-    // Fetch trades for each token from the public data API
-    for (token_id, total) in [
-        (up_token_id, &mut up_total),
-        (down_token_id, &mut dn_total),
-    ] {
-        let url = format!("https://data-api.polymarket.com/trades?asset_id={}&limit=100", token_id);
-        if let Ok(resp) = http.get(&url).send().await {
-            if let Ok(trades) = resp.json::<Vec<serde_json::Value>>().await {
-                for trade in &trades {
-                    if let Some(size) = trade.get("size")
-                        .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<f64>().ok())
-                    {
-                        // #5: Only count trades where we are the maker
-                        let maker = trade.get("maker_address")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_lowercase();
-                        if wallet_address.is_empty() || maker.contains(wallet_address) {
-                            *total += size;
-                        }
-                    }
+    // Parse token IDs to U256 for comparison
+    let up_u256 = U256::from_str(up_token_id).ok();
+    let dn_u256 = U256::from_str(down_token_id).ok();
+
+    // Fetch our authenticated open orders with size_matched
+    let request = OrdersRequest::default();
+    match client.orders(&request, None).await {
+        Ok(page) => {
+            for order in &page.data {
+                open_count += 1;
+                // size_matched is Decimal — convert to f64
+                let matched: f64 = order.size_matched.to_string()
+                    .parse().unwrap_or(0.0);
+
+                if Some(order.asset_id) == up_u256 {
+                    up_matched += matched;
+                } else if Some(order.asset_id) == dn_u256 {
+                    dn_matched += matched;
                 }
             }
+        }
+        Err(e) => {
+            warn!("reconcile: orders() failed: {} — skipping", e);
         }
     }
 
     Ok(crate::types_v2::ReconciliationResult {
         open_order_count: open_count,
-        up_size_matched: up_total,
-        down_size_matched: dn_total,
+        up_size_matched: up_matched,
+        down_size_matched: dn_matched,
         ts_ms: chrono::Utc::now().timestamp_millis(),
     })
 }
