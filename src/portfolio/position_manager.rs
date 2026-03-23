@@ -220,11 +220,12 @@ pub async fn run_position_manager_task(
                         }
                     }
 
-                    // Legacy events — ignore
+                    // Events handled elsewhere or not relevant here
                     ExecutionEvent::ExitFilled { .. } => {}
                     ExecutionEvent::ExitRejected { .. } => {}
                     ExecutionEvent::CancelAck { .. } => {}
-                    ExecutionEvent::ReconcileResult(_) => {} // handled in vidarx strategy
+                    ExecutionEvent::ReconcileResult(_) => {}
+                    ExecutionEvent::MakerOrderPosted { .. } => {} // handled in vidarx strategy
                 }
             }
 

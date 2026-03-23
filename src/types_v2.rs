@@ -180,6 +180,8 @@ pub enum ExecutionCommand {
         price: f64,
         size: f64,
         post_only: bool,
+        ladder_key: String,
+        was_cheap: bool,
     },
     /// Reconcile: fetch open orders to verify local state
     Reconcile {
@@ -248,6 +250,16 @@ pub enum ExecutionEvent {
     CancelAck {
         ts_ms: i64,
         count: usize,
+    },
+    /// Maker order successfully posted (GTC postOnly bid resting on book)
+    MakerOrderPosted {
+        order_id: String,
+        token_id: String,
+        side: Side,
+        price: f64,
+        size: f64,
+        ladder_key: String,
+        was_cheap: bool,
     },
     ReconcileResult(ReconciliationResult),
 }

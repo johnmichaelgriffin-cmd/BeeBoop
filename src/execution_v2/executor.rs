@@ -241,18 +241,17 @@ pub async fn run_executor_task(
                 }
             }
 
-            ExecutionCommand::PostMakerBid { market_slug, token_id, side, price, size, post_only } => {
+            ExecutionCommand::PostMakerBid { market_slug: _, token_id, side, price, size, post_only, ladder_key, was_cheap } => {
                 let sent_ts_ms = chrono::Utc::now().timestamp_millis();
                 let start = Instant::now();
 
                 let result = if let Some((ref cli, ref signer)) = client {
                     execute_gtc_bid(cli, signer, &token_id, size, price, post_only).await
                 } else {
-                    // Dry run
                     Ok(FillResult {
                         order_id: format!("dry-maker-{}", sent_ts_ms),
                         filled_price: price,
-                        filled_size: 0.0, // GTC doesn't fill immediately
+                        filled_size: 0.0,
                         latency_ms: 0,
                     })
                 };
@@ -261,9 +260,16 @@ pub async fn run_executor_task(
 
                 match result {
                     Ok(fill) => {
-                        // GTC posted — it won't fill immediately, it rests on the book
-                        // Fills come later via user WS or when someone hits our bid
-                        // For now, we treat the post as success and wait for fills
+                        // Emit MakerOrderPosted so strategy can track live orders + metadata
+                        let _ = evt_tx.send(ExecutionEvent::MakerOrderPosted {
+                            order_id: fill.order_id,
+                            token_id: token_id.clone(),
+                            side,
+                            price,
+                            size,
+                            ladder_key,
+                            was_cheap,
+                        }).await;
                     }
                     Err(e) => {
                         if !e.contains("would cross") && !e.contains("post-only") {

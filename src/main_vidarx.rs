@@ -306,9 +306,22 @@ async fn run_vidarx_strategy(
                 last_signal = Some(signal);
             }
 
-            // Receive execution events (cancel acks, reconciliation results)
+            // Receive execution events (order posted acks, cancel acks, reconciliation)
             Some(evt) = exec_evt_rx.recv() => {
                 match evt {
+                    // Maker order successfully posted — track it
+                    ExecutionEvent::MakerOrderPosted { order_id, token_id, side, price, size, ladder_key, was_cheap } => {
+                        // Populate live_orders for selective refresh
+                        live_orders.insert(ladder_key.clone(), (order_id.clone(), price, size));
+                        // Populate order_meta for fill attribution
+                        order_meta.insert(order_id, PostedOrderMeta {
+                            _asset_id: token_id,
+                            was_cheap_at_post: was_cheap,
+                            _ladder_level: ladder_key.split(':').last()
+                                .and_then(|s| s.parse().ok()).unwrap_or(0),
+                            posted_price: price,
+                        });
+                    }
                     ExecutionEvent::ReconcileResult(recon) => {
                         info!("RECONCILE: open_orders={} CLOB_fills: UP={:.1} DN={:.1} | local: UP={:.1} DN={:.1} | drift: UP={:.1} DN={:.1}",
                             recon.open_order_count,
@@ -316,12 +329,11 @@ async fn run_vidarx_strategy(
                             up_shares, dn_shares,
                             recon.up_size_matched - up_shares, recon.down_size_matched - dn_shares,
                         );
-                        // If CLOB shows more fills than local, we missed user WS events — log warning
                         if recon.up_size_matched > up_shares + 1.0 || recon.down_size_matched > dn_shares + 1.0 {
                             warn!("RECONCILE DRIFT DETECTED — CLOB has more fills than local state");
                         }
                     }
-                    _ => {} // ignore other events (cancel acks etc)
+                    _ => {}
                 }
             }
 
@@ -593,52 +605,21 @@ async fn run_vidarx_strategy(
                     desired_quotes.insert(key, (price, size, exp_token.clone(), exp_side));
                 }
 
-                // #2: Selective refresh — compare desired vs live orders
-                // Cancel orders whose price changed, keep those that didn't
-                let mut keys_to_cancel: Vec<String> = Vec::new();
-                for (key, (live_id, live_price, _live_size)) in &live_orders {
-                    if let Some((desired_price, _desired_size, _, _)) = desired_quotes.get(key) {
-                        // Price changed by more than half a tick — cancel and replace
-                        let tick = if key.starts_with("cheap") { cheap_tick } else { exp_tick };
-                        if (*desired_price - *live_price).abs() > tick * 0.5 {
-                            keys_to_cancel.push(key.clone());
-                        }
-                        // Same price — keep it, preserve queue position
-                    } else {
-                        // Desired no longer wants this level — cancel it
-                        keys_to_cancel.push(key.clone());
-                    }
+                // Cancel ALL existing orders before reposting fresh ladder.
+                // This prevents duplicate ladder accumulation.
+                // Queue priority is sacrificed but safety is guaranteed.
+                if !live_orders.is_empty() {
+                    let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                        reason: "refresh_cycle".into(),
+                    }).await;
+                    live_orders.clear();
+                    order_meta.clear();
+                    // Brief pause for cancels to process
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
 
-                // Cancel stale orders
-                for key in &keys_to_cancel {
-                    if let Some((order_id, _, _)) = live_orders.remove(key) {
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: format!("selective:{}", key),
-                        }).await;
-                        // Note: CancelAll cancels everything — for true selective cancel
-                        // we'd need a CancelOrder(order_id) command. For now, cancel all
-                        // and repost all desired quotes below.
-                    }
-                }
-
-                // If any cancels happened, we need to repost everything
-                // (because CancelAll nukes all orders, not just the one we wanted)
-                let needs_full_repost = !keys_to_cancel.is_empty();
-
-                // Post new/changed quotes
+                // Post fresh ladder — all desired quotes
                 for (key, (price, size, token_id, side)) in &desired_quotes {
-                    // Skip if this order is still live at the right price
-                    if !needs_full_repost {
-                        if let Some((_live_id, live_price, _)) = live_orders.get(key) {
-                            let tick = if key.starts_with("cheap") { cheap_tick } else { exp_tick };
-                            if (price - live_price).abs() <= tick * 0.5 {
-                                continue; // still good — keep it
-                            }
-                        }
-                    }
-
-                    // Determine if this is a cheap or exp order for metadata
                     let is_cheap_order = key.starts_with("cheap");
 
                     let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
@@ -648,13 +629,10 @@ async fn run_vidarx_strategy(
                         price: *price,
                         size: *size,
                         post_only: true,
+                        ladder_key: key.clone(),
+                        was_cheap: is_cheap_order,
                     }).await;
                     quotes_posted += 1;
-
-                    // #4: Store order metadata for fill attribution
-                    // We don't have the order_id yet (executor returns it asynchronously)
-                    // So we track by key and price — when a fill comes at this price,
-                    // we can look up whether it was cheap or exp
                 }
             }
         }
