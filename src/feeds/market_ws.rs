@@ -202,8 +202,8 @@ pub async fn run_market_ws_task(
                                     let _ = latest_tx.send(top);
                                 }
 
-                                // Log sparingly — first 3 events then every 5000
-                                if events_received <= 3 || events_received % 5000 == 0 {
+                                // Log first 3 events then every 500th — enough to see prices updating
+                                if events_received <= 3 || events_received % 500 == 0 {
                                     info!("market_ws: #{} | UP ask={} bid={} | DN ask={} bid={}",
                                         events_received,
                                         up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),

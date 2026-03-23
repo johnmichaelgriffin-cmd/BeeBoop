@@ -120,13 +120,10 @@ async fn main() -> Result<()> {
         log_tx.clone(),
     ));
 
-    // ── 3b. Polymarket price feed — REST polling (fallback, 100ms) ──
-    tokio::spawn(feeds::polymarket_ws::run_polymarket_ws_task(
-        market_watch_rx.clone(),
-        polymarket_tx,
-        pm_top_watch_tx,
-        log_tx.clone(),
-    ));
+    // ── 3b. REST polling DISABLED — WebSocket only, ride or die ──
+    // No REST fallback. WebSocket must work.
+    let _ = polymarket_tx; // suppress unused warning
+    let _ = pm_top_watch_tx; // WS already holds its own clone
 
     // ── 4. RTDS / Chainlink ─────────────────────────────────────
     tokio::spawn(feeds::rtds::run_rtds_task(
