@@ -112,7 +112,9 @@ async fn main() -> Result<()> {
         let api_secret = config.poly_api_secret.clone();
         let api_passphrase = config.poly_api_passphrase.clone();
         tokio::spawn(feeds::user_ws::run_user_ws_task(
-            api_key, api_secret, api_passphrase, fill_tx,
+            api_key, api_secret, api_passphrase,
+            market_watch_rx.clone(),
+            fill_tx,
         ));
     } else {
         info!("No credentials — user WS disabled (fills won't be tracked)");

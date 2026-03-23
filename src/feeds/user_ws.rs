@@ -36,10 +36,16 @@ pub async fn run_user_ws_task(
     api_key: String,
     api_secret: String,
     api_passphrase: String,
+    market_rx: tokio::sync::watch::Receiver<crate::types_v2::MarketDescriptor>,
     fill_tx: mpsc::Sender<UserFillEvent>,
 ) {
     loop {
-        info!("user_ws: connecting...");
+        // Get current market condition ID for subscription
+        let market = market_rx.borrow().clone();
+        let condition_id = market.condition_id.clone();
+
+        info!("user_ws: connecting (condition={})...",
+            if condition_id.is_empty() { "none".to_string() } else { condition_id[..16.min(condition_id.len())].to_string() });
 
         let ws_result = connect_async(USER_WS_URL).await;
         let (ws_stream, _) = match ws_result {
@@ -53,7 +59,13 @@ pub async fn run_user_ws_task(
 
         let (mut write, mut read) = ws_stream.split();
 
-        // Authenticate on the user channel
+        // Authenticate on the user channel with specific market condition
+        let markets_array = if condition_id.is_empty() {
+            vec![]
+        } else {
+            vec![condition_id.clone()]
+        };
+
         let auth_msg = json!({
             "auth": {
                 "apiKey": api_key,
@@ -61,7 +73,7 @@ pub async fn run_user_ws_task(
                 "passphrase": api_passphrase,
             },
             "type": "user",
-            "markets": [],  // empty = subscribe to all markets
+            "markets": markets_array,
         });
 
         if let Err(e) = write.send(Message::Text(auth_msg.to_string())).await {
@@ -145,8 +157,10 @@ pub async fn run_user_ws_task(
                                 .unwrap_or("UNKNOWN")
                                 .to_string();
 
-                            // Only emit for real fills
-                            if size > 0.0 && (status == "MATCHED" || status == "MINED" || status == "CONFIRMED") {
+                            // Only emit on MATCHED — do NOT count MINED/CONFIRMED again
+                            // The same trade emits MATCHED -> MINED -> CONFIRMED lifecycle.
+                            // Counting all three would 2x-3x inflate inventory.
+                            if size > 0.0 && status == "MATCHED" {
                                 let fill = UserFillEvent {
                                     order_id,
                                     asset_id,

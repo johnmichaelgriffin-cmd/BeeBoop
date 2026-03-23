@@ -152,26 +152,22 @@ pub async fn run_market_ws_task(
                                     }
                                 }
 
-                                // ── FORMAT 2: best_bid_ask event (requires custom_feature_enabled) ──
+                                // ── FORMAT 2: best_bid_ask event — top-level fields per docs ──
                                 if event_type == "best_bid_ask" {
-                                    if let Some(changes) = data.get("changes").and_then(|v| v.as_array()) {
-                                        for change in changes {
-                                            let aid = change.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
-                                            let best_ask_val = change.get("best_ask")
-                                                .and_then(|v| v.as_str())
-                                                .and_then(|s| s.parse::<f64>().ok());
-                                            let best_bid_val = change.get("best_bid")
-                                                .and_then(|v| v.as_str())
-                                                .and_then(|s| s.parse::<f64>().ok());
+                                    let aid = data.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let best_ask_val = data.get("best_ask")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok());
+                                    let best_bid_val = data.get("best_bid")
+                                        .and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok());
 
-                                            if aid == up_token {
-                                                if let Some(a) = best_ask_val { up_ask = Some(a); updated = true; }
-                                                if let Some(b) = best_bid_val { up_bid = Some(b); updated = true; }
-                                            } else if aid == dn_token {
-                                                if let Some(a) = best_ask_val { dn_ask = Some(a); updated = true; }
-                                                if let Some(b) = best_bid_val { dn_bid = Some(b); updated = true; }
-                                            }
-                                        }
+                                    if aid == up_token {
+                                        if let Some(a) = best_ask_val { up_ask = Some(a); updated = true; }
+                                        if let Some(b) = best_bid_val { up_bid = Some(b); updated = true; }
+                                    } else if aid == dn_token {
+                                        if let Some(a) = best_ask_val { dn_ask = Some(a); updated = true; }
+                                        if let Some(b) = best_bid_val { dn_bid = Some(b); updated = true; }
                                     }
                                 }
 
@@ -222,17 +218,16 @@ pub async fn run_market_ws_task(
                                     }
                                 }
 
-                                // ── FORMAT 5: tick_size_change ──
+                                // ── FORMAT 5: tick_size_change — top-level fields per docs ──
                                 if event_type == "tick_size_change" {
-                                    if let Some(tick_sizes) = data.get("tick_sizes").and_then(|v| v.as_array()) {
-                                        for ts in tick_sizes {
-                                            let aid = ts.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
-                                            let tick = ts.get("tick_size").and_then(|v| v.as_str())
-                                                .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.01);
-                                            if aid == up_token || aid == dn_token {
-                                                info!("market_ws: TICK SIZE CHANGE: {} -> {}", &aid[..16.min(aid.len())], tick);
-                                            }
-                                        }
+                                    let aid = data.get("asset_id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let old_tick = data.get("old_tick_size").and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.01);
+                                    let new_tick = data.get("new_tick_size").and_then(|v| v.as_str())
+                                        .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.01);
+                                    if aid == up_token || aid == dn_token {
+                                        info!("market_ws: TICK SIZE CHANGE: {} old={} new={}", &aid[..16.min(aid.len())], old_tick, new_tick);
+                                        // TODO: store and use dynamic tick size in quote construction
                                     }
                                 }
 
