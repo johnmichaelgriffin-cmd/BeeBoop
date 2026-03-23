@@ -291,10 +291,9 @@ pub async fn run_executor_task(
                 }
             }
 
-            ExecutionCommand::Reconcile { up_token_id, down_token_id } => {
+            ExecutionCommand::Reconcile { up_token_id, down_token_id, wallet_address } => {
                 if let Some((ref cli, _)) = client {
-                    // Fetch recent trades to reconcile fill state
-                    match reconcile_fills(cli, &up_token_id, &down_token_id).await {
+                    match reconcile_fills(cli, &up_token_id, &down_token_id, &wallet_address).await {
                         Ok(result) => {
                             let _ = evt_tx.send(ExecutionEvent::ReconcileResult(result)).await;
                         }
@@ -574,6 +573,7 @@ async fn reconcile_fills(
     _client: &AuthedClient,
     up_token_id: &str,
     down_token_id: &str,
+    wallet_address: &str,
 ) -> Result<crate::types_v2::ReconciliationResult, String> {
     // Use REST directly — simpler than fighting SDK type mismatches
     let http = reqwest::Client::new();
@@ -595,11 +595,12 @@ async fn reconcile_fills(
                         .and_then(|v| v.as_str())
                         .and_then(|s| s.parse::<f64>().ok())
                     {
-                        // Only count our buys (maker side)
+                        // #5: Only count trades where we are the maker
                         let maker = trade.get("maker_address")
                             .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if !maker.is_empty() {
+                            .unwrap_or("")
+                            .to_lowercase();
+                        if wallet_address.is_empty() || maker.contains(wallet_address) {
                             *total += size;
                         }
                     }

@@ -30,6 +30,8 @@ pub async fn run_market_ws_task(
     let mut up_bid: Option<f64> = None;
     let mut dn_ask: Option<f64> = None;
     let mut dn_bid: Option<f64> = None;
+    let mut up_tick: Option<f64> = None;
+    let mut dn_tick: Option<f64> = None;
     let mut events_received: u64 = 0;
 
     loop {
@@ -225,9 +227,14 @@ pub async fn run_market_ws_task(
                                         .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.01);
                                     let new_tick = data.get("new_tick_size").and_then(|v| v.as_str())
                                         .and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.01);
-                                    if aid == up_token || aid == dn_token {
-                                        info!("market_ws: TICK SIZE CHANGE: {} old={} new={}", &aid[..16.min(aid.len())], old_tick, new_tick);
-                                        // TODO: store and use dynamic tick size in quote construction
+                                    if aid == up_token {
+                                        info!("market_ws: TICK SIZE CHANGE UP: old={} new={}", old_tick, new_tick);
+                                        up_tick = Some(new_tick);
+                                        updated = true;
+                                    } else if aid == dn_token {
+                                        info!("market_ws: TICK SIZE CHANGE DN: old={} new={}", old_tick, new_tick);
+                                        dn_tick = Some(new_tick);
+                                        updated = true;
                                     }
                                 }
 
@@ -252,6 +259,8 @@ pub async fn run_market_ws_task(
                                         up_bid,
                                         down_ask: dn_ask,
                                         down_bid: dn_bid,
+                                        up_tick_size: up_tick,
+                                        down_tick_size: dn_tick,
                                     };
                                     let _ = latest_tx.send(top);
                                 }

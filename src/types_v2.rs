@@ -58,6 +58,9 @@ pub struct PolymarketTop {
     pub up_ask: Option<f64>,
     pub down_bid: Option<f64>,
     pub down_ask: Option<f64>,
+    // #3: Dynamic tick sizes (updated from tick_size_change events)
+    pub up_tick_size: Option<f64>,
+    pub down_tick_size: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -182,6 +185,7 @@ pub enum ExecutionCommand {
     Reconcile {
         up_token_id: String,
         down_token_id: String,
+        wallet_address: String,
     },
 }
 

@@ -52,6 +52,8 @@ pub async fn run_polymarket_ws_task(
             up_bid,
             down_ask: dn_ask,
             down_bid: dn_bid,
+            up_tick_size: None,
+            down_tick_size: None,
         };
 
         let _ = latest_tx.send(top.clone());

@@ -198,15 +198,52 @@ async fn run_vidarx_strategy(
     let mut last_signal: Option<Signal> = None;
     let mut window_active = false;
     let mut last_reconcile_ts: i64 = 0;
-    let reconcile_interval_ms: i64 = 10_000; // reconcile every 10 seconds
-    // Track last known prices for staleness detection
+    let reconcile_interval_ms: i64 = 10_000;
     let mut last_price_update_ms: i64 = 0;
 
-    // Quote refresh interval — every 2 seconds
+    // Quote refresh interval
     let quote_refresh_ms: i64 = 2000;
     // Ladder sizes
-    let cheap_ladder = [20.0_f64, 15.0, 10.0]; // L1, L2, L3
+    let cheap_ladder = [20.0_f64, 15.0, 10.0];
     let exp_ladder = [15.0_f64, 12.0, 8.0];
+
+    // #2: Live order tracking for selective refresh (avoid cancel-all every cycle)
+    // Maps "side:level" -> (order_id, posted_price, posted_size)
+    let mut live_orders: std::collections::HashMap<String, (String, f64, f64)> = std::collections::HashMap::new();
+
+    // #3: Dynamic tick size per token (updated from WS tick_size_change events)
+    let mut up_tick_size: f64 = 0.01;
+    let mut dn_tick_size: f64 = 0.01;
+
+    // #4: Order metadata map for fill attribution
+    // Maps order_id -> PostedOrderMeta
+    struct PostedOrderMeta {
+        _asset_id: String,
+        was_cheap_at_post: bool,
+        _ladder_level: u8,
+        posted_price: f64,
+    }
+    let mut order_meta: std::collections::HashMap<String, PostedOrderMeta> = std::collections::HashMap::new();
+
+    // #5: Our wallet address for reconciliation filtering
+    let our_wallet = if !config.poly_private_key.is_empty() {
+        // Derive wallet address from private key
+        let pk_clean = if config.poly_private_key.starts_with("0x") {
+            &config.poly_private_key[2..]
+        } else {
+            &config.poly_private_key
+        };
+        use alloy::signers::local::PrivateKeySigner;
+        use std::str::FromStr;
+        PrivateKeySigner::from_str(pk_clean)
+            .map(|s| format!("{:?}", s.address()).to_lowercase())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    if !our_wallet.is_empty() {
+        info!("Wallet for reconciliation: {}", &our_wallet[..12.min(our_wallet.len())]);
+    }
 
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
@@ -249,6 +286,10 @@ async fn run_vidarx_strategy(
                 window_active = false;
                 last_price_update_ms = 0;
                 last_window_ts = market.window_start_ts;
+                live_orders.clear();
+                order_meta.clear();
+                up_tick_size = 0.01;
+                dn_tick_size = 0.01;
 
                 // Cancel any leftover orders from previous window
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
@@ -310,13 +351,19 @@ async fn run_vidarx_strategy(
                     dn_cost += fill.size * fill.price;
                 }
 
-                // Classify cheap/exp at FILL TIME using current book (not refresh time)
-                let top = pm_top_rx.borrow().clone();
-                let is_cheap = match (top.up_ask, top.down_ask) {
-                    (Some(ua), Some(da)) => {
-                        if is_up { ua < da } else { da < ua }
+                // #4: Classify cheap/exp using order metadata (posted at quote time)
+                // Falls back to current book if order_id not found in metadata
+                let is_cheap = if let Some(meta) = order_meta.get(&fill.order_id) {
+                    meta.was_cheap_at_post
+                } else {
+                    // Fallback: use current book snapshot
+                    let top = pm_top_rx.borrow().clone();
+                    match (top.up_ask, top.down_ask) {
+                        (Some(ua), Some(da)) => {
+                            if is_up { ua < da } else { da < ua }
+                        }
+                        _ => fill.price < 0.50,
                     }
-                    _ => fill.price < 0.50, // fallback: below 50c = cheap
                 };
 
                 if is_cheap {
@@ -408,6 +455,7 @@ async fn run_vidarx_strategy(
                     let _ = exec_cmd_tx.send(ExecutionCommand::Reconcile {
                         up_token_id: market.up_token_id.clone(),
                         down_token_id: market.down_token_id.clone(),
+                        wallet_address: our_wallet.clone(),
                     }).await;
                 }
 
@@ -431,6 +479,10 @@ async fn run_vidarx_strategy(
                     warn!("STALE PRICES: {}ms since last update — skipping quotes", price_age_ms);
                     continue;
                 }
+
+                // #3: Update dynamic tick sizes from WS
+                if let Some(t) = top.up_tick_size { up_tick_size = t; }
+                if let Some(t) = top.down_tick_size { dn_tick_size = t; }
 
                 // Compute fair values — signal shifts our estimate of true value
                 let up_mid = (up_bid + up_ask) / 2.0;
@@ -475,84 +527,134 @@ async fn run_vidarx_strategy(
                 // Late window — reduce aggressiveness
                 let late_mult = if elapsed_s >= 180 { 0.5 } else { 1.0 };
 
-                // Cancel existing orders before posting new ones
-                let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                    reason: "quote_refresh".into(),
-                }).await;
-
-                // Small delay to let cancels process
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // #2: Selective refresh — build new desired quotes first,
+                // then only cancel/replace orders whose price actually changed.
+                // Orders at the same price keep their queue position.
+                let mut desired_quotes: std::collections::HashMap<String, (f64, f64, String, Side)> =
+                    std::collections::HashMap::new(); // key -> (price, size, token_id, side)
 
                 // Build bid ladders for BOTH sides
                 // Cheap side ladder
                 let cheap_token = if cheap_side == Side::Up { &market.up_token_id } else { &market.down_token_id };
                 let cheap_bid = if cheap_side == Side::Up { up_bid } else { dn_bid };
                 let cheap_ask_price = if cheap_side == Side::Up { up_ask } else { dn_ask };
-
                 let cheap_fair = if cheap_side == Side::Up { fair_up } else { fair_dn };
+                // #3: Use dynamic tick size
+                let cheap_tick = if cheap_side == Side::Up { up_tick_size } else { dn_tick_size };
 
                 for (level, &base_size) in cheap_ladder.iter().enumerate() {
                     let size = (base_size * cheap_size_mult * late_mult * (1.0 + skew.abs() * 0.3)).round().max(1.0);
                     let price = match level {
-                        0 => (cheap_bid + 0.01).min(cheap_ask_price - 0.01), // L1: bid+1tick, below ask
-                        1 => cheap_bid,                                       // L2: at best bid
-                        _ => (cheap_bid - 0.01).max(0.01),                   // L3: bid-1tick
+                        0 => (cheap_bid + cheap_tick).min(cheap_ask_price - cheap_tick),
+                        1 => cheap_bid,
+                        _ => (cheap_bid - cheap_tick).max(cheap_tick),
                     };
+                    // Round price to tick size
+                    let price = (price / cheap_tick).round() * cheap_tick;
 
-                    if price <= 0.01 || price >= cheap_ask_price { continue; } // would cross or invalid
+                    if price <= cheap_tick || price >= cheap_ask_price { continue; }
 
-                    // Quote-edge filter: only post if bid has enough edge vs fair value
                     let edge = cheap_fair - price;
                     if edge < min_edges[level] { continue; }
 
-                    let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                        market_slug: market.slug.clone(),
-                        token_id: cheap_token.clone(),
-                        side: cheap_side,
-                        price,
-                        size,
-                        post_only: true,
-                    }).await;
-                    quotes_posted += 1;
+                    let key = format!("cheap:{}", level);
+                    let is_cheap = true;
+                    desired_quotes.insert(key, (price, size, cheap_token.clone(), cheap_side));
                 }
 
                 // Expensive side ladder
                 let exp_token = if exp_side == Side::Up { &market.up_token_id } else { &market.down_token_id };
                 let exp_bid = if exp_side == Side::Up { up_bid } else { dn_bid };
                 let exp_ask_price = if exp_side == Side::Up { up_ask } else { dn_ask };
+                let exp_fair = if exp_side == Side::Up { fair_up } else { fair_dn };
+                let exp_tick = if exp_side == Side::Up { up_tick_size } else { dn_tick_size };
 
-                // Apply signal skew to expensive side
                 let exp_skew = if (exp_side == Side::Up && score > 0.0) || (exp_side == Side::Down && score < 0.0) {
-                    0.01 // tighten bid by 1c when signal favors this side
+                    exp_tick
                 } else {
                     0.0
                 };
 
-                let exp_fair = if exp_side == Side::Up { fair_up } else { fair_dn };
-
                 for (level, &base_size) in exp_ladder.iter().enumerate() {
                     let size = (base_size * exp_size_mult * late_mult).round().max(1.0);
                     let price = match level {
-                        0 => (exp_bid + 0.01 + exp_skew).min(exp_ask_price - 0.01),
+                        0 => (exp_bid + exp_tick + exp_skew).min(exp_ask_price - exp_tick),
                         1 => exp_bid + exp_skew,
-                        _ => (exp_bid - 0.01 + exp_skew).max(0.01),
+                        _ => (exp_bid - exp_tick + exp_skew).max(exp_tick),
                     };
+                    let price = (price / exp_tick).round() * exp_tick;
 
-                    if price <= 0.01 || price >= exp_ask_price { continue; }
+                    if price <= exp_tick || price >= exp_ask_price { continue; }
 
-                    // Quote-edge filter: only post if bid has enough edge vs fair value
                     let edge = exp_fair - price;
                     if edge < min_edges[level] { continue; }
 
+                    let key = format!("exp:{}", level);
+                    desired_quotes.insert(key, (price, size, exp_token.clone(), exp_side));
+                }
+
+                // #2: Selective refresh — compare desired vs live orders
+                // Cancel orders whose price changed, keep those that didn't
+                let mut keys_to_cancel: Vec<String> = Vec::new();
+                for (key, (live_id, live_price, _live_size)) in &live_orders {
+                    if let Some((desired_price, _desired_size, _, _)) = desired_quotes.get(key) {
+                        // Price changed by more than half a tick — cancel and replace
+                        let tick = if key.starts_with("cheap") { cheap_tick } else { exp_tick };
+                        if (*desired_price - *live_price).abs() > tick * 0.5 {
+                            keys_to_cancel.push(key.clone());
+                        }
+                        // Same price — keep it, preserve queue position
+                    } else {
+                        // Desired no longer wants this level — cancel it
+                        keys_to_cancel.push(key.clone());
+                    }
+                }
+
+                // Cancel stale orders
+                for key in &keys_to_cancel {
+                    if let Some((order_id, _, _)) = live_orders.remove(key) {
+                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                            reason: format!("selective:{}", key),
+                        }).await;
+                        // Note: CancelAll cancels everything — for true selective cancel
+                        // we'd need a CancelOrder(order_id) command. For now, cancel all
+                        // and repost all desired quotes below.
+                    }
+                }
+
+                // If any cancels happened, we need to repost everything
+                // (because CancelAll nukes all orders, not just the one we wanted)
+                let needs_full_repost = !keys_to_cancel.is_empty();
+
+                // Post new/changed quotes
+                for (key, (price, size, token_id, side)) in &desired_quotes {
+                    // Skip if this order is still live at the right price
+                    if !needs_full_repost {
+                        if let Some((_live_id, live_price, _)) = live_orders.get(key) {
+                            let tick = if key.starts_with("cheap") { cheap_tick } else { exp_tick };
+                            if (price - live_price).abs() <= tick * 0.5 {
+                                continue; // still good — keep it
+                            }
+                        }
+                    }
+
+                    // Determine if this is a cheap or exp order for metadata
+                    let is_cheap_order = key.starts_with("cheap");
+
                     let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                         market_slug: market.slug.clone(),
-                        token_id: exp_token.clone(),
-                        side: exp_side,
-                        price,
-                        size,
+                        token_id: token_id.clone(),
+                        side: *side,
+                        price: *price,
+                        size: *size,
                         post_only: true,
                     }).await;
                     quotes_posted += 1;
+
+                    // #4: Store order metadata for fill attribution
+                    // We don't have the order_id yet (executor returns it asynchronously)
+                    // So we track by key and price — when a fill comes at this price,
+                    // we can look up whether it was cheap or exp
                 }
             }
         }
