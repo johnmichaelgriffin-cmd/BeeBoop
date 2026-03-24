@@ -53,6 +53,141 @@ pub struct Config {
 
     // Logging
     pub logs_dir: String,
+
+    // Tuning — risk-shaping thresholds
+    pub tune: TuneConfig,
+}
+
+/// Risk-shaping thresholds — pair cost gates, residual caps, regime filters.
+#[derive(Debug, Clone)]
+pub struct TuneConfig {
+    // Pair-cost gates
+    pub pair_cost_full_size_max: f64,
+    pub pair_cost_reduce_max: f64,
+    pub pair_cost_strong_only_max: f64,
+    // Residual controls
+    pub weak_signal_max_ratio: f64,
+    pub med_signal_max_ratio: f64,
+    pub strong_signal_max_ratio: f64,
+    pub extreme_signal_max_ratio: f64,
+    pub soft_cap_fraction: f64,
+    pub soft_freeze_pair_cost: f64,
+    // Exp-heavy override
+    pub exp_heavy_override_score: f64,
+    pub exp_heavy_strong_score: f64,
+    pub exp_heavy_pair_cost_max: f64,
+    pub base_cheap_target: f64,
+    pub neutral_cheap_target: f64,
+    pub exp_heavy_cheap_target: f64,
+    // Extreme-price filter
+    pub extreme_reduce_exp_price: f64,
+    pub extreme_reduce_cheap_price: f64,
+    pub extreme_hard_exp_price: f64,
+    pub extreme_hard_cheap_price: f64,
+    pub extreme_size_multiplier: f64,
+    pub extreme_edge_add_cents: f64,
+    // Rolling regime filter
+    pub rolling_short_windows: usize,
+    pub rolling_pause_pnl_per_window: f64,
+    pub rolling_pause_pair_cost: f64,
+    pub rolling_resume_pnl_per_window: f64,
+    pub rolling_resume_pair_cost: f64,
+    // Min pairs before pair-cost gating activates
+    pub min_pairs_for_cost_gate: f64,
+}
+
+impl Default for TuneConfig {
+    fn default() -> Self {
+        Self {
+            pair_cost_full_size_max: 0.995,
+            pair_cost_reduce_max: 1.010,
+            pair_cost_strong_only_max: 1.030,
+            weak_signal_max_ratio: 1.20,
+            med_signal_max_ratio: 1.50,
+            strong_signal_max_ratio: 2.25,
+            extreme_signal_max_ratio: 3.00,
+            soft_cap_fraction: 0.80,
+            soft_freeze_pair_cost: 0.995,
+            exp_heavy_override_score: 1.40,
+            exp_heavy_strong_score: 2.00,
+            exp_heavy_pair_cost_max: 0.990,
+            base_cheap_target: 0.545,
+            neutral_cheap_target: 0.500,
+            exp_heavy_cheap_target: 0.470,
+            extreme_reduce_exp_price: 0.80,
+            extreme_reduce_cheap_price: 0.20,
+            extreme_hard_exp_price: 0.90,
+            extreme_hard_cheap_price: 0.10,
+            extreme_size_multiplier: 0.50,
+            extreme_edge_add_cents: 0.005,
+            rolling_short_windows: 6,
+            rolling_pause_pnl_per_window: -5.0,
+            rolling_pause_pair_cost: 1.010,
+            rolling_resume_pnl_per_window: 5.0,
+            rolling_resume_pair_cost: 0.995,
+            min_pairs_for_cost_gate: 50.0,
+        }
+    }
+}
+
+/// Signal strength band
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SignalBand {
+    Weak,
+    Medium,
+    Strong,
+    Extreme,
+}
+
+/// Pair cost quoting mode
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PairCostMode {
+    Full,
+    Reduced,
+    StrongOnly,
+    Stop,
+}
+
+impl TuneConfig {
+    pub fn signal_band(&self, score: f64) -> SignalBand {
+        let abs_score = score.abs();
+        if abs_score >= 2.00 { SignalBand::Extreme }
+        else if abs_score >= 1.40 { SignalBand::Strong }
+        else if abs_score >= 0.80 { SignalBand::Medium }
+        else { SignalBand::Weak }
+    }
+
+    pub fn max_ratio_for_band(&self, band: SignalBand) -> f64 {
+        match band {
+            SignalBand::Weak => self.weak_signal_max_ratio,
+            SignalBand::Medium => self.med_signal_max_ratio,
+            SignalBand::Strong => self.strong_signal_max_ratio,
+            SignalBand::Extreme => self.extreme_signal_max_ratio,
+        }
+    }
+
+    pub fn pair_cost_mode(&self, pair_cost: f64, matched_pairs: f64) -> PairCostMode {
+        if matched_pairs < self.min_pairs_for_cost_gate {
+            return PairCostMode::Full; // not enough data yet
+        }
+        if pair_cost <= self.pair_cost_full_size_max { PairCostMode::Full }
+        else if pair_cost <= self.pair_cost_reduce_max { PairCostMode::Reduced }
+        else if pair_cost <= self.pair_cost_strong_only_max { PairCostMode::StrongOnly }
+        else { PairCostMode::Stop }
+    }
+
+    pub fn cheap_target(&self, score: f64, pred_winner_is_exp: bool, pair_cost: Option<f64>) -> f64 {
+        let abs_score = score.abs();
+        let pc_ok = pair_cost.map_or(true, |pc| pc <= self.exp_heavy_pair_cost_max);
+
+        if abs_score >= self.exp_heavy_strong_score && pred_winner_is_exp && pc_ok {
+            self.exp_heavy_cheap_target
+        } else if abs_score >= self.exp_heavy_override_score && pred_winner_is_exp && pc_ok {
+            self.neutral_cheap_target
+        } else {
+            self.base_cheap_target
+        }
+    }
 }
 
 impl Default for Config {
@@ -106,6 +241,8 @@ impl Default for Config {
             poly_api_passphrase: String::new(),
 
             logs_dir: "logs".to_string(),
+
+            tune: TuneConfig::default(),
         }
     }
 }
