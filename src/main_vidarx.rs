@@ -205,10 +205,8 @@ async fn run_vidarx_strategy(
 
     // Quote refresh interval
     let quote_refresh_ms: i64 = 2000;
-    // Ladder sizes — rebalanced to reduce cheap accumulation
-    // Old: cheap 45 total vs exp 35 → too cheap-heavy (58%+)
-    // New: cheap 40 vs exp 41 → target realized cheap ~52-54%
-    let cheap_ladder = [20.0_f64, 15.0, 10.0]; // original working sizes
+    // Ladder sizes — the sizes that worked
+    let cheap_ladder = [20.0_f64, 15.0, 10.0];
     let exp_ladder = [15.0_f64, 12.0, 8.0];
 
     // Live order tracking for selective refresh
@@ -423,16 +421,13 @@ async fn run_vidarx_strategy(
                     up_avg + dn_avg
                 } else { 0.0 };
 
-                let total_ce = cheap_shares + exp_shares;
-                let hb_cheap_pct = if total_ce > 0.0 { cheap_shares / total_ce * 100.0 } else { 53.0 };
-
-                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | chp={:.0}% matched={:.0} pcost={:.0}c | fills={} quotes={} | signal={}",
+                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh matched={:.0} pcost={:.0}c | fills={} quotes={} | signal={} | window_active={}",
                     top.up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
                     top.down_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
-                    up_shares, dn_shares,
-                    hb_cheap_pct, matched, pair_cost * 100.0,
+                    up_shares, dn_shares, matched, pair_cost * 100.0,
                     fills_this_window, quotes_posted,
                     last_signal.as_ref().map_or("none".into(), |s| format!("{:.2}", s.score)),
+                    window_active,
                 );
             }
 
@@ -525,52 +520,26 @@ async fn run_vidarx_strategy(
                 // Edge thresholds
                 let min_edges = [0.015_f64, 0.010, 0.005]; // L1, L2, L3
 
-                // Signal skew — mild (at most ±15% size, ±1 tick)
+                // Signal skew — mild
                 let skew = (score * 0.25).clamp(-0.5, 0.5);
 
-                // ═══ INVENTORY TRACKING ═══
-                let total_ce = cheap_shares + exp_shares;
-                let cheap_ratio = if total_ce > 0.0 { cheap_shares / total_ce } else { 0.55 };
-                let matched = up_shares.min(dn_shares);
-                let live_pair_cost = if matched > 0.0 {
-                    let up_avg = up_cost / up_shares.max(0.001);
-                    let dn_avg = dn_cost / dn_shares.max(0.001);
-                    up_avg + dn_avg
-                } else { 0.0 };
+                // Inventory correction — simple 55/45 target, nothing fancy
+                let total_fill_shares = up_shares + dn_shares;
+                let cheap_eff = if cheap_side == Side::Up { up_shares } else { dn_shares };
+                let cheap_ratio = if total_fill_shares > 0.0 { cheap_eff / total_fill_shares } else { 0.55 };
 
-                // ═══ TWO PHASES: ACCUMULATE (T+5 to T+180) then REBALANCE+AGGRESSIVE (T+180 to T+240) ═══
                 let mut cheap_size_mult = 1.0_f64;
                 let mut exp_size_mult = 1.0_f64;
-                let mut late_phase = false;
-                let mut rebalancing = false;
-                let mut aggressive_mode = false;
-
-                if elapsed_s >= 180 {
-                    late_phase = true;
-
-                    // Check if we're within ±2% of 55/45 target
-                    let balanced = cheap_ratio >= 0.53 && cheap_ratio <= 0.57;
-
-                    if !balanced && total_ce > 10.0 {
-                        // REBALANCE: buy ONLY the underweight side
-                        rebalancing = true;
-                        if cheap_ratio > 0.57 {
-                            // Too cheap-heavy → buy only expensive
-                            cheap_size_mult = 0.0;
-                            exp_size_mult = 1.0;
-                        } else if cheap_ratio < 0.53 {
-                            // Too exp-heavy → buy only cheap
-                            cheap_size_mult = 1.0;
-                            exp_size_mult = 0.0;
-                        }
-                    } else {
-                        // BALANCED or not enough data → go AGGRESSIVE
-                        // Deeper bids: shift all ladder prices down by 0.5c
-                        aggressive_mode = true;
-                        // Size stays at 1.0 — no late-window reduction
-                    }
+                if cheap_ratio > 0.60 {
+                    cheap_size_mult = 0.7;
+                    exp_size_mult = 1.2;
+                } else if cheap_ratio < 0.50 {
+                    cheap_size_mult = 1.2;
+                    exp_size_mult = 0.7;
                 }
-                // T+5 to T+180: no corrections, no multipliers, old behavior
+
+                // Late window — reduce aggressiveness
+                let late_mult = if elapsed_s >= 180 { 0.5 } else { 1.0 };
 
                 // ═══ WALLET STOP-LOSS — snapshot + check ═══
                 let now_ms_for_wallet = chrono::Utc::now().timestamp_millis();
@@ -622,16 +591,13 @@ async fn run_vidarx_strategy(
                 let cheap_tick = if cheap_side == Side::Up { up_tick_size } else { dn_tick_size };
 
                 for (level, &base_size) in cheap_ladder.iter().enumerate() {
-                    let raw_size = (base_size * cheap_size_mult * (1.0 + skew.abs() * 0.15)).round();
-                    if raw_size < 5.0 { continue; }
+                    let raw_size = (base_size * cheap_size_mult * late_mult * (1.0 + skew.abs() * 0.3)).round();
+                    if raw_size < 5.0 { continue; } // skip — below venue minimum, don't force to 5
                     let size = raw_size;
-
-                    // Aggressive mode (T+180 when balanced): shift bids 0.5c deeper
-                    let aggressive_shift = if aggressive_mode { 0.005 } else { 0.0 };
                     let price = match level {
-                        0 => cheap_bid - aggressive_shift,
-                        1 => cheap_bid - cheap_tick - aggressive_shift,
-                        _ => cheap_bid - 2.0 * cheap_tick - aggressive_shift,
+                        0 => cheap_bid, // L1: at best bid (NOT bid+tick — that crosses)
+                        1 => cheap_bid - cheap_tick,
+                        _ => cheap_bid - 2.0 * cheap_tick,
                     };
                     // Round price to tick size
                     let price = (price / cheap_tick).round() * cheap_tick;
@@ -661,16 +627,13 @@ async fn run_vidarx_strategy(
                 };
 
                 for (level, &base_size) in exp_ladder.iter().enumerate() {
-                    let raw_size = (base_size * exp_size_mult).round();
-                    if raw_size < 5.0 { continue; }
+                    let raw_size = (base_size * exp_size_mult * late_mult).round();
+                    if raw_size < 5.0 { continue; } // skip — below venue minimum
                     let size = raw_size;
-
-                    // Aggressive mode: shift bids 0.5c deeper
-                    let aggressive_shift = if aggressive_mode { 0.005 } else { 0.0 };
                     let price = match level {
-                        0 => exp_bid + exp_skew - aggressive_shift,
-                        1 => exp_bid - exp_tick + exp_skew - aggressive_shift,
-                        _ => exp_bid - 2.0 * exp_tick + exp_skew - aggressive_shift,
+                        0 => exp_bid + exp_skew, // L1: at best bid (with signal skew)
+                        1 => exp_bid - exp_tick + exp_skew,
+                        _ => exp_bid - 2.0 * exp_tick + exp_skew,
                     };
                     let price = (price / exp_tick).round() * exp_tick;
 
