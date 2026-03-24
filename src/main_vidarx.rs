@@ -723,7 +723,9 @@ async fn run_vidarx_strategy(
                 let cheap_tick = if cheap_side == Side::Up { up_tick_size } else { dn_tick_size };
 
                 for (level, &base_size) in cheap_ladder.iter().enumerate() {
-                    let size = (base_size * cheap_size_mult * late_mult * (1.0 + skew.abs() * 0.3)).round().max(5.0);
+                    let raw_size = (base_size * cheap_size_mult * late_mult * (1.0 + skew.abs() * 0.3)).round();
+                    if raw_size < 5.0 { continue; } // skip — below venue minimum, don't force to 5
+                    let size = raw_size;
                     let price = match level {
                         0 => cheap_bid, // L1: at best bid (NOT bid+tick — that crosses)
                         1 => cheap_bid - cheap_tick,
@@ -757,7 +759,9 @@ async fn run_vidarx_strategy(
                 };
 
                 for (level, &base_size) in exp_ladder.iter().enumerate() {
-                    let size = (base_size * exp_size_mult * late_mult).round().max(5.0);
+                    let raw_size = (base_size * exp_size_mult * late_mult).round();
+                    if raw_size < 5.0 { continue; } // skip — below venue minimum
+                    let size = raw_size;
                     let price = match level {
                         0 => exp_bid + exp_skew, // L1: at best bid (with signal skew)
                         1 => exp_bid - exp_tick + exp_skew,
@@ -781,10 +785,11 @@ async fn run_vidarx_strategy(
                 let tick_threshold = cheap_tick.min(exp_tick) * 0.5;
                 let mut needs_cancel = false;
 
-                // Check if ANY quote price moved enough to warrant a refresh
-                for (key, (desired_price, _desired_size, _, _)) in &desired_quotes {
-                    if let Some((_live_id, live_price, _live_size)) = live_orders.get(key) {
-                        if (*desired_price - *live_price).abs() > tick_threshold {
+                // Check if ANY quote price OR SIZE changed enough to warrant a refresh
+                for (key, (desired_price, desired_size, _, _)) in &desired_quotes {
+                    if let Some((_live_id, live_price, live_size)) = live_orders.get(key) {
+                        if (*desired_price - *live_price).abs() > tick_threshold
+                            || (*desired_size - *live_size).abs() >= 1.0 {
                             needs_cancel = true;
                             break;
                         }
