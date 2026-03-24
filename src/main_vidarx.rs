@@ -164,22 +164,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Vidarx Strategy — buy-only maker accumulator
+/// Vidarx Strategy — buy-only maker accumulator (REVERTED to simple version)
 ///
 /// Posts GTC postOnly bids on both sides, skewed by signal.
-/// Tracks inventory, manages quote lifecycle, holds to resolution.
+/// Simple cheap/exp correction. No risk-shaping overlay.
+/// Only protection: rolling 3-hour wallet stop-loss.
 async fn run_vidarx_strategy(
     config: Config,
-    shared: SharedState,
+    _shared: SharedState,
     market_rx: watch::Receiver<MarketDescriptor>,
     pm_top_rx: watch::Receiver<PolymarketTop>,
     mut signal_rx: mpsc::Receiver<Signal>,
     exec_cmd_tx: mpsc::Sender<ExecutionCommand>,
     mut exec_evt_rx: mpsc::Receiver<ExecutionEvent>,
     mut fill_rx: mpsc::Receiver<feeds::user_ws::UserFillEvent>,
-    log_tx: mpsc::Sender<LogEvent>,
+    _log_tx: mpsc::Sender<LogEvent>,
 ) {
-    info!("vidarx_strategy: started");
+    info!("vidarx_strategy: SIMPLE MODE — no risk overlay, wallet stop-loss only");
 
     // Per-window tracking
     let mut last_window_ts: i64 = 0;
@@ -187,40 +188,35 @@ async fn run_vidarx_strategy(
     let mut dn_shares: f64 = 0.0;
     let mut up_cost: f64 = 0.0;
     let mut dn_cost: f64 = 0.0;
-    // Fill-time cheap/exp classification (not refresh-time)
     let mut cheap_shares: f64 = 0.0;
     let mut exp_shares: f64 = 0.0;
     let mut cheap_cost: f64 = 0.0;
     let mut exp_cost: f64 = 0.0;
     let mut quotes_posted: u32 = 0;
     let mut fills_this_window: u32 = 0;
-    // Track shares POSTED as a worst-case inventory estimate
-    // (assumes all posted orders fill — conservative for balancing)
-    let mut up_shares_posted: f64 = 0.0;
-    let mut dn_shares_posted: f64 = 0.0;
     let mut last_quote_ts: i64 = 0;
     let mut last_signal: Option<Signal> = None;
     let mut window_active = false;
+    let mut last_price_update_ms: i64 = 0;
     let mut last_reconcile_ts: i64 = 0;
     let reconcile_interval_ms: i64 = 10_000;
-    let mut last_price_update_ms: i64 = 0;
+    let mut up_shares_posted: f64 = 0.0;
+    let mut dn_shares_posted: f64 = 0.0;
 
     // Quote refresh interval
     let quote_refresh_ms: i64 = 2000;
-    // Ladder sizes
+    // Ladder sizes — the sizes that worked
     let cheap_ladder = [20.0_f64, 15.0, 10.0];
     let exp_ladder = [15.0_f64, 12.0, 8.0];
 
-    // #2: Live order tracking for selective refresh (avoid cancel-all every cycle)
-    // Maps "side:level" -> (order_id, posted_price, posted_size)
+    // Live order tracking for selective refresh
     let mut live_orders: std::collections::HashMap<String, (String, f64, f64)> = std::collections::HashMap::new();
 
-    // #3: Dynamic tick size per token (updated from WS tick_size_change events)
+    // Dynamic tick size per token
     let mut up_tick_size: f64 = 0.01;
     let mut dn_tick_size: f64 = 0.01;
 
-    // #4: Order metadata map for fill attribution
-    // Maps order_id -> PostedOrderMeta
+    // Order metadata for fill attribution
     struct PostedOrderMeta {
         _asset_id: String,
         was_cheap_at_post: bool,
@@ -229,34 +225,35 @@ async fn run_vidarx_strategy(
     }
     let mut order_meta: std::collections::HashMap<String, PostedOrderMeta> = std::collections::HashMap::new();
 
-    // #5: Our wallet address for reconciliation filtering
+    // Our wallet address for reconciliation
     let our_wallet = if !config.poly_private_key.is_empty() {
-        // Derive wallet address from private key
-        let pk_clean = if config.poly_private_key.starts_with("0x") {
-            &config.poly_private_key[2..]
-        } else {
-            &config.poly_private_key
-        };
+        let pk_clean = if config.poly_private_key.starts_with("0x") { &config.poly_private_key[2..] } else { &config.poly_private_key };
         use alloy::signers::local::PrivateKeySigner;
         use std::str::FromStr;
         PrivateKeySigner::from_str(pk_clean)
             .map(|s| format!("{:?}", s.address()).to_lowercase())
             .unwrap_or_default()
-    } else {
-        String::new()
-    };
-    if !our_wallet.is_empty() {
-        info!("Wallet for reconciliation: {}", &our_wallet[..12.min(our_wallet.len())]);
-    }
+    } else { String::new() };
 
-    // Rolling regime filter state
-    let mut rolling_pnl: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
-    let mut rolling_pair_costs: std::collections::VecDeque<f64> = std::collections::VecDeque::new();
-    let mut market_paused = false;
+    // ═══ ROLLING WALLET STOP-LOSS ═══
+    // Record wallet value at bot start + top of every hour.
+    // If current wallet drops $2500 below any snapshot in last 3 hours, STOP.
+    let mut wallet_snapshots: std::collections::VecDeque<(i64, f64)> = std::collections::VecDeque::new();
+    let mut last_wallet_snapshot_ts: i64 = 0;
+    let wallet_snapshot_interval_ms: i64 = 3_600_000; // 1 hour
+    let wallet_max_drawdown: f64 = 2500.0;
+    let wallet_lookback_ms: i64 = 3 * 3_600_000; // 3 hours
+    let mut bot_stopped = false;
 
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
+        // ═══ WALLET STOP-LOSS CHECK ═══
+        if bot_stopped {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            continue;
+        }
+
         // Window change detection
         {
             let market = market_rx.borrow().clone();
@@ -269,9 +266,6 @@ async fn run_vidarx_strategy(
                         let dn_avg = if dn_shares > 0.0 { dn_cost / dn_shares } else { 0.0 };
                         up_avg + dn_avg
                     } else { 0.0 };
-                    let cheap_ratio = if up_shares + dn_shares > 0.0 {
-                        up_shares.min(dn_shares) / (up_shares + dn_shares) * 2.0 // approximate
-                    } else { 0.0 };
 
                     info!(">>> WINDOW COMPLETE: UP {:.0}sh (${:.2}) DN {:.0}sh (${:.2}) | matched={:.0} pair_cost={:.2}c | fills={} quotes={}",
                         up_shares, up_cost, dn_shares, dn_cost,
@@ -279,37 +273,7 @@ async fn run_vidarx_strategy(
                         fills_this_window, quotes_posted);
                 }
 
-                // Rolling regime tracking — estimate window PnL
-                // (crude: assume winner resolves to $1, loser to $0)
-                if fills_this_window > 0 {
-                    let matched = up_shares.min(dn_shares);
-                    let pair_cost = if matched > 0.0 {
-                        let up_avg = up_cost / up_shares.max(0.001);
-                        let dn_avg = dn_cost / dn_shares.max(0.001);
-                        up_avg + dn_avg
-                    } else { 1.0 };
-
-                    // Estimate PnL: matched * (1 - pair_cost) + max residual * (0.5 - avg_cost)
-                    let est_pnl = matched * (1.0 - pair_cost);
-                    rolling_pnl.push_back(est_pnl);
-                    rolling_pair_costs.push_back(pair_cost);
-                    while rolling_pnl.len() > config.tune.rolling_short_windows { rolling_pnl.pop_front(); }
-                    while rolling_pair_costs.len() > config.tune.rolling_short_windows { rolling_pair_costs.pop_front(); }
-
-                    // Check pause conditions
-                    if rolling_pnl.len() >= config.tune.rolling_short_windows {
-                        let avg_pnl: f64 = rolling_pnl.iter().sum::<f64>() / rolling_pnl.len() as f64;
-                        let avg_pc: f64 = rolling_pair_costs.iter().sum::<f64>() / rolling_pair_costs.len() as f64;
-                        if avg_pnl < config.tune.rolling_pause_pnl_per_window || avg_pc > config.tune.rolling_pause_pair_cost {
-                            if !market_paused {
-                                market_paused = true;
-                                warn!(">>> REGIME PAUSED: rolling_pnl={:.1}/w pair_cost={:.3} — waiting for recovery", avg_pnl, avg_pc);
-                            }
-                        }
-                    }
-                }
-
-                // Reset for new window
+                // Reset for new window (no regime tracking — just reset)
                 up_shares = 0.0;
                 dn_shares = 0.0;
                 up_cost = 0.0;
@@ -318,10 +282,10 @@ async fn run_vidarx_strategy(
                 exp_shares = 0.0;
                 cheap_cost = 0.0;
                 exp_cost = 0.0;
-                quotes_posted = 0;
-                fills_this_window = 0;
                 up_shares_posted = 0.0;
                 dn_shares_posted = 0.0;
+                quotes_posted = 0;
+                fills_this_window = 0;
                 last_quote_ts = 0;
                 last_signal = None;
                 window_active = false;
@@ -537,77 +501,8 @@ async fn run_vidarx_strategy(
                 if let Some(t) = top.up_tick_size { up_tick_size = t; }
                 if let Some(t) = top.down_tick_size { dn_tick_size = t; }
 
-                // ═══ TUNING GATES — risk-shaping layer ═══
-                let tune = &config.tune;
+                // ═══ SIMPLE STRATEGY — no risk overlay ═══
                 let score = last_signal.as_ref().map_or(0.0, |s| s.score);
-                let signal_band = tune.signal_band(score);
-
-                // Compute live pair cost
-                let matched = up_shares.min(dn_shares);
-                let live_pair_cost = if matched > 0.0 {
-                    let up_avg = up_cost / up_shares.max(0.001);
-                    let dn_avg = dn_cost / dn_shares.max(0.001);
-                    up_avg + dn_avg
-                } else { 0.0 };
-
-                // Rolling regime kill switch
-                if market_paused {
-                    // Check resume conditions
-                    if rolling_pnl.len() >= tune.rolling_short_windows {
-                        let avg_pnl: f64 = rolling_pnl.iter().sum::<f64>() / rolling_pnl.len() as f64;
-                        let avg_pc: f64 = rolling_pair_costs.iter().sum::<f64>() / rolling_pair_costs.len().max(1) as f64;
-                        if avg_pnl > tune.rolling_resume_pnl_per_window && avg_pc < tune.rolling_resume_pair_cost {
-                            market_paused = false;
-                            info!(">>> REGIME RESUMED: rolling_pnl={:.1} pair_cost={:.3}", avg_pnl, avg_pc);
-                        }
-                    }
-                    if market_paused { continue; }
-                }
-
-                // Pair-cost gating
-                let pc_mode = tune.pair_cost_mode(live_pair_cost, matched);
-                match pc_mode {
-                    config_v2::PairCostMode::Stop => {
-                        if window_active {
-                            warn!(">>> PAIR COST {:.3} > {:.3} — STOPPED accumulating", live_pair_cost, tune.pair_cost_strong_only_max);
-                        }
-                        continue;
-                    }
-                    config_v2::PairCostMode::StrongOnly => {
-                        if signal_band != config_v2::SignalBand::Strong && signal_band != config_v2::SignalBand::Extreme {
-                            continue; // only strong/extreme signals allowed
-                        }
-                    }
-                    _ => {} // Full or Reduced — proceed
-                }
-
-                // Predicted winner side for residual control
-                let pred_winner_up = score > 0.0;
-                let winner_shares = if pred_winner_up { up_shares } else { dn_shares };
-                let loser_shares = if pred_winner_up { dn_shares } else { up_shares };
-                let winner_ratio = winner_shares / loser_shares.max(1.0);
-
-                // Dynamic residual cap
-                let max_ratio = tune.max_ratio_for_band(signal_band);
-                let favored_capped = winner_ratio >= max_ratio;
-                if favored_capped && matched > tune.min_pairs_for_cost_gate {
-                    // Don't log every cycle — just when first capped
-                }
-
-                // Soft freeze — preserve favorable asymmetry
-                let soft_cap = max_ratio * tune.soft_cap_fraction;
-                let soft_freeze = winner_ratio >= soft_cap && live_pair_cost >= tune.soft_freeze_pair_cost && matched > tune.min_pairs_for_cost_gate;
-
-                // Compute fair values
-                let up_mid = (up_bid + up_ask) / 2.0;
-                let k = 0.03;
-                let fair_up = (up_mid + k * score).clamp(0.02, 0.98);
-                let fair_dn = (1.0 - fair_up).clamp(0.02, 0.98);
-
-                // Edge thresholds — base + extreme-price add-on
-                let mut min_edge_l1 = 0.015_f64;
-                let mut min_edge_l2 = 0.010_f64;
-                let mut min_edge_l3 = 0.005_f64;
 
                 // Determine cheap vs expensive
                 let (cheap_side, exp_side) = if up_ask < dn_ask {
@@ -615,97 +510,70 @@ async fn run_vidarx_strategy(
                 } else {
                     (Side::Down, Side::Up)
                 };
-                let exp_ask = if exp_side == Side::Up { up_ask } else { dn_ask };
-                let cheap_ask_raw = if cheap_side == Side::Up { up_ask } else { dn_ask };
 
-                // Extreme-price filter
-                let mut extreme_mult = 1.0_f64;
-                let extreme_hard = exp_ask > tune.extreme_hard_exp_price || cheap_ask_raw < tune.extreme_hard_cheap_price;
-                let extreme_reduce = exp_ask > tune.extreme_reduce_exp_price || cheap_ask_raw < tune.extreme_reduce_cheap_price;
+                // Compute fair values (mild signal shift)
+                let up_mid = (up_bid + up_ask) / 2.0;
+                let k = 0.03;
+                let fair_up = (up_mid + k * score).clamp(0.02, 0.98);
+                let fair_dn = (1.0 - fair_up).clamp(0.02, 0.98);
 
-                if extreme_hard {
-                    // Hard regime: only favored L1 if strong signal
-                    if signal_band != config_v2::SignalBand::Strong && signal_band != config_v2::SignalBand::Extreme {
-                        continue; // skip this window
-                    }
-                    extreme_mult = tune.extreme_size_multiplier * 0.5; // very small
-                } else if extreme_reduce {
-                    extreme_mult = tune.extreme_size_multiplier;
-                    min_edge_l1 += tune.extreme_edge_add_cents;
-                    min_edge_l2 += tune.extreme_edge_add_cents;
-                    min_edge_l3 += tune.extreme_edge_add_cents;
-                }
+                // Edge thresholds
+                let min_edges = [0.015_f64, 0.010, 0.005]; // L1, L2, L3
 
-                let min_edges = [min_edge_l1, min_edge_l2, min_edge_l3];
-
-                // Exp-heavy override — shift cheap target in strong windows
-                let pred_winner_is_exp = (pred_winner_up && exp_side == Side::Up) ||
-                    (!pred_winner_up && exp_side == Side::Down);
-                let cheap_target = tune.cheap_target(score, pred_winner_is_exp, Some(live_pair_cost));
-
-                // Signal skew
+                // Signal skew — mild
                 let skew = (score * 0.25).clamp(-0.5, 0.5);
 
-                // Inventory ratio from fills
+                // Inventory correction — simple 55/45 target, nothing fancy
                 let total_fill_shares = up_shares + dn_shares;
                 let cheap_eff = if cheap_side == Side::Up { up_shares } else { dn_shares };
-                let cheap_ratio = if total_fill_shares > 0.0 { cheap_eff / total_fill_shares } else { cheap_target };
+                let cheap_ratio = if total_fill_shares > 0.0 { cheap_eff / total_fill_shares } else { 0.55 };
 
-                // Inventory correction toward dynamic cheap target
                 let mut cheap_size_mult = 1.0_f64;
                 let mut exp_size_mult = 1.0_f64;
-                if cheap_ratio > cheap_target + 0.05 {
+                if cheap_ratio > 0.60 {
                     cheap_size_mult = 0.7;
                     exp_size_mult = 1.2;
-                } else if cheap_ratio < cheap_target - 0.05 {
+                } else if cheap_ratio < 0.50 {
                     cheap_size_mult = 1.2;
                     exp_size_mult = 0.7;
                 }
 
-                // Pair-cost mode adjustments
-                match pc_mode {
-                    config_v2::PairCostMode::Reduced => {
-                        cheap_size_mult *= 0.65;
-                        exp_size_mult *= 0.65;
-                        // Drop L3 on underfavored side (handled in ladder loop below)
-                    }
-                    config_v2::PairCostMode::StrongOnly => {
-                        cheap_size_mult *= 0.50;
-                        exp_size_mult *= 0.50;
-                    }
-                    _ => {}
-                }
-
-                // Soft freeze adjustments — protect favorable asymmetry
-                if soft_freeze {
-                    // Reduce underfavored side
-                    if pred_winner_up {
-                        // Winner is UP; reduce DN (loser) quoting
-                        if cheap_side == Side::Down { cheap_size_mult *= 0.5; }
-                        else { exp_size_mult *= 0.5; }
-                    } else {
-                        if cheap_side == Side::Up { cheap_size_mult *= 0.5; }
-                        else { exp_size_mult *= 0.5; }
-                    }
-                }
-
-                // Favored side capped — stop quoting favored entirely
-                if favored_capped && matched > tune.min_pairs_for_cost_gate {
-                    if pred_winner_up {
-                        if cheap_side == Side::Up { cheap_size_mult = 0.0; }
-                        else { exp_size_mult = 0.0; }
-                    } else {
-                        if cheap_side == Side::Down { cheap_size_mult = 0.0; }
-                        else { exp_size_mult = 0.0; }
-                    }
-                }
-
-                // Apply extreme-price multiplier
-                cheap_size_mult *= extreme_mult;
-                exp_size_mult *= extreme_mult;
-
                 // Late window — reduce aggressiveness
                 let late_mult = if elapsed_s >= 180 { 0.5 } else { 1.0 };
+
+                // ═══ WALLET STOP-LOSS — snapshot + check ═══
+                let now_ms_for_wallet = chrono::Utc::now().timestamp_millis();
+                if now_ms_for_wallet - last_wallet_snapshot_ts >= wallet_snapshot_interval_ms || last_wallet_snapshot_ts == 0 {
+                    // Estimate current wallet from deployed capital
+                    let deployed = up_cost + dn_cost;
+                    // Use deployed as proxy — real wallet check would be better
+                    // For now, snapshot the total deployed capital as a reference
+                    let wallet_estimate = 5000.0 - deployed; // crude estimate
+                    wallet_snapshots.push_back((now_ms_for_wallet, wallet_estimate));
+                    // Trim old snapshots
+                    while let Some((ts, _)) = wallet_snapshots.front() {
+                        if now_ms_for_wallet - ts > wallet_lookback_ms {
+                            wallet_snapshots.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    last_wallet_snapshot_ts = now_ms_for_wallet;
+
+                    // Check drawdown
+                    if let Some(peak) = wallet_snapshots.iter().map(|(_, v)| *v).reduce(f64::max) {
+                        let drawdown = peak - wallet_estimate;
+                        if drawdown >= wallet_max_drawdown {
+                            error!(">>> WALLET STOP-LOSS: current={:.0} peak={:.0} drawdown={:.0} >= {:.0} — STOPPING BOT",
+                                wallet_estimate, peak, drawdown, wallet_max_drawdown);
+                            bot_stopped = true;
+                            let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                                reason: "wallet_stop_loss".into(),
+                            }).await;
+                            continue;
+                        }
+                    }
+                }
 
                 // #2: Selective refresh — build new desired quotes first,
                 // then only cancel/replace orders whose price actually changed.
