@@ -544,6 +544,15 @@ async fn run_vidarx_strategy(
                 // Late window — reduce aggressiveness
                 let late_mult = if elapsed_s >= 180 { 0.5 } else { 1.0 };
 
+                // Dynamic pricing: if pcost > 97c, go 3c deeper on all ladders
+                let matched = up_shares.min(dn_shares);
+                let live_pair_cost = if matched > 0.0 {
+                    let up_avg = up_cost / up_shares.max(0.001);
+                    let dn_avg = dn_cost / dn_shares.max(0.001);
+                    up_avg + dn_avg
+                } else { 0.0 };
+                let pcost_extra_shift = if live_pair_cost > 0.97 && matched > 10.0 { 3.0 } else { 0.0 };
+
                 // ═══ WALLET STOP-LOSS — snapshot + check ═══
                 let now_ms_for_wallet = chrono::Utc::now().timestamp_millis();
                 if now_ms_for_wallet - last_wallet_snapshot_ts >= wallet_snapshot_interval_ms || last_wallet_snapshot_ts == 0 {
@@ -598,9 +607,9 @@ async fn run_vidarx_strategy(
                     if raw_size < 5.0 { continue; } // skip — below venue minimum, don't force to 5
                     let size = raw_size;
                     let price = match level {
-                        0 => cheap_bid - 4.0 * cheap_tick, // L1: bid - 4c
-                        1 => cheap_bid - 5.0 * cheap_tick, // L2: bid - 5c
-                        _ => cheap_bid - 6.0 * cheap_tick, // L3: bid - 6c
+                        0 => cheap_bid - (4.0 + pcost_extra_shift) * cheap_tick,
+                        1 => cheap_bid - (5.0 + pcost_extra_shift) * cheap_tick,
+                        _ => cheap_bid - (6.0 + pcost_extra_shift) * cheap_tick,
                     };
                     // Round price to tick size
                     let price = (price / cheap_tick).round() * cheap_tick;
@@ -634,9 +643,9 @@ async fn run_vidarx_strategy(
                     if raw_size < 5.0 { continue; } // skip — below venue minimum
                     let size = raw_size;
                     let price = match level {
-                        0 => exp_bid - 4.0 * exp_tick + exp_skew, // L1: bid - 4c
-                        1 => exp_bid - 5.0 * exp_tick + exp_skew, // L2: bid - 5c
-                        _ => exp_bid - 6.0 * exp_tick + exp_skew, // L3: bid - 6c
+                        0 => exp_bid - (4.0 + pcost_extra_shift) * exp_tick + exp_skew,
+                        1 => exp_bid - (5.0 + pcost_extra_shift) * exp_tick + exp_skew,
+                        _ => exp_bid - (6.0 + pcost_extra_shift) * exp_tick + exp_skew,
                     };
                     let price = (price / exp_tick).round() * exp_tick;
 
