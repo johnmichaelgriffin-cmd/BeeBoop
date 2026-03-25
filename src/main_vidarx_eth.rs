@@ -551,7 +551,16 @@ async fn run_vidarx_strategy(
                     let dn_avg = dn_cost / dn_shares.max(0.001);
                     up_avg + dn_avg
                 } else { 0.0 };
-                let pcost_extra_shift = if live_pair_cost > 0.97 && matched > 10.0 { 3.0 } else { 0.0 };
+                // Graduated pcost shift — worse pair cost = deeper bids
+                let pcost_extra_shift = if matched > 10.0 {
+                    if live_pair_cost > 1.00 { 6.0 }
+                    else if live_pair_cost > 0.99 { 5.0 }
+                    else if live_pair_cost > 0.98 { 4.0 }
+                    else if live_pair_cost > 0.97 { 3.0 }
+                    else if live_pair_cost > 0.96 { 2.0 }
+                    else if live_pair_cost > 0.95 { 1.0 }
+                    else { 0.0 }
+                } else { 0.0 };
 
                 // ═══ WALLET STOP-LOSS — snapshot + check ═══
                 let now_ms_for_wallet = chrono::Utc::now().timestamp_millis();
