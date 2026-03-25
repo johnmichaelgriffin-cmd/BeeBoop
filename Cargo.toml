@@ -94,6 +94,10 @@ path = "src/main_btc_mint.rs"
 name = "beeboop-v3"
 path = "src/main_vidarx.rs"
 
+[[bin]]
+name = "beeboop-v3-eth"
+path = "src/main_vidarx_eth.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
