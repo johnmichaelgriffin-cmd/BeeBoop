@@ -69,8 +69,15 @@ async fn connect_and_stream_sym(
 
     // Ping every 5s
     let mut ping_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+    let rtds_connect_time = chrono::Utc::now().timestamp();
 
     loop {
+        // Forced reconnect every 10 minutes
+        if chrono::Utc::now().timestamp() - rtds_connect_time >= 600 {
+            info!("rtds: FORCED RECONNECT after 600s");
+            break;
+        }
+
         tokio::select! {
             msg = read.next() => {
                 match msg {

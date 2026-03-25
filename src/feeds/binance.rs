@@ -41,8 +41,14 @@ async fn connect_and_stream(
     let (ws, _) = connect_async(url).await?;
     let (mut write, mut read) = ws.split();
     info!("binance: connected");
+    let binance_connect_time = chrono::Utc::now().timestamp();
 
     while let Some(msg) = read.next().await {
+        // Forced reconnect every 10 minutes
+        if chrono::Utc::now().timestamp() - binance_connect_time >= 600 {
+            info!("binance: FORCED RECONNECT after 600s");
+            break;
+        }
         match msg? {
             Message::Text(text) => {
                 let now_ms = chrono::Utc::now().timestamp_millis();

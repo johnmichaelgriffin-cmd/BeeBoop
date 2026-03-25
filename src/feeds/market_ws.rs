@@ -100,9 +100,20 @@ pub async fn run_market_ws_task(
             }
         });
 
-        // Reader loop
+        // Reader loop with forced reconnect every 10 minutes
+        let connect_time = chrono::Utc::now().timestamp();
+        let max_connection_secs: i64 = 600; // 10 minutes
+
         let mut alive = true;
         while alive {
+            // Forced reconnect every 10 minutes to prevent stale connections
+            let now_secs = chrono::Utc::now().timestamp();
+            if now_secs - connect_time >= max_connection_secs {
+                info!("market_ws: FORCED RECONNECT after {}s — keeping connection fresh",
+                    now_secs - connect_time);
+                break;
+            }
+
             // Also check if market changed (new window) — need to resubscribe
             let current_market = market_rx.borrow().clone();
             if current_market.up_token_id != up_token || current_market.down_token_id != dn_token {

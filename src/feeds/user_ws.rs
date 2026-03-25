@@ -136,9 +136,18 @@ pub async fn run_user_ws_task(
         // Track size_matched per order_id — delta = fill
         let mut order_matched: HashMap<String, f64> = HashMap::new();
         let mut events_received: u64 = 0;
+        let user_connect_time = chrono::Utc::now().timestamp();
+        let user_max_connection_secs: i64 = 600; // forced reconnect every 10 min
 
-        // Reader loop with market change detection
+        // Reader loop with market change detection + forced reconnect
         loop {
+            // Forced reconnect every 10 minutes
+            let now_secs = chrono::Utc::now().timestamp();
+            if now_secs - user_connect_time >= user_max_connection_secs {
+                info!("user_ws: FORCED RECONNECT after {}s", now_secs - user_connect_time);
+                break;
+            }
+
             tokio::select! {
                 // Watch for market window change
                 _ = market_rx.changed() => {
