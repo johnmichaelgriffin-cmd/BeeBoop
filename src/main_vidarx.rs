@@ -595,9 +595,9 @@ async fn run_vidarx_strategy(
                     if raw_size < 5.0 { continue; } // skip — below venue minimum, don't force to 5
                     let size = raw_size;
                     let price = match level {
-                        0 => cheap_bid - 2.0 * cheap_tick, // L1: bid - 2c
-                        1 => cheap_bid - 3.0 * cheap_tick, // L2: bid - 3c
-                        _ => cheap_bid - 4.0 * cheap_tick, // L3: bid - 4c
+                        0 => cheap_bid - 3.0 * cheap_tick, // L1: bid - 3c
+                        1 => cheap_bid - 4.0 * cheap_tick, // L2: bid - 4c
+                        _ => cheap_bid - 5.0 * cheap_tick, // L3: bid - 5c
                     };
                     // Round price to tick size
                     let price = (price / cheap_tick).round() * cheap_tick;
@@ -631,9 +631,9 @@ async fn run_vidarx_strategy(
                     if raw_size < 5.0 { continue; } // skip — below venue minimum
                     let size = raw_size;
                     let price = match level {
-                        0 => exp_bid - 2.0 * exp_tick + exp_skew, // L1: bid - 2c
-                        1 => exp_bid - 3.0 * exp_tick + exp_skew, // L2: bid - 3c
-                        _ => exp_bid - 4.0 * exp_tick + exp_skew, // L3: bid - 4c
+                        0 => exp_bid - 3.0 * exp_tick + exp_skew, // L1: bid - 3c
+                        1 => exp_bid - 4.0 * exp_tick + exp_skew, // L2: bid - 4c
+                        _ => exp_bid - 5.0 * exp_tick + exp_skew, // L3: bid - 5c
                     };
                     let price = (price / exp_tick).round() * exp_tick;
 
