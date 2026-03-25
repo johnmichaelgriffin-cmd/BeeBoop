@@ -551,11 +551,9 @@ async fn run_vidarx_strategy(
                 // Graduated pcost shift — worse pair cost = deeper bids
                 let pcost_extra_shift = if matched > 10.0 {
                     if live_pair_cost > 1.00 { 6.0 }
-                    else if live_pair_cost > 0.99 { 5.0 }
-                    else if live_pair_cost > 0.98 { 4.0 }
-                    else if live_pair_cost > 0.97 { 3.0 }
-                    else if live_pair_cost > 0.96 { 2.0 }
-                    else if live_pair_cost > 0.95 { 1.0 }
+                    else if live_pair_cost > 0.99 { 3.0 }
+                    else if live_pair_cost > 0.98 { 2.0 }
+                    else if live_pair_cost > 0.97 { 1.0 }
                     else { 0.0 }
                 } else { 0.0 };
 
