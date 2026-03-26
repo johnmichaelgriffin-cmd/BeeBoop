@@ -78,7 +78,7 @@ pub async fn run_executor_task(
                 let start = Instant::now();
 
                 let result = if let Some((ref cli, ref signer)) = client {
-                    execute_fok_buy(cli, signer, &token_id, config.share_base, max_price).await
+                    execute_fok_buy(cli, signer, &token_id, notional, max_price).await
                 } else {
                     // Dry run
                     let shares = notional / max_price;
