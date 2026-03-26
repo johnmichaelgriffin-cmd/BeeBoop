@@ -98,6 +98,22 @@ path = "src/main_vidarx.rs"
 name = "beeboop-v3-eth"
 path = "src/main_vidarx_eth.rs"
 
+[[bin]]
+name = "lockprofit-eth"
+path = "src/main_lockprofit_eth.rs"
+
+[[bin]]
+name = "lockprofit-sol"
+path = "src/main_lockprofit_sol.rs"
+
+[[bin]]
+name = "lockprofit-xrp"
+path = "src/main_lockprofit_xrp.rs"
+
+[[bin]]
+name = "lockprofit-bnb"
+path = "src/main_lockprofit_bnb.rs"
+
 [profile.release]
 opt-level = 3
 lto = true

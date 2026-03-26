@@ -26,6 +26,8 @@ pub async fn run_market_discovery_task(
         "btc" => "btc-updown-5m",
         "eth" => "eth-updown-5m",
         "sol" => "sol-updown-5m",
+        "xrp" => "xrp-updown-5m",
+        "bnb" => "bnb-updown-5m",
         _ => "btc-updown-5m",
     };
 
