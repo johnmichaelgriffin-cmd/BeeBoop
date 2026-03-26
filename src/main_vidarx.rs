@@ -185,23 +185,26 @@ async fn run_vidarx_strategy(
 
     // Per-window state
     let mut last_window_ts: i64 = 0;
-    let mut pair_done = false;          // true once FULLY done (GTC filled or stop-loss triggered)
+    let mut pair_done = false;          // true once FULLY matched or stop-loss
     let mut exp_fill_price: f64 = 0.0;  // what we paid for the expensive side
-    let mut exp_fill_shares: f64 = 0.0;
-    let mut cheap_gtc_posted = false;    // have we posted the cheap GTC?
-    let mut watching_for_flip = false;   // monitoring cheap side for 60c flip
-    let mut cheap_token_id: String = String::new();  // which token the GTC is on
+    let mut exp_fill_shares: f64 = 0.0; // ACTUAL shares filled on expensive side (from executor)
+    let mut cheap_gtc_posted = false;
+    let mut watching_for_flip = false;
+    let mut cheap_token_id: String = String::new();
     let mut cheap_side_saved: Option<Side> = None;
+    let mut cheap_gtc_order_id: String = String::new(); // #3: track the specific GTC order
+    let mut cheap_shares_filled: f64 = 0.0; // shares filled on cheap side specifically
     let mut up_shares: f64 = 0.0;
     let mut dn_shares: f64 = 0.0;
     let mut up_cost: f64 = 0.0;
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
     let mut last_signal: Option<Signal> = None;
-    let mut force_buy_sent = false;      // prevent double force-buy
+    let mut force_buy_sent = false;
 
-    let target_profit_per_pair = 0.95;   // buy both sides for 95c total → 5c profit
-    let momentum_gate = 0.55;            // wait for one side to hit 55c
+    let target_profit_per_pair = 0.95;
+    let momentum_gate = 0.55;
+    let match_threshold = 0.90; // #1: pair_done when cheap fills >= 90% of exp fills
 
     // ═══ AUTO-SCALING ═══
     // Track lockprofit success over rolling 30-window batches.
@@ -278,6 +281,8 @@ async fn run_vidarx_strategy(
                 watching_for_flip = false;
                 cheap_token_id.clear();
                 cheap_side_saved = None;
+                cheap_gtc_order_id.clear();
+                cheap_shares_filled = 0.0;
                 both_legs_filled_this_window = false;
                 last_signal = None;
                 force_buy_sent = false;
@@ -305,6 +310,7 @@ async fn run_vidarx_strategy(
                 match evt {
                     ExecutionEvent::EntryFilled { side, filled_price, filled_size, .. } => {
                         // TRUST THE EXECUTOR — count these shares immediately
+                        // This is the EXPENSIVE side FOK fill
                         match side {
                             Side::Up => {
                                 up_shares += filled_size;
@@ -316,15 +322,24 @@ async fn run_vidarx_strategy(
                             }
                         }
                         fills_this_window += 1;
-                        let side_label = if side == Side::Up { "UP" } else { "DN" };
-                        info!(">>> EXECUTOR FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0}",
-                            side_label, filled_size, filled_price, up_shares, dn_shares);
 
-                        // Check if both sides now have shares → lockprofit complete
-                        if up_shares > 0.0 && dn_shares > 0.0 {
+                        // #4: Record ACTUAL exp fill size for matching threshold
+                        if exp_fill_shares == 0.0 || (exp_fill_price > 0.0 && filled_price >= 0.50) {
+                            exp_fill_shares = filled_size;
+                            exp_fill_price = filled_price;
+                        }
+
+                        let side_label = if side == Side::Up { "UP" } else { "DN" };
+                        info!(">>> EXECUTOR FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} | exp_actual={:.1}sh",
+                            side_label, filled_size, filled_price, up_shares, dn_shares, exp_fill_shares);
+
+                        // #1: Check matched threshold — not just "both > 0"
+                        let matched = up_shares.min(dn_shares);
+                        if exp_fill_shares > 0.0 && matched >= exp_fill_shares * match_threshold {
                             both_legs_filled_this_window = true;
-                            if watching_for_flip {
-                                info!(">>> LOCKPROFIT COMPLETE (from executor) — both legs filled");
+                            if watching_for_flip && !pair_done {
+                                info!(">>> LOCKPROFIT COMPLETE (executor): matched={:.1} >= {:.1} threshold",
+                                    matched, exp_fill_shares * match_threshold);
                                 watching_for_flip = false;
                                 pair_done = true;
                                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
@@ -333,22 +348,34 @@ async fn run_vidarx_strategy(
                             }
                         }
                     }
+                    // #3: Capture cheap GTC order_id when posted
+                    ExecutionEvent::MakerOrderPosted { order_id, ladder_key, .. } => {
+                        if ladder_key == "lockprofit_cheap" {
+                            cheap_gtc_order_id = order_id.clone();
+                            info!(">>> CHEAP GTC TRACKED: order_id={}", &order_id[..16.min(order_id.len())]);
+                        }
+                    }
                     _ => {}
                 }
             }
 
-            // Track GTC fills from user WS (FOK fills already counted from executor)
+            // #3: Track ONLY cheap GTC fills from user WS — filter by order_id
             Some(fill) = fill_rx.recv() => {
                 let market = market_rx.borrow().clone();
                 let is_up = fill.asset_id == market.up_token_id;
                 let is_dn = fill.asset_id == market.down_token_id;
                 if !is_up && !is_dn { continue; }
                 if fill.side != "BUY" { continue; }
-
-                // Only count GTC fills (ORDER_UPDATE) — FOK fills already counted from executor
-                // This prevents double-counting the same FOK fill
                 if fill.status != "ORDER_UPDATE" { continue; }
 
+                // #3: ONLY count fills for our specific cheap GTC order
+                // This prevents counting FOK order updates or random other fills
+                if cheap_gtc_order_id.is_empty() || fill.order_id != cheap_gtc_order_id {
+                    continue; // not our cheap GTC — skip
+                }
+
+                // This IS our cheap GTC fill
+                cheap_shares_filled += fill.size;
                 fills_this_window += 1;
                 if is_up {
                     up_shares += fill.size;
@@ -359,14 +386,17 @@ async fn run_vidarx_strategy(
                 }
 
                 let side_label = if is_up { "UP" } else { "DN" };
-                info!(">>> GTC FILL (user_ws): {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0}",
-                    side_label, fill.size, fill.price, up_shares, dn_shares);
+                info!(">>> CHEAP GTC FILL: {} {:.1}sh @ {:.2} | cheap_filled={:.1}/{:.1} | UP={:.0} DN={:.0}",
+                    side_label, fill.size, fill.price,
+                    cheap_shares_filled, exp_fill_shares,
+                    up_shares, dn_shares);
 
-                // Check if both legs now have fills → lockprofit complete
-                if up_shares > 0.0 && dn_shares > 0.0 {
+                // #1: Check matched threshold — cheap fills >= 90% of exp fills
+                if exp_fill_shares > 0.0 && cheap_shares_filled >= exp_fill_shares * match_threshold {
                     both_legs_filled_this_window = true;
                     if watching_for_flip && !pair_done {
-                        info!(">>> LOCKPROFIT COMPLETE (from GTC fill) — both legs filled");
+                        info!(">>> LOCKPROFIT COMPLETE (GTC): cheap={:.1} >= {:.1} threshold",
+                            cheap_shares_filled, exp_fill_shares * match_threshold);
                         watching_for_flip = false;
                         pair_done = true;
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
@@ -477,17 +507,19 @@ async fn run_vidarx_strategy(
                         // Round to 2 decimal places
                         let cheap_bid_price = (cheap_bid_price * 100.0).round() / 100.0;
 
-                        info!(">>> GTC BID: {} {:.0}sh @ {:.0}c (lockprofit: 95c - {:.0}c = {:.0}c)",
+                        // #4: GTC size matches estimated exp fill (floor(base * ask))
+                        let est_exp_shares = (shares_per_leg * exp_ask).floor().max(5.0);
+                        info!(">>> GTC BID: {} {:.0}sh @ {:.0}c (lockprofit: 95c - {:.0}c = {:.0}c) [exp est={:.0}sh]",
                             if cheap_side == Side::Up { "UP" } else { "DN" },
-                            shares_per_leg, cheap_bid_price * 100.0,
-                            exp_ask * 100.0, cheap_bid_price * 100.0);
+                            est_exp_shares, cheap_bid_price * 100.0,
+                            exp_ask * 100.0, cheap_bid_price * 100.0, est_exp_shares);
 
                         let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                             market_slug: market.slug.clone(),
                             token_id: cheap_token.clone(),
                             side: cheap_side,
                             price: cheap_bid_price,
-                            size: shares_per_leg,
+                            size: est_exp_shares, // match the estimated exp fill size
                             post_only: true,
                             ladder_key: "lockprofit_cheap".into(),
                             was_cheap: true,
