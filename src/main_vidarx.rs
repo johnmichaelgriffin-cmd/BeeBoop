@@ -300,16 +300,54 @@ async fn run_vidarx_strategy(
                 last_signal = Some(signal);
             }
 
-            // Drain executor events
-            Some(_evt) = exec_evt_rx.recv() => {}
+            // Process executor events — trust FOK fills immediately
+            Some(evt) = exec_evt_rx.recv() => {
+                match evt {
+                    ExecutionEvent::EntryFilled { side, filled_price, filled_size, .. } => {
+                        // TRUST THE EXECUTOR — count these shares immediately
+                        match side {
+                            Side::Up => {
+                                up_shares += filled_size;
+                                up_cost += filled_size * filled_price;
+                            }
+                            Side::Down => {
+                                dn_shares += filled_size;
+                                dn_cost += filled_size * filled_price;
+                            }
+                        }
+                        fills_this_window += 1;
+                        let side_label = if side == Side::Up { "UP" } else { "DN" };
+                        info!(">>> EXECUTOR FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0}",
+                            side_label, filled_size, filled_price, up_shares, dn_shares);
 
-            // Track fills from user WS
+                        // Check if both sides now have shares → lockprofit complete
+                        if up_shares > 0.0 && dn_shares > 0.0 {
+                            both_legs_filled_this_window = true;
+                            if watching_for_flip {
+                                info!(">>> LOCKPROFIT COMPLETE (from executor) — both legs filled");
+                                watching_for_flip = false;
+                                pair_done = true;
+                                let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                                    reason: "lockprofit_complete".into(),
+                                }).await;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            // Track GTC fills from user WS (FOK fills already counted from executor)
             Some(fill) = fill_rx.recv() => {
                 let market = market_rx.borrow().clone();
                 let is_up = fill.asset_id == market.up_token_id;
                 let is_dn = fill.asset_id == market.down_token_id;
                 if !is_up && !is_dn { continue; }
                 if fill.side != "BUY" { continue; }
+
+                // Only count GTC fills (ORDER_UPDATE) — FOK fills already counted from executor
+                // This prevents double-counting the same FOK fill
+                if fill.status != "ORDER_UPDATE" { continue; }
 
                 fills_this_window += 1;
                 if is_up {
@@ -321,19 +359,21 @@ async fn run_vidarx_strategy(
                 }
 
                 let side_label = if is_up { "UP" } else { "DN" };
-                let matched = up_shares.min(dn_shares);
-                let pair_cost = if matched > 0.0 {
-                    (up_cost / up_shares.max(0.001)) + (dn_cost / dn_shares.max(0.001))
-                } else { 0.0 };
+                info!(">>> GTC FILL (user_ws): {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0}",
+                    side_label, fill.size, fill.price, up_shares, dn_shares);
 
-                // Check if both legs now have fills
+                // Check if both legs now have fills → lockprofit complete
                 if up_shares > 0.0 && dn_shares > 0.0 {
                     both_legs_filled_this_window = true;
+                    if watching_for_flip && !pair_done {
+                        info!(">>> LOCKPROFIT COMPLETE (from GTC fill) — both legs filled");
+                        watching_for_flip = false;
+                        pair_done = true;
+                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                            reason: "lockprofit_complete".into(),
+                        }).await;
+                    }
                 }
-
-                info!(">>> FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c | fills={} | locked={}",
-                    side_label, fill.size, fill.price,
-                    up_shares, dn_shares, matched, pair_cost * 100.0, fills_this_window, both_legs_filled_this_window);
             }
 
             // Heartbeat
