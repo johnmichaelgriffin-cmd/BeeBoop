@@ -86,9 +86,7 @@ async fn main() -> Result<()> {
 
     // 2. Binance feed — ETH
     tokio::spawn(feeds::binance::run_binance_feed_task_for(
-        "ethusdt",
-        binance_tx.clone(),
-        log_tx.clone(),
+        "ethusdt", binance_tx.clone(), log_tx.clone(),
     ));
 
     // 3. Polymarket WebSocket — ride or die, no REST fallback
@@ -101,10 +99,7 @@ async fn main() -> Result<()> {
 
     // 4. RTDS / Chainlink — ETH
     tokio::spawn(feeds::rtds::run_rtds_task_for(
-        "eth/usd",
-        chainlink_tx,
-        chainlink_watch_tx,
-        log_tx.clone(),
+        "eth/usd", chainlink_tx, chainlink_watch_tx, log_tx.clone(),
     ));
 
     // 4b. User WebSocket — authenticated feed for fill tracking
@@ -187,10 +182,13 @@ async fn run_vidarx_strategy(
 
     // Per-window state
     let mut last_window_ts: i64 = 0;
-    let mut pair_done = false;          // true once we've placed both legs
+    let mut pair_done = false;          // true once FULLY done (GTC filled or stop-loss triggered)
     let mut exp_fill_price: f64 = 0.0;  // what we paid for the expensive side
     let mut exp_fill_shares: f64 = 0.0;
     let mut cheap_gtc_posted = false;    // have we posted the cheap GTC?
+    let mut watching_for_flip = false;   // monitoring cheap side for 60c flip
+    let mut cheap_token_id: String = String::new();  // which token the GTC is on
+    let mut cheap_side_saved: Option<Side> = None;
     let mut up_shares: f64 = 0.0;
     let mut dn_shares: f64 = 0.0;
     let mut up_cost: f64 = 0.0;
@@ -203,7 +201,7 @@ async fn run_vidarx_strategy(
     // ═══ AUTO-SCALING ═══
     // Track lockprofit success over rolling 30-window batches.
     // If >=27/30 lock successfully, scale up +20sh. If <27/30, scale back down.
-    let mut shares_per_leg: f64 = 20.0;
+    let mut shares_per_leg: f64 = 40.0;
     let min_shares: f64 = 20.0;
     let scale_window_batch: usize = 30;
     let scale_success_threshold: usize = 27; // 90% success rate to scale up
@@ -272,6 +270,9 @@ async fn run_vidarx_strategy(
                 exp_fill_price = 0.0;
                 exp_fill_shares = 0.0;
                 cheap_gtc_posted = false;
+                watching_for_flip = false;
+                cheap_token_id.clear();
+                cheap_side_saved = None;
                 both_legs_filled_this_window = false;
                 last_window_ts = market.window_start_ts;
 
@@ -422,13 +423,66 @@ async fn run_vidarx_strategy(
                         }).await;
 
                         cheap_gtc_posted = true;
-                        pair_done = true; // done for this window — GTC rests until filled or window ends
-                        info!(">>> PAIR LOCKED: exp {:.0}c + cheap bid {:.0}c = {:.0}c target | holding to resolution",
+                        watching_for_flip = true; // NOT pair_done — watch for GTC fill or flip
+                        cheap_token_id = cheap_token.clone();
+                        cheap_side_saved = Some(cheap_side);
+                        info!(">>> GTC POSTED + WATCHING: exp {:.0}c + cheap bid {:.0}c = {:.0}c target | watching for fill or flip",
                             exp_ask * 100.0, cheap_bid_price * 100.0,
                             (exp_ask + cheap_bid_price) * 100.0);
                     } else {
                         warn!(">>> CHEAP BID PRICE {:.2} out of range — skipping cheap leg", cheap_bid_price);
-                        pair_done = true; // still done, just holding the expensive side
+                        pair_done = true;
+                    }
+                }
+
+                // ═══ STEP 3: FLIP DETECTION — if cheap side surges to 60c, stop-loss buy it ═══
+                if watching_for_flip && !pair_done {
+                    // Check if the cheap side's ask has surged to 60c+
+                    let cheap_ask_now = if cheap_side_saved == Some(Side::Up) { up_ask } else { dn_ask };
+
+                    if cheap_ask_now >= momentum_gate {
+                        // FLIP! The "cheap" side is now expensive too. Stop-loss buy it.
+                        warn!(">>> FLIP DETECTED: cheap side ask={:.0}c >= 60c — STOP-LOSS FOK BUY",
+                            cheap_ask_now * 100.0);
+
+                        // Cancel the resting GTC
+                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                            reason: "flip_stop_loss".into(),
+                        }).await;
+
+                        // FOK buy the cheap side at market to limit loss
+                        let stop_side = cheap_side_saved.unwrap_or(Side::Down);
+                        let _ = exec_cmd_tx.send(ExecutionCommand::EnterTaker {
+                            market_slug: market.slug.clone(),
+                            token_id: cheap_token_id.clone(),
+                            side: stop_side,
+                            max_price: cheap_ask_now,
+                            notional: shares_per_leg,
+                            signal: Signal {
+                                created_ts_ms: now_ms,
+                                side: stop_side,
+                                entry_mode: EntryMode::Taker,
+                                r200_bps: 0.0, r500_bps: 0.0, r800_bps: 0.0, r2000_bps: 0.0,
+                                fast_move_bps: 0.0, raw_basis_bps: 0.0, basis_dev_bps: 0.0,
+                                dbasis_bps: 0.0, obi_ema: 0.0, score: 0.0, confidence: 0.0,
+                                strong_contradiction: false,
+                            },
+                        }).await;
+
+                        let est_loss = exp_fill_price + cheap_ask_now - 1.0;
+                        warn!(">>> STOP-LOSS: exp {:.0}c + cheap FOK {:.0}c = {:.0}c | est loss ~{:.0}c/pair",
+                            exp_fill_price * 100.0, cheap_ask_now * 100.0,
+                            (exp_fill_price + cheap_ask_now) * 100.0, est_loss * 100.0);
+
+                        watching_for_flip = false;
+                        pair_done = true;
+                    }
+
+                    // Also check: if the GTC filled (both sides have shares), we're done
+                    if up_shares > 0.0 && dn_shares > 0.0 && !pair_done {
+                        info!(">>> GTC FILLED — both legs complete, lockprofit done");
+                        watching_for_flip = false;
+                        pair_done = true;
                     }
                 }
             }
