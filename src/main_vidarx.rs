@@ -427,8 +427,8 @@ async fn run_vidarx_strategy(
 
                 let elapsed_s = (now_ms / 1000) - market.window_start_ts;
 
-                // Wait for T+10s
-                if elapsed_s < 10 { continue; }
+                // Wait for T+35s — let the window establish itself
+                if elapsed_s < 35 { continue; }
                 // Stop at T+240s
                 if elapsed_s >= 240 { continue; }
 
