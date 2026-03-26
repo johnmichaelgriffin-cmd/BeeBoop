@@ -197,9 +197,10 @@ async fn run_vidarx_strategy(
     let mut up_cost: f64 = 0.0;
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
+    let mut last_signal: Option<Signal> = None;
 
     let target_profit_per_pair = 0.95;   // buy both sides for 95c total → 5c profit
-    let momentum_gate = 0.60;            // wait for one side to hit 60c
+    let momentum_gate = 0.55;            // wait for one side to hit 55c
 
     // ═══ AUTO-SCALING ═══
     // Track lockprofit success over rolling 30-window batches.
@@ -277,6 +278,7 @@ async fn run_vidarx_strategy(
                 cheap_token_id.clear();
                 cheap_side_saved = None;
                 both_legs_filled_this_window = false;
+                last_signal = None;
                 last_window_ts = market.window_start_ts;
 
                 // Cancel leftover GTC from previous window
@@ -291,8 +293,10 @@ async fn run_vidarx_strategy(
         }
 
         tokio::select! {
-            // Drain signals (we don't use them for lockprofit, but need to drain the channel)
-            Some(_signal) = signal_rx.recv() => {}
+            // Save latest signal for confirmation logic
+            Some(signal) = signal_rx.recv() => {
+                last_signal = Some(signal);
+            }
 
             // Drain executor events
             Some(_evt) = exec_evt_rx.recv() => {}
@@ -333,11 +337,12 @@ async fn run_vidarx_strategy(
             // Heartbeat
             _ = heartbeat_interval.tick() => {
                 let top = pm_top_rx.borrow().clone();
-                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pair_done={} locked={} | {:.0}sh/leg | batch {}/{}",
+                let sig_info = last_signal.as_ref().map_or("none".into(), |s| format!("{:.2}", s.score));
+                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pair_done={} locked={} | {:.0}sh/leg | signal={} | batch {}/{}",
                     top.up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
                     top.down_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
                     up_shares, dn_shares, pair_done, both_legs_filled_this_window,
-                    shares_per_leg, window_results.len(), scale_window_batch);
+                    shares_per_leg, sig_info, window_results.len(), scale_window_batch);
             }
 
             // ═══ MAIN STRATEGY LOOP — every 500ms ═══
@@ -362,7 +367,7 @@ async fn run_vidarx_strategy(
                     _ => continue,
                 };
 
-                // ═══ STEP 1: Wait for momentum (60c on one side) ═══
+                // ═══ STEP 1: Wait for 55c momentum + strong signal confirmation ═══
                 if exp_fill_price == 0.0 {
                     // Determine which side is expensive
                     let (exp_side, exp_ask, exp_token, cheap_token, cheap_side) = if up_ask >= dn_ask {
@@ -371,15 +376,36 @@ async fn run_vidarx_strategy(
                         (Side::Down, dn_ask, &market.down_token_id, &market.up_token_id, Side::Up)
                     };
 
-                    // Momentum gate: expensive side must be >= 60c
+                    // Momentum gate: expensive side must be >= 55c
                     if exp_ask < momentum_gate {
                         continue; // not ready yet
                     }
 
-                    // FOK BUY 20sh of expensive side at 99c
-                    info!(">>> MOMENTUM HIT: {} ask={:.0}c — FOK BUY {:.0}sh @ 99c",
+                    // Signal confirmation: signal must agree with the expensive side
+                    // UP expensive → signal must be bullish (score > 0)
+                    // DN expensive → signal must be bearish (score < 0)
+                    let signal_agrees = match &last_signal {
+                        Some(sig) => {
+                            let strong_enough = sig.score.abs() >= 0.45; // at least medium strength
+                            let direction_match = match exp_side {
+                                Side::Up => sig.score > 0.0,   // bullish signal for UP expensive
+                                Side::Down => sig.score < 0.0, // bearish signal for DN expensive
+                            };
+                            strong_enough && direction_match
+                        }
+                        None => false, // no signal yet
+                    };
+
+                    if !signal_agrees {
+                        continue; // wait for signal confirmation
+                    }
+
+                    let sig_score = last_signal.as_ref().map_or(0.0, |s| s.score);
+
+                    // FOK BUY expensive side at 99c
+                    info!(">>> SIGNAL CONFIRMED: {} ask={:.0}c score={:.2} — FOK BUY {:.0}sh @ 99c",
                         if exp_side == Side::Up { "UP" } else { "DN" },
-                        exp_ask * 100.0, shares_per_leg);
+                        exp_ask * 100.0, sig_score, shares_per_leg);
 
                     let _ = exec_cmd_tx.send(ExecutionCommand::EnterTaker {
                         market_slug: market.slug.clone(),
