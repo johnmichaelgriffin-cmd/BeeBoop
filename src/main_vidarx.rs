@@ -198,6 +198,7 @@ async fn run_vidarx_strategy(
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
     let mut last_signal: Option<Signal> = None;
+    let mut force_buy_sent = false;      // prevent double force-buy
 
     let target_profit_per_pair = 0.95;   // buy both sides for 95c total → 5c profit
     let momentum_gate = 0.55;            // wait for one side to hit 55c
@@ -279,6 +280,7 @@ async fn run_vidarx_strategy(
                 cheap_side_saved = None;
                 both_legs_filled_this_window = false;
                 last_signal = None;
+                force_buy_sent = false;
                 last_window_ts = market.window_start_ts;
 
                 // Cancel leftover GTC from previous window
@@ -465,16 +467,20 @@ async fn run_vidarx_strategy(
                 }
 
                 // ═══ STEP 3: WATCH FOR GTC FILL, FLIP STOP-LOSS, OR T+210 FORCE BUY ═══
-                if watching_for_flip && !pair_done {
+                if watching_for_flip && !pair_done && !force_buy_sent {
                     // First: check if GTC already filled (both sides have shares)
                     if up_shares > 0.0 && dn_shares > 0.0 {
-                        info!(">>> GTC FILLED — both legs complete, lockprofit done");
+                        info!(">>> LOCKPROFIT COMPLETE — both legs filled, done for this window");
                         watching_for_flip = false;
                         pair_done = true;
+                        // Cancel any remaining GTC just in case
+                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                            reason: "lockprofit_complete".into(),
+                        }).await;
                     }
 
-                    // Only do flip detection / force buy AFTER T+210s
-                    if !pair_done && elapsed_s >= 210 {
+                    // Only do flip detection / force buy AFTER T+210s AND only if not already done
+                    if !pair_done && !force_buy_sent && elapsed_s >= 210 {
                         let cheap_ask_now = if cheap_side_saved == Some(Side::Up) { up_ask } else { dn_ask };
 
                         // FLIP: cheap side surged to 60c+ → stop-loss buy
@@ -513,15 +519,18 @@ async fn run_vidarx_strategy(
 
                             watching_for_flip = false;
                             pair_done = true;
+                            force_buy_sent = true;
                         }
                     }
 
-                    // T+210 FORCE BUY: if GTC hasn't filled by T+210, buy cheap at market
-                    if !pair_done && elapsed_s >= 210 && !(up_shares > 0.0 && dn_shares > 0.0) {
+                    // T+210 FORCE BUY: ONLY if cheap side has flipped expensive (>=55c)
+                    // If cheap side is still cheap, the GTC is probably working — leave it alone
+                    if !pair_done && !force_buy_sent && elapsed_s >= 210 && !(up_shares > 0.0 && dn_shares > 0.0) {
                         let cheap_ask_now = if cheap_side_saved == Some(Side::Up) { up_ask } else { dn_ask };
 
-                        // Only force buy if cheap side is still actually cheap (< 60c)
-                        if cheap_ask_now < momentum_gate {
+                        // Only force buy if cheap side has become expensive (market flipped)
+                        // If it's still cheap, the GTC should fill eventually — don't double-buy
+                        if cheap_ask_now >= momentum_gate {
                             info!(">>> T+210 FORCE BUY: GTC unfilled, cheap ask={:.0}c — FOK buying to match",
                                 cheap_ask_now * 100.0);
 
@@ -555,6 +564,7 @@ async fn run_vidarx_strategy(
 
                             watching_for_flip = false;
                             pair_done = true;
+                            force_buy_sent = true;
                         }
                     }
                 }
