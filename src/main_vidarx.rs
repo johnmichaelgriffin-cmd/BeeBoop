@@ -438,54 +438,98 @@ async fn run_vidarx_strategy(
                     }
                 }
 
-                // ═══ STEP 3: FLIP DETECTION — if cheap side surges to 60c, stop-loss buy it ═══
+                // ═══ STEP 3: WATCH FOR GTC FILL, FLIP STOP-LOSS, OR T+210 FORCE BUY ═══
                 if watching_for_flip && !pair_done {
-                    // Check if the cheap side's ask has surged to 60c+
-                    let cheap_ask_now = if cheap_side_saved == Some(Side::Up) { up_ask } else { dn_ask };
-
-                    if cheap_ask_now >= momentum_gate {
-                        // FLIP! The "cheap" side is now expensive too. Stop-loss buy it.
-                        warn!(">>> FLIP DETECTED: cheap side ask={:.0}c >= 60c — STOP-LOSS FOK BUY",
-                            cheap_ask_now * 100.0);
-
-                        // Cancel the resting GTC
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "flip_stop_loss".into(),
-                        }).await;
-
-                        // FOK buy the cheap side at market to limit loss
-                        let stop_side = cheap_side_saved.unwrap_or(Side::Down);
-                        let _ = exec_cmd_tx.send(ExecutionCommand::EnterTaker {
-                            market_slug: market.slug.clone(),
-                            token_id: cheap_token_id.clone(),
-                            side: stop_side,
-                            max_price: cheap_ask_now,
-                            notional: shares_per_leg,
-                            signal: Signal {
-                                created_ts_ms: now_ms,
-                                side: stop_side,
-                                entry_mode: EntryMode::Taker,
-                                r200_bps: 0.0, r500_bps: 0.0, r800_bps: 0.0, r2000_bps: 0.0,
-                                fast_move_bps: 0.0, raw_basis_bps: 0.0, basis_dev_bps: 0.0,
-                                dbasis_bps: 0.0, obi_ema: 0.0, score: 0.0, confidence: 0.0,
-                                strong_contradiction: false,
-                            },
-                        }).await;
-
-                        let est_loss = exp_fill_price + cheap_ask_now - 1.0;
-                        warn!(">>> STOP-LOSS: exp {:.0}c + cheap FOK {:.0}c = {:.0}c | est loss ~{:.0}c/pair",
-                            exp_fill_price * 100.0, cheap_ask_now * 100.0,
-                            (exp_fill_price + cheap_ask_now) * 100.0, est_loss * 100.0);
-
+                    // First: check if GTC already filled (both sides have shares)
+                    if up_shares > 0.0 && dn_shares > 0.0 {
+                        info!(">>> GTC FILLED — both legs complete, lockprofit done");
                         watching_for_flip = false;
                         pair_done = true;
                     }
 
-                    // Also check: if the GTC filled (both sides have shares), we're done
-                    if up_shares > 0.0 && dn_shares > 0.0 && !pair_done {
-                        info!(">>> GTC FILLED — both legs complete, lockprofit done");
-                        watching_for_flip = false;
-                        pair_done = true;
+                    // Only do flip detection / force buy AFTER T+210s
+                    if !pair_done && elapsed_s >= 210 {
+                        let cheap_ask_now = if cheap_side_saved == Some(Side::Up) { up_ask } else { dn_ask };
+
+                        // FLIP: cheap side surged to 60c+ → stop-loss buy
+                        if cheap_ask_now >= momentum_gate {
+                            warn!(">>> FLIP DETECTED at T+{}s: cheap ask={:.0}c >= 60c — STOP-LOSS FOK",
+                                elapsed_s, cheap_ask_now * 100.0);
+
+                            // Cancel the resting GTC first
+                            let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                                reason: "flip_stop_loss".into(),
+                            }).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                            let stop_side = cheap_side_saved.unwrap_or(Side::Down);
+                            let _ = exec_cmd_tx.send(ExecutionCommand::EnterTaker {
+                                market_slug: market.slug.clone(),
+                                token_id: cheap_token_id.clone(),
+                                side: stop_side,
+                                max_price: cheap_ask_now,
+                                notional: shares_per_leg,
+                                signal: Signal {
+                                    created_ts_ms: now_ms,
+                                    side: stop_side,
+                                    entry_mode: EntryMode::Taker,
+                                    r200_bps: 0.0, r500_bps: 0.0, r800_bps: 0.0, r2000_bps: 0.0,
+                                    fast_move_bps: 0.0, raw_basis_bps: 0.0, basis_dev_bps: 0.0,
+                                    dbasis_bps: 0.0, obi_ema: 0.0, score: 0.0, confidence: 0.0,
+                                    strong_contradiction: false,
+                                },
+                            }).await;
+
+                            let est_loss = exp_fill_price + cheap_ask_now - 1.0;
+                            warn!(">>> STOP-LOSS: exp {:.0}c + cheap FOK {:.0}c = {:.0}c | est loss ~{:.0}c/pair",
+                                exp_fill_price * 100.0, cheap_ask_now * 100.0,
+                                (exp_fill_price + cheap_ask_now) * 100.0, est_loss * 100.0);
+
+                            watching_for_flip = false;
+                            pair_done = true;
+                        }
+                    }
+
+                    // T+210 FORCE BUY: if GTC hasn't filled by T+210, buy cheap at market
+                    if !pair_done && elapsed_s >= 210 && !(up_shares > 0.0 && dn_shares > 0.0) {
+                        let cheap_ask_now = if cheap_side_saved == Some(Side::Up) { up_ask } else { dn_ask };
+
+                        // Only force buy if cheap side is still actually cheap (< 60c)
+                        if cheap_ask_now < momentum_gate {
+                            info!(">>> T+210 FORCE BUY: GTC unfilled, cheap ask={:.0}c — FOK buying to match",
+                                cheap_ask_now * 100.0);
+
+                            // Cancel resting GTC
+                            let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                                reason: "force_match_t210".into(),
+                            }).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                            let stop_side = cheap_side_saved.unwrap_or(Side::Down);
+                            let _ = exec_cmd_tx.send(ExecutionCommand::EnterTaker {
+                                market_slug: market.slug.clone(),
+                                token_id: cheap_token_id.clone(),
+                                side: stop_side,
+                                max_price: cheap_ask_now,
+                                notional: shares_per_leg,
+                                signal: Signal {
+                                    created_ts_ms: now_ms,
+                                    side: stop_side,
+                                    entry_mode: EntryMode::Taker,
+                                    r200_bps: 0.0, r500_bps: 0.0, r800_bps: 0.0, r2000_bps: 0.0,
+                                    fast_move_bps: 0.0, raw_basis_bps: 0.0, basis_dev_bps: 0.0,
+                                    dbasis_bps: 0.0, obi_ema: 0.0, score: 0.0, confidence: 0.0,
+                                    strong_contradiction: false,
+                                },
+                            }).await;
+
+                            let est_cost = exp_fill_price + cheap_ask_now;
+                            info!(">>> FORCE MATCH: exp {:.0}c + cheap FOK {:.0}c = {:.0}c",
+                                exp_fill_price * 100.0, cheap_ask_now * 100.0, est_cost * 100.0);
+
+                            watching_for_flip = false;
+                            pair_done = true;
+                        }
                     }
                 }
             }
