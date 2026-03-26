@@ -197,7 +197,17 @@ async fn run_vidarx_strategy(
 
     let target_profit_per_pair = 0.95;   // buy both sides for 95c total → 5c profit
     let momentum_gate = 0.60;            // wait for one side to hit 60c
-    let shares_per_leg = 20.0;
+
+    // ═══ AUTO-SCALING ═══
+    // Track lockprofit success over rolling 30-window batches.
+    // If >=27/30 lock successfully, scale up +20sh. If <27/30, scale back down.
+    let mut shares_per_leg: f64 = 20.0;
+    let min_shares: f64 = 20.0;
+    let scale_window_batch: usize = 30;
+    let scale_success_threshold: usize = 27; // 90% success rate to scale up
+    let scale_step: f64 = 20.0;
+    let mut window_results: std::collections::VecDeque<bool> = std::collections::VecDeque::new(); // true = both legs filled
+    let mut both_legs_filled_this_window = false;
 
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
@@ -206,20 +216,53 @@ async fn run_vidarx_strategy(
         {
             let market = market_rx.borrow().clone();
             if market.window_start_ts > 0 && market.window_start_ts != last_window_ts {
-                // Log previous window
-                if last_window_ts > 0 && (up_shares > 0.0 || dn_shares > 0.0) {
+                // Log previous window + record lockprofit result
+                if last_window_ts > 0 {
                     let matched = up_shares.min(dn_shares);
                     let pair_cost = if matched > 0.0 {
                         let up_avg = up_cost / up_shares.max(0.001);
                         let dn_avg = dn_cost / dn_shares.max(0.001);
                         up_avg + dn_avg
                     } else { 0.0 };
-                    info!(">>> WINDOW COMPLETE: UP {:.0}sh (${:.2}) DN {:.0}sh (${:.2}) | matched={:.0} pcost={:.0}c | fills={}",
-                        up_shares, up_cost, dn_shares, dn_cost,
-                        matched, pair_cost * 100.0, fills_this_window);
+
+                    if up_shares > 0.0 || dn_shares > 0.0 {
+                        info!(">>> WINDOW COMPLETE: UP {:.0}sh (${:.2}) DN {:.0}sh (${:.2}) | matched={:.0} pcost={:.0}c | fills={} | locked={}",
+                            up_shares, up_cost, dn_shares, dn_cost,
+                            matched, pair_cost * 100.0, fills_this_window, both_legs_filled_this_window);
+                    }
+
+                    // ═══ AUTO-SCALE: record result and check batch ═══
+                    if pair_done {
+                        window_results.push_back(both_legs_filled_this_window);
+                    }
+                    // Only check scaling every 30 windows
+                    if window_results.len() >= scale_window_batch {
+                        let successes = window_results.iter().filter(|&&v| v).count();
+                        let old_shares = shares_per_leg;
+
+                        if successes >= scale_success_threshold {
+                            // 90%+ success → scale UP
+                            shares_per_leg += scale_step;
+                            info!(">>> AUTO-SCALE UP: {}/{} locked ({:.0}%) → shares {:.0} → {:.0}",
+                                successes, scale_window_batch,
+                                successes as f64 / scale_window_batch as f64 * 100.0,
+                                old_shares, shares_per_leg);
+                        } else {
+                            // Below 90% → scale DOWN (but not below minimum)
+                            shares_per_leg = (shares_per_leg - scale_step).max(min_shares);
+                            if shares_per_leg < old_shares {
+                                warn!(">>> AUTO-SCALE DOWN: {}/{} locked ({:.0}%) → shares {:.0} → {:.0}",
+                                    successes, scale_window_batch,
+                                    successes as f64 / scale_window_batch as f64 * 100.0,
+                                    old_shares, shares_per_leg);
+                            }
+                        }
+                        // Clear the batch for next 30
+                        window_results.clear();
+                    }
                 }
 
-                // Reset
+                // Reset for new window
                 up_shares = 0.0; dn_shares = 0.0;
                 up_cost = 0.0; dn_cost = 0.0;
                 fills_this_window = 0;
@@ -227,6 +270,7 @@ async fn run_vidarx_strategy(
                 exp_fill_price = 0.0;
                 exp_fill_shares = 0.0;
                 cheap_gtc_posted = false;
+                both_legs_filled_this_window = false;
                 last_window_ts = market.window_start_ts;
 
                 // Cancel leftover GTC from previous window
@@ -234,7 +278,9 @@ async fn run_vidarx_strategy(
                     reason: "new_window".into(),
                 }).await;
 
-                info!(">>> NEW WINDOW {} — waiting for 60c momentum", market.window_start_ts);
+                info!(">>> NEW WINDOW {} — {:.0}sh/leg — waiting for 60c momentum ({}/{} in current batch)",
+                    market.window_start_ts, shares_per_leg,
+                    window_results.len(), scale_window_batch);
             }
         }
 
@@ -268,18 +314,24 @@ async fn run_vidarx_strategy(
                     (up_cost / up_shares.max(0.001)) + (dn_cost / dn_shares.max(0.001))
                 } else { 0.0 };
 
-                info!(">>> FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c | fills={}",
+                // Check if both legs now have fills
+                if up_shares > 0.0 && dn_shares > 0.0 {
+                    both_legs_filled_this_window = true;
+                }
+
+                info!(">>> FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c | fills={} | locked={}",
                     side_label, fill.size, fill.price,
-                    up_shares, dn_shares, matched, pair_cost * 100.0, fills_this_window);
+                    up_shares, dn_shares, matched, pair_cost * 100.0, fills_this_window, both_legs_filled_this_window);
             }
 
             // Heartbeat
             _ = heartbeat_interval.tick() => {
                 let top = pm_top_rx.borrow().clone();
-                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pair_done={} gtc_posted={} | fills={}",
+                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pair_done={} locked={} | {:.0}sh/leg | batch {}/{}",
                     top.up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
                     top.down_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
-                    up_shares, dn_shares, pair_done, cheap_gtc_posted, fills_this_window);
+                    up_shares, dn_shares, pair_done, both_legs_filled_this_window,
+                    shares_per_leg, window_results.len(), scale_window_batch);
             }
 
             // ═══ MAIN STRATEGY LOOP — every 500ms ═══
