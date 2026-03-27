@@ -197,7 +197,7 @@ async fn run_vidarx_strategy(
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
     let mut matching_gtc_posted = false; // true once we've posted the single matching GTC
-    let max_shares_per_side: f64 = 50.0;
+    let max_shares_per_side: f64 = 75.0;
     let match_tolerance = 0.10; // within 10% = considered matched
     let target_pair_cost = 0.95; // lockprofit target
 
@@ -423,17 +423,22 @@ async fn run_vidarx_strategy(
                 }
 
                 // ═══ PHASE 2: One side full — post matching GTC on the other side ═══
-                if one_side_full && !matching_gtc_posted && !pair_done {
-                    // Determine which side is fuller
-                    let (full_side, full_shares, full_cost, need_token, need_side, need_bid) =
+                // ═══ PHASE 2: One side full — keep laddering the underweight side 4c deeper ═══
+                if one_side_full && !pair_done {
+                    let (full_side, full_shares, _full_cost) =
                         if up_shares >= dn_shares {
-                            ("UP", up_shares, up_cost, &market.down_token_id, Side::Down, dn_bid)
+                            ("UP", up_shares, up_cost)
                         } else {
-                            ("DN", dn_shares, dn_cost, &market.up_token_id, Side::Up, up_bid)
+                            ("DN", dn_shares, dn_cost)
                         };
 
-                    let full_avg = full_cost / full_shares.max(0.001);
-                    let already = if need_side == Side::Up { up_shares } else { dn_shares };
+                    let (need_side, need_token, need_bid, need_ask, already) =
+                        if up_shares >= dn_shares {
+                            (Side::Down, &market.down_token_id, dn_bid, dn_ask, dn_shares)
+                        } else {
+                            (Side::Up, &market.up_token_id, up_bid, up_ask, up_shares)
+                        };
+
                     let still_need = (full_shares - already).max(0.0);
 
                     // Within 10% tolerance? Done.
@@ -445,50 +450,44 @@ async fn run_vidarx_strategy(
                             reason: "matched_within_tolerance".into(),
                         }).await;
                     } else if still_need < 5.0 {
-                        // Bug B fix: sub-5 shares needed — treat as close enough
-                        info!(">>> CLOSE ENOUGH: {} {:.0}sh, other {:.0}sh, need {:.1} < 5 min — done",
+                        info!(">>> CLOSE ENOUGH: {} {:.0}sh, other {:.0}sh, need {:.1} < 5 — done",
                             full_side, full_shares, already, still_need);
                         pair_done = true;
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                             reason: "close_enough_sub5".into(),
                         }).await;
-                    } else {
-                        // Post matching GTC at profitable price
-                        let max_price = target_pair_cost - full_avg;
-                        let match_price = ((max_price.min(need_bid)) * 100.0).round() / 100.0;
+                    } else if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
+                        // Keep posting ladders on the UNDERWEIGHT side only, but 4c deeper
+                        let base_sizes = [8.0_f64, 6.0, 6.0];
+                        let mut remaining = still_need.min(max_shares_per_side - already);
+                        let need_label = if need_side == Side::Up { "UP" } else { "DN" };
 
-                        if match_price > 0.01 && match_price < 0.95 && still_need >= 5.0 {
-                            // Cancel flash ladders first
-                            let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                                reason: "switching_to_match_gtc".into(),
-                            }).await;
-                            orders_live = false;
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-                            info!(">>> MATCHING GTC: {} full at avg {:.0}c | need {:.0} {} @ max {:.0}c | posting @ {:.0}c",
-                                full_side, full_avg * 100.0,
-                                still_need, if need_side == Side::Up { "UP" } else { "DN" },
-                                max_price * 100.0, match_price * 100.0);
+                        for (level, &base_size) in base_sizes.iter().enumerate() {
+                            let size = base_size.min(remaining);
+                            if size < 5.0 { break; }
+                            // 4c deeper than normal: (3+4)=7c, (4+4)=8c, (5+4)=9c from bid
+                            let offset = (7 + level) as f64 * 0.01;
+                            let price = ((need_bid - offset) * 100.0).round() / 100.0;
+                            if price <= 0.01 || price >= need_ask { continue; }
 
                             let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                 market_slug: market.slug.clone(),
                                 token_id: need_token.clone(),
                                 side: need_side,
-                                price: match_price,
-                                size: still_need,
+                                price,
+                                size,
                                 post_only: true,
-                                ladder_key: "matching_gtc".into(),
-                                was_cheap: match_price < 0.50,
+                                ladder_key: format!("match_{}:{}", need_label.to_lowercase(), level),
+                                was_cheap: price < 0.50,
                             }).await;
-
-                            // Bug B fix: DON'T set matching_gtc_posted here
-                            // Wait for MakerOrderPosted event from executor
-                            info!(">>> MATCHING GTC SENT — waiting for executor confirmation");
-                        } else {
-                            warn!(">>> MATCH PRICE {:.2} or size {:.1} invalid — holding as-is",
-                                match_price, still_need);
-                            pair_done = true;
+                            remaining -= size;
+                            if remaining < 5.0 { break; }
                         }
+
+                        orders_live = true;
+                        last_post_ts = now_ms;
+                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | deeper ladders -7/-8/-9c",
+                            full_side, full_shares, need_label, still_need);
                     }
                 }
             }
