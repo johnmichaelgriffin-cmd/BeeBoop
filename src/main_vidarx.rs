@@ -247,8 +247,18 @@ async fn run_vidarx_strategy(
             // Drain signals (not used directly but keeps channel flowing)
             Some(_) = signal_rx.recv() => {}
 
-            // Drain executor events
-            Some(_) = exec_evt_rx.recv() => {}
+            // Process executor events — confirm matching GTC was accepted
+            Some(evt) = exec_evt_rx.recv() => {
+                match evt {
+                    ExecutionEvent::MakerOrderPosted { ladder_key, order_id, .. } => {
+                        if ladder_key == "matching_gtc" {
+                            matching_gtc_posted = true;
+                            info!(">>> MATCHING GTC CONFIRMED: order_id={}", &order_id[..16.min(order_id.len())]);
+                        }
+                    }
+                    _ => {}
+                }
+            }
 
             // Track fills from user WS
             Some(fill) = fill_rx.recv() => {
@@ -346,7 +356,9 @@ async fn run_vidarx_strategy(
                 let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
 
                 // Check if one side is full
-                let one_side_full = up_shares >= max_shares_per_side || dn_shares >= max_shares_per_side;
+                // Use practical_full (16) to avoid dead zone when remaining < 5 (venue min)
+                let practical_full = max_shares_per_side - 4.0; // 16 when cap = 20
+                let one_side_full = up_shares >= practical_full || dn_shares >= practical_full;
 
                 if !one_side_full && !matching_gtc_posted {
                     // Both sides still need tokens — post flash ladders every 2s
@@ -412,23 +424,19 @@ async fn run_vidarx_strategy(
 
                 // ═══ PHASE 2: One side full — post matching GTC on the other side ═══
                 if one_side_full && !matching_gtc_posted && !pair_done {
-                    // Determine which side needs matching
+                    // Determine which side is fuller
                     let (full_side, full_shares, full_cost, need_token, need_side, need_bid) =
-                        if up_shares >= max_shares_per_side {
+                        if up_shares >= dn_shares {
                             ("UP", up_shares, up_cost, &market.down_token_id, Side::Down, dn_bid)
                         } else {
                             ("DN", dn_shares, dn_cost, &market.up_token_id, Side::Up, up_bid)
                         };
 
                     let full_avg = full_cost / full_shares.max(0.001);
-                    let need_shares = full_shares; // match the full side
-
-                    // Already have some on the other side?
                     let already = if need_side == Side::Up { up_shares } else { dn_shares };
-                    let still_need = (need_shares - already).max(0.0);
+                    let still_need = (full_shares - already).max(0.0);
 
-                    // FIX #3: Real 10% tolerance check (not just "need < 5")
-                    // For 20sh target: need at least 18sh on other side
+                    // Within 10% tolerance? Done.
                     if already >= full_shares * (1.0 - match_tolerance) {
                         info!(">>> MATCHED (within 10%): {} {:.0}sh, other {:.0}sh — done",
                             full_side, full_shares, already);
@@ -436,12 +444,20 @@ async fn run_vidarx_strategy(
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                             reason: "matched_within_tolerance".into(),
                         }).await;
+                    } else if still_need < 5.0 {
+                        // Bug B fix: sub-5 shares needed — treat as close enough
+                        info!(">>> CLOSE ENOUGH: {} {:.0}sh, other {:.0}sh, need {:.1} < 5 min — done",
+                            full_side, full_shares, already, still_need);
+                        pair_done = true;
+                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                            reason: "close_enough_sub5".into(),
+                        }).await;
                     } else {
                         // Post matching GTC at profitable price
                         let max_price = target_pair_cost - full_avg;
                         let match_price = ((max_price.min(need_bid)) * 100.0).round() / 100.0;
 
-                        if match_price > 0.01 && match_price < 0.95 {
+                        if match_price > 0.01 && match_price < 0.95 && still_need >= 5.0 {
                             // Cancel flash ladders first
                             let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                                 reason: "switching_to_match_gtc".into(),
@@ -465,11 +481,12 @@ async fn run_vidarx_strategy(
                                 was_cheap: match_price < 0.50,
                             }).await;
 
-                            matching_gtc_posted = true;
-                            info!(">>> MATCHING GTC POSTED — resting until window resolution");
+                            // Bug B fix: DON'T set matching_gtc_posted here
+                            // Wait for MakerOrderPosted event from executor
+                            info!(">>> MATCHING GTC SENT — waiting for executor confirmation");
                         } else {
-                            warn!(">>> MATCH PRICE {:.2} out of range (full avg {:.0}c) — holding naked",
-                                match_price, full_avg * 100.0);
+                            warn!(">>> MATCH PRICE {:.2} or size {:.1} invalid — holding as-is",
+                                match_price, still_need);
                             pair_done = true;
                         }
                     }
