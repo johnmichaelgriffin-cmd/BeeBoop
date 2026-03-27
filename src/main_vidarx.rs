@@ -276,12 +276,14 @@ async fn run_vidarx_strategy(
                 info!(">>> FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c",
                     side_label, fill.size, fill.price, up_shares, dn_shares, matched, pair_cost * 100.0);
 
-                // Check if we're now matched (within 10%)
-                if !pair_done && up_shares >= max_shares_per_side * 0.5 && dn_shares >= max_shares_per_side * 0.5 {
+                // FIX #2: Only check match AFTER one side is full (>= 20sh)
+                // Don't stop early when both sides are half-full
+                if !pair_done && (up_shares >= max_shares_per_side || dn_shares >= max_shares_per_side) {
                     let bigger = up_shares.max(dn_shares);
                     let smaller = up_shares.min(dn_shares);
                     if smaller >= bigger * (1.0 - match_tolerance) {
-                        info!(">>> MATCHED! UP={:.0} DN={:.0} — within 10%, holding to resolution", up_shares, dn_shares);
+                        info!(">>> MATCHED! UP={:.0} DN={:.0} — one side full + within 10%, holding to resolution",
+                            up_shares, dn_shares);
                         pair_done = true;
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                             reason: "matched_pair_done".into(),
@@ -349,14 +351,16 @@ async fn run_vidarx_strategy(
                 if !one_side_full && !matching_gtc_posted {
                     // Both sides still need tokens — post flash ladders every 2s
                     if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
-                        // Post 3-level ladder on BOTH sides: ask-3c, ask-4c, ask-5c
+                        // Post 3-level ladder on BOTH sides: bid-3c, bid-4c, bid-5c
+                        // FIX #1: decrement remaining as we post each level
                         // UP side
                         if up_needs >= 5.0 {
-                            let sizes = [8.0_f64, 6.0, 6.0]; // L1, L2, L3
-                            for (level, &size) in sizes.iter().enumerate() {
-                                let size = size.min(up_needs);
-                                if size < 5.0 { continue; }
-                                let offset = (3 + level) as f64 * 0.01; // 3c, 4c, 5c
+                            let base_sizes = [8.0_f64, 6.0, 6.0];
+                            let mut up_remaining = up_needs;
+                            for (level, &base_size) in base_sizes.iter().enumerate() {
+                                let size = base_size.min(up_remaining);
+                                if size < 5.0 { break; }
+                                let offset = (3 + level) as f64 * 0.01;
                                 let price = ((up_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= up_ask { continue; }
 
@@ -370,15 +374,18 @@ async fn run_vidarx_strategy(
                                     ladder_key: format!("up:{}", level),
                                     was_cheap: up_ask < dn_ask,
                                 }).await;
+                                up_remaining -= size;
+                                if up_remaining < 5.0 { break; }
                             }
                         }
 
                         // DN side
                         if dn_needs >= 5.0 {
-                            let sizes = [8.0_f64, 6.0, 6.0];
-                            for (level, &size) in sizes.iter().enumerate() {
-                                let size = size.min(dn_needs);
-                                if size < 5.0 { continue; }
+                            let base_sizes = [8.0_f64, 6.0, 6.0];
+                            let mut dn_remaining = dn_needs;
+                            for (level, &base_size) in base_sizes.iter().enumerate() {
+                                let size = base_size.min(dn_remaining);
+                                if size < 5.0 { break; }
                                 let offset = (3 + level) as f64 * 0.01;
                                 let price = ((dn_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= dn_ask { continue; }
@@ -393,6 +400,8 @@ async fn run_vidarx_strategy(
                                     ladder_key: format!("dn:{}", level),
                                     was_cheap: dn_ask < up_ask,
                                 }).await;
+                                dn_remaining -= size;
+                                if dn_remaining < 5.0 { break; }
                             }
                         }
 
@@ -418,13 +427,14 @@ async fn run_vidarx_strategy(
                     let already = if need_side == Side::Up { up_shares } else { dn_shares };
                     let still_need = (need_shares - already).max(0.0);
 
-                    if still_need < 5.0 {
-                        // Close enough — we're matched
-                        info!(">>> MATCHED (close enough): {} {:.0}sh, other {:.0}sh — done",
+                    // FIX #3: Real 10% tolerance check (not just "need < 5")
+                    // For 20sh target: need at least 18sh on other side
+                    if already >= full_shares * (1.0 - match_tolerance) {
+                        info!(">>> MATCHED (within 10%): {} {:.0}sh, other {:.0}sh — done",
                             full_side, full_shares, already);
                         pair_done = true;
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "matched_close_enough".into(),
+                            reason: "matched_within_tolerance".into(),
                         }).await;
                     } else {
                         // Post matching GTC at profitable price
