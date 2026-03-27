@@ -164,12 +164,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// LOCKPROFIT Strategy — wait for 60c, FOK expensive, GTC bid cheap at (95c - fill).
+/// FLASH LADDER Strategy — post both-side ladders, cancel after 250ms, repeat.
 ///
-/// 1. Wait for one side to hit 60c ask
-/// 2. FOK buy 20sh of the expensive side at 99c limit
-/// 3. Post GTC postOnly bid on cheap side at (95c - fill_price), 20sh
-/// 4. Hold both to resolution. One pair per window.
+/// 1. T+10s: start posting 3-level ladders on BOTH sides (ask-3c, -4c, -5c)
+/// 2. Cancel all after 250ms (avoid catching falling knives)
+/// 3. Re-post every 2s with fresh prices
+/// 4. Max 20sh per side. Once one side hits 20sh:
+///    - If other side within 10% → done, hold to resolution
+///    - If not → post single GTC on underweight side at profitable price
+///    - Leave that GTC until resolution
 async fn run_vidarx_strategy(
     config: Config,
     _shared: SharedState,
@@ -181,201 +184,80 @@ async fn run_vidarx_strategy(
     mut fill_rx: mpsc::Receiver<feeds::user_ws::UserFillEvent>,
     _log_tx: mpsc::Sender<LogEvent>,
 ) {
-    info!("LOCKPROFIT: wait for 60c → FOK 20sh expensive → GTC bid cheap at (95c - fill)");
+    info!("FLASH LADDER: post both sides ask-3/-4/-5c, cancel@250ms, max 20sh/side, matching GTC");
 
     // Per-window state
     let mut last_window_ts: i64 = 0;
-    let mut pair_done = false;          // true once FULLY matched or stop-loss
-    let mut exp_fill_price: f64 = 0.0;  // what we paid for the expensive side
-    let mut exp_fill_shares: f64 = 0.0; // ACTUAL shares filled on expensive side (from executor)
-    let mut cheap_gtc_posted = false;
-    let mut watching_for_flip = false;
-    let mut cheap_token_id: String = String::new();
-    let mut cheap_side_saved: Option<Side> = None;
-    let mut cheap_gtc_order_id: String = String::new(); // #3: track the specific GTC order
-    let mut cheap_shares_filled: f64 = 0.0; // shares filled on cheap side specifically
+    let mut pair_done = false;
+
+    // Per-window inventory
     let mut up_shares: f64 = 0.0;
     let mut dn_shares: f64 = 0.0;
     let mut up_cost: f64 = 0.0;
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
-    let mut last_signal: Option<Signal> = None;
-    let mut force_buy_sent = false;
+    let mut matching_gtc_posted = false; // true once we've posted the single matching GTC
+    let max_shares_per_side: f64 = 20.0;
+    let match_tolerance = 0.10; // within 10% = considered matched
+    let target_pair_cost = 0.95; // lockprofit target
 
-    let target_profit_per_pair = 0.95;
-    let momentum_gate = 0.55;
-    let match_threshold = 0.90; // #1: pair_done when cheap fills >= 90% of exp fills
-
-    // ═══ AUTO-SCALING ═══
-    // Track lockprofit success over rolling 30-window batches.
-    // If >=27/30 lock successfully, scale up +20sh. If <27/30, scale back down.
-    let mut shares_per_leg: f64 = 40.0;
-    let min_shares: f64 = 20.0;
-    let scale_window_batch: usize = 30;
-    let scale_success_threshold: usize = 27; // 90% success rate to scale up
-    let scale_step: f64 = 20.0;
-    let mut window_results: std::collections::VecDeque<bool> = std::collections::VecDeque::new(); // true = both legs filled
-    let mut both_legs_filled_this_window = false;
+    // Timing
+    let post_interval_ms: i64 = 2000;   // post ladders every 2s
+    let cancel_delay_ms: u64 = 250;     // cancel 250ms after posting
+    let mut last_post_ts: i64 = 0;
+    let mut orders_live = false;         // true between post and cancel
 
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
-        // Window change detection
+        // ═══ WINDOW CHANGE DETECTION ═══
         {
             let market = market_rx.borrow().clone();
             if market.window_start_ts > 0 && market.window_start_ts != last_window_ts {
-                // Log previous window + record lockprofit result
-                if last_window_ts > 0 {
+                // Log previous window
+                if last_window_ts > 0 && (up_shares > 0.0 || dn_shares > 0.0) {
                     let matched = up_shares.min(dn_shares);
                     let pair_cost = if matched > 0.0 {
-                        let up_avg = up_cost / up_shares.max(0.001);
-                        let dn_avg = dn_cost / dn_shares.max(0.001);
-                        up_avg + dn_avg
+                        (up_cost / up_shares.max(0.001)) + (dn_cost / dn_shares.max(0.001))
                     } else { 0.0 };
-
-                    if up_shares > 0.0 || dn_shares > 0.0 {
-                        info!(">>> WINDOW COMPLETE: UP {:.0}sh (${:.2}) DN {:.0}sh (${:.2}) | matched={:.0} pcost={:.0}c | fills={} | locked={}",
-                            up_shares, up_cost, dn_shares, dn_cost,
-                            matched, pair_cost * 100.0, fills_this_window, both_legs_filled_this_window);
-                    }
-
-                    // ═══ AUTO-SCALE: record result and check batch ═══
-                    if pair_done {
-                        window_results.push_back(both_legs_filled_this_window);
-                    }
-                    // Only check scaling every 30 windows
-                    if window_results.len() >= scale_window_batch {
-                        let successes = window_results.iter().filter(|&&v| v).count();
-                        let old_shares = shares_per_leg;
-
-                        if successes >= scale_success_threshold {
-                            // 90%+ success → scale UP
-                            shares_per_leg += scale_step;
-                            info!(">>> AUTO-SCALE UP: {}/{} locked ({:.0}%) → shares {:.0} → {:.0}",
-                                successes, scale_window_batch,
-                                successes as f64 / scale_window_batch as f64 * 100.0,
-                                old_shares, shares_per_leg);
-                        } else {
-                            // Below 90% → scale DOWN (but not below minimum)
-                            shares_per_leg = (shares_per_leg - scale_step).max(min_shares);
-                            if shares_per_leg < old_shares {
-                                warn!(">>> AUTO-SCALE DOWN: {}/{} locked ({:.0}%) → shares {:.0} → {:.0}",
-                                    successes, scale_window_batch,
-                                    successes as f64 / scale_window_batch as f64 * 100.0,
-                                    old_shares, shares_per_leg);
-                            }
-                        }
-                        // Clear the batch for next 30
-                        window_results.clear();
-                    }
+                    info!(">>> WINDOW COMPLETE: UP {:.0}sh (${:.2}) DN {:.0}sh (${:.2}) | matched={:.0} pcost={:.0}c | fills={}",
+                        up_shares, up_cost, dn_shares, dn_cost,
+                        matched, pair_cost * 100.0, fills_this_window);
                 }
 
-                // Reset for new window
+                // Reset
                 up_shares = 0.0; dn_shares = 0.0;
                 up_cost = 0.0; dn_cost = 0.0;
                 fills_this_window = 0;
                 pair_done = false;
-                exp_fill_price = 0.0;
-                exp_fill_shares = 0.0;
-                cheap_gtc_posted = false;
-                watching_for_flip = false;
-                cheap_token_id.clear();
-                cheap_side_saved = None;
-                cheap_gtc_order_id.clear();
-                cheap_shares_filled = 0.0;
-                both_legs_filled_this_window = false;
-                last_signal = None;
-                force_buy_sent = false;
+                matching_gtc_posted = false;
+                orders_live = false;
+                last_post_ts = 0;
                 last_window_ts = market.window_start_ts;
 
-                // Cancel leftover GTC from previous window
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                     reason: "new_window".into(),
                 }).await;
 
-                info!(">>> NEW WINDOW {} — {:.0}sh/leg — waiting for 60c momentum ({}/{} in current batch)",
-                    market.window_start_ts, shares_per_leg,
-                    window_results.len(), scale_window_batch);
+                info!(">>> NEW WINDOW {} — flash ladder max {:.0}sh/side", market.window_start_ts, max_shares_per_side);
             }
         }
 
         tokio::select! {
-            // Save latest signal for confirmation logic
-            Some(signal) = signal_rx.recv() => {
-                last_signal = Some(signal);
-            }
+            // Drain signals (not used directly but keeps channel flowing)
+            Some(_) = signal_rx.recv() => {}
 
-            // Process executor events — trust FOK fills immediately
-            Some(evt) = exec_evt_rx.recv() => {
-                match evt {
-                    ExecutionEvent::EntryFilled { side, filled_price, filled_size, .. } => {
-                        // TRUST THE EXECUTOR — count these shares immediately
-                        // This is the EXPENSIVE side FOK fill
-                        match side {
-                            Side::Up => {
-                                up_shares += filled_size;
-                                up_cost += filled_size * filled_price;
-                            }
-                            Side::Down => {
-                                dn_shares += filled_size;
-                                dn_cost += filled_size * filled_price;
-                            }
-                        }
-                        fills_this_window += 1;
+            // Drain executor events
+            Some(_) = exec_evt_rx.recv() => {}
 
-                        // #4: Record ACTUAL exp fill size for matching threshold
-                        if exp_fill_shares == 0.0 || (exp_fill_price > 0.0 && filled_price >= 0.50) {
-                            exp_fill_shares = filled_size;
-                            exp_fill_price = filled_price;
-                        }
-
-                        let side_label = if side == Side::Up { "UP" } else { "DN" };
-                        info!(">>> EXECUTOR FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} | exp_actual={:.1}sh",
-                            side_label, filled_size, filled_price, up_shares, dn_shares, exp_fill_shares);
-
-                        // #1: Check matched threshold — not just "both > 0"
-                        let matched = up_shares.min(dn_shares);
-                        if exp_fill_shares > 0.0 && matched >= exp_fill_shares * match_threshold {
-                            both_legs_filled_this_window = true;
-                            if watching_for_flip && !pair_done {
-                                info!(">>> LOCKPROFIT COMPLETE (executor): matched={:.1} >= {:.1} threshold",
-                                    matched, exp_fill_shares * match_threshold);
-                                watching_for_flip = false;
-                                pair_done = true;
-                                let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                                    reason: "lockprofit_complete".into(),
-                                }).await;
-                            }
-                        }
-                    }
-                    // #3: Capture cheap GTC order_id when posted
-                    ExecutionEvent::MakerOrderPosted { order_id, ladder_key, .. } => {
-                        if ladder_key == "lockprofit_cheap" {
-                            cheap_gtc_order_id = order_id.clone();
-                            info!(">>> CHEAP GTC TRACKED: order_id={}", &order_id[..16.min(order_id.len())]);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            // #3: Track ONLY cheap GTC fills from user WS — filter by order_id
+            // Track fills from user WS
             Some(fill) = fill_rx.recv() => {
                 let market = market_rx.borrow().clone();
                 let is_up = fill.asset_id == market.up_token_id;
                 let is_dn = fill.asset_id == market.down_token_id;
                 if !is_up && !is_dn { continue; }
                 if fill.side != "BUY" { continue; }
-                if fill.status != "ORDER_UPDATE" { continue; }
 
-                // #3: ONLY count fills for our specific cheap GTC order
-                // This prevents counting FOK order updates or random other fills
-                if cheap_gtc_order_id.is_empty() || fill.order_id != cheap_gtc_order_id {
-                    continue; // not our cheap GTC — skip
-                }
-
-                // This IS our cheap GTC fill
-                cheap_shares_filled += fill.size;
                 fills_this_window += 1;
                 if is_up {
                     up_shares += fill.size;
@@ -386,21 +268,23 @@ async fn run_vidarx_strategy(
                 }
 
                 let side_label = if is_up { "UP" } else { "DN" };
-                info!(">>> CHEAP GTC FILL: {} {:.1}sh @ {:.2} | cheap_filled={:.1}/{:.1} | UP={:.0} DN={:.0}",
-                    side_label, fill.size, fill.price,
-                    cheap_shares_filled, exp_fill_shares,
-                    up_shares, dn_shares);
+                let matched = up_shares.min(dn_shares);
+                let pair_cost = if matched > 0.0 {
+                    (up_cost / up_shares.max(0.001)) + (dn_cost / dn_shares.max(0.001))
+                } else { 0.0 };
 
-                // #1: Check matched threshold — cheap fills >= 90% of exp fills
-                if exp_fill_shares > 0.0 && cheap_shares_filled >= exp_fill_shares * match_threshold {
-                    both_legs_filled_this_window = true;
-                    if watching_for_flip && !pair_done {
-                        info!(">>> LOCKPROFIT COMPLETE (GTC): cheap={:.1} >= {:.1} threshold",
-                            cheap_shares_filled, exp_fill_shares * match_threshold);
-                        watching_for_flip = false;
+                info!(">>> FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c",
+                    side_label, fill.size, fill.price, up_shares, dn_shares, matched, pair_cost * 100.0);
+
+                // Check if we're now matched (within 10%)
+                if !pair_done && up_shares >= max_shares_per_side * 0.5 && dn_shares >= max_shares_per_side * 0.5 {
+                    let bigger = up_shares.max(dn_shares);
+                    let smaller = up_shares.min(dn_shares);
+                    if smaller >= bigger * (1.0 - match_tolerance) {
+                        info!(">>> MATCHED! UP={:.0} DN={:.0} — within 10%, holding to resolution", up_shares, dn_shares);
                         pair_done = true;
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "lockprofit_complete".into(),
+                            reason: "matched_pair_done".into(),
                         }).await;
                     }
                 }
@@ -409,17 +293,15 @@ async fn run_vidarx_strategy(
             // Heartbeat
             _ = heartbeat_interval.tick() => {
                 let top = pm_top_rx.borrow().clone();
-                let sig_info = last_signal.as_ref().map_or("none".into(), |s| format!("{:.2}", s.score));
-                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pair_done={} locked={} | {:.0}sh/leg | signal={} | batch {}/{}",
+                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pair_done={} gtc_match={} | fills={}",
                     top.up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
                     top.down_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
-                    up_shares, dn_shares, pair_done, both_legs_filled_this_window,
-                    shares_per_leg, sig_info, window_results.len(), scale_window_batch);
+                    up_shares, dn_shares, pair_done, matching_gtc_posted, fills_this_window);
             }
 
-            // ═══ MAIN STRATEGY LOOP — every 500ms ═══
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                if pair_done { continue; } // already done for this window
+            // ═══ MAIN STRATEGY LOOP — every 100ms ═══
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
+                if pair_done { continue; }
 
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let market = market_rx.borrow().clone();
@@ -427,216 +309,158 @@ async fn run_vidarx_strategy(
 
                 let elapsed_s = (now_ms / 1000) - market.window_start_ts;
 
-                // Wait for T+35s — let the window establish itself
-                if elapsed_s < 35 { continue; }
+                // Wait for T+10s
+                if elapsed_s < 10 { continue; }
                 // Stop at T+240s
-                if elapsed_s >= 240 { continue; }
+                if elapsed_s >= 240 {
+                    if !pair_done {
+                        info!(">>> T+240s — window over, holding to resolution");
+                        pair_done = true;
+                    }
+                    continue;
+                }
+
+                // ═══ CANCEL after 250ms ═══
+                if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms as i64 {
+                    let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                        reason: "flash_cancel_250ms".into(),
+                    }).await;
+                    orders_live = false;
+                }
 
                 // Get prices
                 let top = pm_top_rx.borrow().clone();
-                let (up_ask, dn_ask) = match (top.up_ask, top.down_ask) {
-                    (Some(ua), Some(da)) => (ua, da),
+                let (up_bid, up_ask) = match (top.up_bid, top.up_ask) {
+                    (Some(b), Some(a)) => (b, a),
+                    _ => continue,
+                };
+                let (dn_bid, dn_ask) = match (top.down_bid, top.down_ask) {
+                    (Some(b), Some(a)) => (b, a),
                     _ => continue,
                 };
 
-                // ═══ STEP 1: Wait for 55c momentum + strong signal confirmation ═══
-                if exp_fill_price == 0.0 {
-                    // Determine which side is expensive
-                    let (exp_side, exp_ask, exp_token, cheap_token, cheap_side) = if up_ask >= dn_ask {
-                        (Side::Up, up_ask, &market.up_token_id, &market.down_token_id, Side::Down)
-                    } else {
-                        (Side::Down, dn_ask, &market.down_token_id, &market.up_token_id, Side::Up)
-                    };
+                // ═══ PHASE 1: Both sides need tokens — post flash ladders ═══
+                let up_needs = (max_shares_per_side - up_shares).max(0.0);
+                let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
 
-                    // Momentum gate: expensive side must be >= 55c
-                    if exp_ask < momentum_gate {
-                        continue; // not ready yet
-                    }
+                // Check if one side is full
+                let one_side_full = up_shares >= max_shares_per_side || dn_shares >= max_shares_per_side;
 
-                    // Signal confirmation: signal must agree with the expensive side
-                    // UP expensive → signal must be bullish (score > 0)
-                    // DN expensive → signal must be bearish (score < 0)
-                    let signal_agrees = match &last_signal {
-                        Some(sig) => {
-                            let strong_enough = sig.score.abs() >= 0.45; // at least medium strength
-                            let direction_match = match exp_side {
-                                Side::Up => sig.score > 0.0,   // bullish signal for UP expensive
-                                Side::Down => sig.score < 0.0, // bearish signal for DN expensive
-                            };
-                            strong_enough && direction_match
+                if !one_side_full && !matching_gtc_posted {
+                    // Both sides still need tokens — post flash ladders every 2s
+                    if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
+                        // Post 3-level ladder on BOTH sides: ask-3c, ask-4c, ask-5c
+                        // UP side
+                        if up_needs >= 5.0 {
+                            let sizes = [8.0_f64, 6.0, 6.0]; // L1, L2, L3
+                            for (level, &size) in sizes.iter().enumerate() {
+                                let size = size.min(up_needs);
+                                if size < 5.0 { continue; }
+                                let offset = (3 + level) as f64 * 0.01; // 3c, 4c, 5c
+                                let price = ((up_bid - offset) * 100.0).round() / 100.0;
+                                if price <= 0.01 || price >= up_ask { continue; }
+
+                                let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                                    market_slug: market.slug.clone(),
+                                    token_id: market.up_token_id.clone(),
+                                    side: Side::Up,
+                                    price,
+                                    size,
+                                    post_only: true,
+                                    ladder_key: format!("up:{}", level),
+                                    was_cheap: up_ask < dn_ask,
+                                }).await;
+                            }
                         }
-                        None => false, // no signal yet
-                    };
 
-                    if !signal_agrees {
-                        continue; // wait for signal confirmation
-                    }
+                        // DN side
+                        if dn_needs >= 5.0 {
+                            let sizes = [8.0_f64, 6.0, 6.0];
+                            for (level, &size) in sizes.iter().enumerate() {
+                                let size = size.min(dn_needs);
+                                if size < 5.0 { continue; }
+                                let offset = (3 + level) as f64 * 0.01;
+                                let price = ((dn_bid - offset) * 100.0).round() / 100.0;
+                                if price <= 0.01 || price >= dn_ask { continue; }
 
-                    let sig_score = last_signal.as_ref().map_or(0.0, |s| s.score);
+                                let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                                    market_slug: market.slug.clone(),
+                                    token_id: market.down_token_id.clone(),
+                                    side: Side::Down,
+                                    price,
+                                    size,
+                                    post_only: true,
+                                    ladder_key: format!("dn:{}", level),
+                                    was_cheap: dn_ask < up_ask,
+                                }).await;
+                            }
+                        }
 
-                    // FOK BUY expensive side at 99c
-                    info!(">>> SIGNAL CONFIRMED: {} ask={:.0}c score={:.2} — FOK BUY {:.0}sh @ 99c",
-                        if exp_side == Side::Up { "UP" } else { "DN" },
-                        exp_ask * 100.0, sig_score, shares_per_leg);
-
-                    let _ = exec_cmd_tx.send(ExecutionCommand::EnterTaker {
-                        market_slug: market.slug.clone(),
-                        token_id: exp_token.clone(),
-                        side: exp_side,
-                        max_price: exp_ask, // used as ask_price for lockprofit formula
-                        notional: shares_per_leg, // share_base for the formula
-                        signal: Signal {
-                            created_ts_ms: now_ms,
-                            side: exp_side,
-                            entry_mode: EntryMode::Taker,
-                            r200_bps: 0.0, r500_bps: 0.0, r800_bps: 0.0, r2000_bps: 0.0,
-                            fast_move_bps: 0.0, raw_basis_bps: 0.0, basis_dev_bps: 0.0,
-                            dbasis_bps: 0.0, obi_ema: 0.0, score: 0.0, confidence: 0.0,
-                            strong_contradiction: false,
-                        },
-                    }).await;
-
-                    // Estimate fill price (actual fill comes from user WS)
-                    exp_fill_price = exp_ask;
-                    exp_fill_shares = shares_per_leg;
-
-                    // ═══ STEP 2: Immediately post GTC bid on cheap side ═══
-                    let cheap_bid_price = target_profit_per_pair - exp_ask;
-
-                    if cheap_bid_price > 0.01 && cheap_bid_price < 0.50 {
-                        // Round to 2 decimal places
-                        let cheap_bid_price = (cheap_bid_price * 100.0).round() / 100.0;
-
-                        // #4: GTC size matches estimated exp fill (floor(base * ask))
-                        let est_exp_shares = (shares_per_leg * exp_ask).floor().max(5.0);
-                        info!(">>> GTC BID: {} {:.0}sh @ {:.0}c (lockprofit: 95c - {:.0}c = {:.0}c) [exp est={:.0}sh]",
-                            if cheap_side == Side::Up { "UP" } else { "DN" },
-                            est_exp_shares, cheap_bid_price * 100.0,
-                            exp_ask * 100.0, cheap_bid_price * 100.0, est_exp_shares);
-
-                        let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                            market_slug: market.slug.clone(),
-                            token_id: cheap_token.clone(),
-                            side: cheap_side,
-                            price: cheap_bid_price,
-                            size: est_exp_shares, // match the estimated exp fill size
-                            post_only: true,
-                            ladder_key: "lockprofit_cheap".into(),
-                            was_cheap: true,
-                        }).await;
-
-                        cheap_gtc_posted = true;
-                        watching_for_flip = true; // NOT pair_done — watch for GTC fill or flip
-                        cheap_token_id = cheap_token.clone();
-                        cheap_side_saved = Some(cheap_side);
-                        info!(">>> GTC POSTED + WATCHING: exp {:.0}c + cheap bid {:.0}c = {:.0}c target | watching for fill or flip",
-                            exp_ask * 100.0, cheap_bid_price * 100.0,
-                            (exp_ask + cheap_bid_price) * 100.0);
-                    } else {
-                        warn!(">>> CHEAP BID PRICE {:.2} out of range — skipping cheap leg", cheap_bid_price);
-                        pair_done = true;
+                        orders_live = true;
+                        last_post_ts = now_ms;
                     }
                 }
 
-                // ═══ STEP 3: WATCH FOR GTC FILL, FLIP STOP-LOSS, OR T+210 FORCE BUY ═══
-                if watching_for_flip && !pair_done && !force_buy_sent {
-                    // First: check if GTC already filled (both sides have shares)
-                    if up_shares > 0.0 && dn_shares > 0.0 {
-                        info!(">>> LOCKPROFIT COMPLETE — both legs filled, done for this window");
-                        watching_for_flip = false;
+                // ═══ PHASE 2: One side full — post matching GTC on the other side ═══
+                if one_side_full && !matching_gtc_posted && !pair_done {
+                    // Determine which side needs matching
+                    let (full_side, full_shares, full_cost, need_token, need_side, need_bid) =
+                        if up_shares >= max_shares_per_side {
+                            ("UP", up_shares, up_cost, &market.down_token_id, Side::Down, dn_bid)
+                        } else {
+                            ("DN", dn_shares, dn_cost, &market.up_token_id, Side::Up, up_bid)
+                        };
+
+                    let full_avg = full_cost / full_shares.max(0.001);
+                    let need_shares = full_shares; // match the full side
+
+                    // Already have some on the other side?
+                    let already = if need_side == Side::Up { up_shares } else { dn_shares };
+                    let still_need = (need_shares - already).max(0.0);
+
+                    if still_need < 5.0 {
+                        // Close enough — we're matched
+                        info!(">>> MATCHED (close enough): {} {:.0}sh, other {:.0}sh — done",
+                            full_side, full_shares, already);
                         pair_done = true;
-                        // Cancel any remaining GTC just in case
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "lockprofit_complete".into(),
+                            reason: "matched_close_enough".into(),
                         }).await;
-                    }
+                    } else {
+                        // Post matching GTC at profitable price
+                        let max_price = target_pair_cost - full_avg;
+                        let match_price = ((max_price.min(need_bid)) * 100.0).round() / 100.0;
 
-                    // Only do flip detection / force buy AFTER T+210s AND only if not already done
-                    if !pair_done && !force_buy_sent && elapsed_s >= 210 {
-                        let cheap_ask_now = if cheap_side_saved == Some(Side::Up) { up_ask } else { dn_ask };
-
-                        // FLIP: cheap side surged to 60c+ → stop-loss buy
-                        if cheap_ask_now >= momentum_gate {
-                            warn!(">>> FLIP DETECTED at T+{}s: cheap ask={:.0}c >= 60c — STOP-LOSS FOK",
-                                elapsed_s, cheap_ask_now * 100.0);
-
-                            // Cancel the resting GTC first
+                        if match_price > 0.01 && match_price < 0.95 {
+                            // Cancel flash ladders first
                             let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                                reason: "flip_stop_loss".into(),
+                                reason: "switching_to_match_gtc".into(),
                             }).await;
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            orders_live = false;
+                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-                            let stop_side = cheap_side_saved.unwrap_or(Side::Down);
-                            let _ = exec_cmd_tx.send(ExecutionCommand::EnterTaker {
+                            info!(">>> MATCHING GTC: {} full at avg {:.0}c | need {:.0} {} @ max {:.0}c | posting @ {:.0}c",
+                                full_side, full_avg * 100.0,
+                                still_need, if need_side == Side::Up { "UP" } else { "DN" },
+                                max_price * 100.0, match_price * 100.0);
+
+                            let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                 market_slug: market.slug.clone(),
-                                token_id: cheap_token_id.clone(),
-                                side: stop_side,
-                                max_price: cheap_ask_now,
-                                notional: shares_per_leg,
-                                signal: Signal {
-                                    created_ts_ms: now_ms,
-                                    side: stop_side,
-                                    entry_mode: EntryMode::Taker,
-                                    r200_bps: 0.0, r500_bps: 0.0, r800_bps: 0.0, r2000_bps: 0.0,
-                                    fast_move_bps: 0.0, raw_basis_bps: 0.0, basis_dev_bps: 0.0,
-                                    dbasis_bps: 0.0, obi_ema: 0.0, score: 0.0, confidence: 0.0,
-                                    strong_contradiction: false,
-                                },
+                                token_id: need_token.clone(),
+                                side: need_side,
+                                price: match_price,
+                                size: still_need,
+                                post_only: true,
+                                ladder_key: "matching_gtc".into(),
+                                was_cheap: match_price < 0.50,
                             }).await;
 
-                            let est_loss = exp_fill_price + cheap_ask_now - 1.0;
-                            warn!(">>> STOP-LOSS: exp {:.0}c + cheap FOK {:.0}c = {:.0}c | est loss ~{:.0}c/pair",
-                                exp_fill_price * 100.0, cheap_ask_now * 100.0,
-                                (exp_fill_price + cheap_ask_now) * 100.0, est_loss * 100.0);
-
-                            watching_for_flip = false;
+                            matching_gtc_posted = true;
+                            info!(">>> MATCHING GTC POSTED — resting until window resolution");
+                        } else {
+                            warn!(">>> MATCH PRICE {:.2} out of range (full avg {:.0}c) — holding naked",
+                                match_price, full_avg * 100.0);
                             pair_done = true;
-                            force_buy_sent = true;
-                        }
-                    }
-
-                    // T+210 FORCE BUY: ONLY if cheap side has flipped expensive (>=55c)
-                    // If cheap side is still cheap, the GTC is probably working — leave it alone
-                    if !pair_done && !force_buy_sent && elapsed_s >= 210 && !(up_shares > 0.0 && dn_shares > 0.0) {
-                        let cheap_ask_now = if cheap_side_saved == Some(Side::Up) { up_ask } else { dn_ask };
-
-                        // Only force buy if cheap side has become expensive (market flipped)
-                        // If it's still cheap, the GTC should fill eventually — don't double-buy
-                        if cheap_ask_now >= momentum_gate {
-                            info!(">>> T+210 FORCE BUY: GTC unfilled, cheap ask={:.0}c — FOK buying to match",
-                                cheap_ask_now * 100.0);
-
-                            // Cancel resting GTC
-                            let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                                reason: "force_match_t210".into(),
-                            }).await;
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-                            let stop_side = cheap_side_saved.unwrap_or(Side::Down);
-                            let _ = exec_cmd_tx.send(ExecutionCommand::EnterTaker {
-                                market_slug: market.slug.clone(),
-                                token_id: cheap_token_id.clone(),
-                                side: stop_side,
-                                max_price: cheap_ask_now,
-                                notional: shares_per_leg,
-                                signal: Signal {
-                                    created_ts_ms: now_ms,
-                                    side: stop_side,
-                                    entry_mode: EntryMode::Taker,
-                                    r200_bps: 0.0, r500_bps: 0.0, r800_bps: 0.0, r2000_bps: 0.0,
-                                    fast_move_bps: 0.0, raw_basis_bps: 0.0, basis_dev_bps: 0.0,
-                                    dbasis_bps: 0.0, obi_ema: 0.0, score: 0.0, confidence: 0.0,
-                                    strong_contradiction: false,
-                                },
-                            }).await;
-
-                            let est_cost = exp_fill_price + cheap_ask_now;
-                            info!(">>> FORCE MATCH: exp {:.0}c + cheap FOK {:.0}c = {:.0}c",
-                                exp_fill_price * 100.0, cheap_ask_now * 100.0, est_cost * 100.0);
-
-                            watching_for_flip = false;
-                            pair_done = true;
-                            force_buy_sent = true;
                         }
                     }
                 }
