@@ -197,7 +197,7 @@ async fn run_vidarx_strategy(
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
     let mut matching_gtc_posted = false; // true once we've posted the single matching GTC
-    let max_shares_per_side: f64 = 20.0;
+    let max_shares_per_side: f64 = 50.0;
     let match_tolerance = 0.10; // within 10% = considered matched
     let target_pair_cost = 0.95; // lockprofit target
 
