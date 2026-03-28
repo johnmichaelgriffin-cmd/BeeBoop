@@ -369,11 +369,14 @@ async fn run_vidarx_strategy(
                         if up_needs >= 5.0 {
                             let base_sizes = [8.0_f64, 6.0, 6.0];
                             let mut up_remaining = up_needs;
+                            let up_is_cheap = up_ask < dn_ask;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (3 + level) as f64 * 0.01;
-                                let price = ((up_bid - offset) * 100.0).round() / 100.0;
+                                // Cheap: bid-3/4/5c | Expensive: ask-2/3/4c
+                                let (offset_base, ref_price) = if up_is_cheap { (3usize, up_bid) } else { (2usize, up_ask) };
+                                let offset = (offset_base + level) as f64 * 0.01;
+                                let price = ((ref_price - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= up_ask { continue; }
 
                                 let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
@@ -395,11 +398,14 @@ async fn run_vidarx_strategy(
                         if dn_needs >= 5.0 {
                             let base_sizes = [8.0_f64, 6.0, 6.0];
                             let mut dn_remaining = dn_needs;
+                            let dn_is_cheap = dn_ask < up_ask;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (3 + level) as f64 * 0.01;
-                                let price = ((dn_bid - offset) * 100.0).round() / 100.0;
+                                // Cheap: bid-3/4/5c | Expensive: ask-2/3/4c
+                                let (offset_base, ref_price) = if dn_is_cheap { (3usize, dn_bid) } else { (2usize, dn_ask) };
+                                let offset = (offset_base + level) as f64 * 0.01;
+                                let price = ((ref_price - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= dn_ask { continue; }
 
                                 let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
@@ -462,12 +468,14 @@ async fn run_vidarx_strategy(
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
 
+                        let need_is_cheap = need_ask < 0.50;
                         for (level, &base_size) in base_sizes.iter().enumerate() {
                             let size = base_size.min(remaining);
                             if size < 5.0 { break; }
-                            // Same as Phase 1: 3c, 4c, 5c from bid
-                            let offset = (3 + level) as f64 * 0.01;
-                            let price = ((need_bid - offset) * 100.0).round() / 100.0;
+                            // Cheap: bid-3/4/5c | Expensive: ask-2/3/4c
+                            let (offset_base, ref_price) = if need_is_cheap { (3usize, need_bid) } else { (2usize, need_ask) };
+                            let offset = (offset_base + level) as f64 * 0.01;
+                            let price = ((ref_price - offset) * 100.0).round() / 100.0;
                             if price <= 0.01 || price >= need_ask { continue; }
 
                             let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
@@ -486,8 +494,10 @@ async fn run_vidarx_strategy(
 
                         orders_live = true;
                         last_post_ts = now_ms;
-                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | ladders -3/-4/-5c",
-                            full_side, full_shares, need_label, still_need);
+                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | ladders {} ({})",
+                            full_side, full_shares, need_label, still_need,
+                            if need_is_cheap { "bid-3/4/5c" } else { "ask-2/3/4c" },
+                            if need_is_cheap { "cheap" } else { "exp" });
                     }
                 }
             }
