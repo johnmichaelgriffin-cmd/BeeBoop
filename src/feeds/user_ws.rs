@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 use tokio::time::{interval, Duration};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use chrono::Timelike;
 use tracing::{error, info, warn};
 
 const USER_WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/user";
@@ -137,14 +138,24 @@ pub async fn run_user_ws_task(
         let mut order_matched: HashMap<String, f64> = HashMap::new();
         let mut events_received: u64 = 0;
         let user_connect_time = chrono::Utc::now().timestamp();
-        let user_max_connection_secs: i64 = 600; // forced reconnect every 10 min
+        // Forced reconnect at the next :59 past the hour (e.g. 10:59, 11:59, ...)
+        let user_reconnect_at: i64 = {
+            let now = chrono::Utc::now();
+            let secs_into_hour = (now.minute() as i64) * 60 + (now.second() as i64);
+            let target_secs: i64 = 59 * 60; // :59:00 into the hour
+            if secs_into_hour < target_secs {
+                now.timestamp() + (target_secs - secs_into_hour)
+            } else {
+                now.timestamp() + (3600 - secs_into_hour + target_secs)
+            }
+        };
 
         // Reader loop with market change detection + forced reconnect
         loop {
-            // Forced reconnect every 10 minutes
+            // Forced reconnect at :59 past the hour
             let now_secs = chrono::Utc::now().timestamp();
-            if now_secs - user_connect_time >= user_max_connection_secs {
-                info!("user_ws: FORCED RECONNECT after {}s", now_secs - user_connect_time);
+            if now_secs >= user_reconnect_at {
+                info!("user_ws: FORCED RECONNECT at :59 mark ({}s since connect)", now_secs - user_connect_time);
                 break;
             }
 

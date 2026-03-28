@@ -457,7 +457,7 @@ async fn run_vidarx_strategy(
                             reason: "close_enough_sub5".into(),
                         }).await;
                     } else if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
-                        // Keep posting ladders on the UNDERWEIGHT side only, but 2c deeper
+                        // Keep posting ladders on the UNDERWEIGHT side only, same offsets as Phase 1
                         let base_sizes = [8.0_f64, 6.0, 6.0];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
@@ -465,8 +465,8 @@ async fn run_vidarx_strategy(
                         for (level, &base_size) in base_sizes.iter().enumerate() {
                             let size = base_size.min(remaining);
                             if size < 5.0 { break; }
-                            // 2c deeper than normal: (3+2)=5c, (4+2)=6c, (5+2)=7c from bid
-                            let offset = (5 + level) as f64 * 0.01;
+                            // Same as Phase 1: 3c, 4c, 5c from bid
+                            let offset = (3 + level) as f64 * 0.01;
                             let price = ((need_bid - offset) * 100.0).round() / 100.0;
                             if price <= 0.01 || price >= need_ask { continue; }
 
@@ -486,7 +486,7 @@ async fn run_vidarx_strategy(
 
                         orders_live = true;
                         last_post_ts = now_ms;
-                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | deeper ladders -5/-6/-7c",
+                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | ladders -3/-4/-5c",
                             full_side, full_shares, need_label, still_need);
                     }
                 }
