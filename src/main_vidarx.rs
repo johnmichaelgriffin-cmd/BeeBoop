@@ -202,7 +202,7 @@ async fn run_vidarx_strategy(
     let target_pair_cost = 0.95; // lockprofit target
 
     // Timing
-    let post_interval_ms: i64 = 2000;   // post ladders every 2s
+    let post_interval_ms: i64 = 1500;   // post ladders every 1.5s
     let cancel_delay_ms: u64 = 250;     // cancel 250ms after posting
     let mut last_post_ts: i64 = 0;
     let mut orders_live = false;         // true between post and cancel
