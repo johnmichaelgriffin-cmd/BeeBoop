@@ -202,7 +202,7 @@ async fn run_vidarx_strategy(
     let target_pair_cost = 0.95; // lockprofit target
 
     // Timing
-    let post_interval_ms: i64 = 1000;   // post ladders every 1s
+    let post_interval_ms: i64 = 2000;   // post ladders every 2s
     let cancel_delay_ms: u64 = 250;     // cancel 250ms after posting
     let mut last_post_ts: i64 = 0;
     let mut orders_live = false;         // true between post and cancel
@@ -367,7 +367,7 @@ async fn run_vidarx_strategy(
                         // FIX #1: decrement remaining as we post each level
                         // UP side
                         if up_needs >= 5.0 {
-                            let base_sizes = [8.0_f64, 6.0, 6.0];
+                            let base_sizes = [10.0_f64, 8.0, 8.0];
                             let mut up_remaining = up_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
@@ -393,7 +393,7 @@ async fn run_vidarx_strategy(
 
                         // DN side
                         if dn_needs >= 5.0 {
-                            let base_sizes = [8.0_f64, 6.0, 6.0];
+                            let base_sizes = [10.0_f64, 8.0, 8.0];
                             let mut dn_remaining = dn_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
@@ -458,7 +458,7 @@ async fn run_vidarx_strategy(
                         }).await;
                     } else if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
                         // Keep posting ladders on the UNDERWEIGHT side only, same offsets as Phase 1
-                        let base_sizes = [8.0_f64, 6.0, 6.0];
+                        let base_sizes = [10.0_f64, 8.0, 8.0];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
 
