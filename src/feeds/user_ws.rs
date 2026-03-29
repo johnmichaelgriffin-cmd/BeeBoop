@@ -36,12 +36,14 @@ pub struct UserFillEvent {
 
 /// Run the authenticated user WebSocket with two-step auth flow.
 /// Tracks order size_matched deltas as primary fill signal.
+/// `reconnect_interval_secs`: interval for aligned boundary reconnects (600 for 5m, 900 for 15m).
 pub async fn run_user_ws_task(
     api_key: String,
     api_secret: String,
     api_passphrase: String,
     mut market_rx: tokio::sync::watch::Receiver<crate::types_v2::MarketDescriptor>,
     fill_tx: mpsc::Sender<UserFillEvent>,
+    reconnect_interval_secs: i64,
 ) {
     let mut current_condition_id = String::new();
 
@@ -75,6 +77,13 @@ pub async fn run_user_ws_task(
                 continue;
             }
         };
+
+        // Compute aligned reconnect time: next interval boundary minus 60s
+        let user_connect_time = chrono::Utc::now().timestamp();
+        let secs_into_interval = user_connect_time % reconnect_interval_secs;
+        let secs_until_boundary = reconnect_interval_secs - secs_into_interval;
+        let user_reconnect_at = user_connect_time + (secs_until_boundary - 60).max(30);
+        info!("user_ws: reconnecting at T+{}s ({}s interval)", user_reconnect_at - user_connect_time, reconnect_interval_secs);
 
         let (mut write, mut read) = ws_stream.split();
 
@@ -137,13 +146,12 @@ pub async fn run_user_ws_task(
         // Track size_matched per order_id — delta = fill
         let mut order_matched: HashMap<String, f64> = HashMap::new();
         let mut events_received: u64 = 0;
-        let user_connect_time = chrono::Utc::now().timestamp();
         // Reader loop with market change detection + forced reconnect
         loop {
-            // Forced reconnect every 10 minutes
+            // Forced reconnect at aligned boundary minus 60s
             let now_secs = chrono::Utc::now().timestamp();
-            if now_secs - user_connect_time >= 600 {
-                info!("user_ws: FORCED RECONNECT after 600s");
+            if now_secs >= user_reconnect_at {
+                info!("user_ws: FORCED RECONNECT (interval={}s)", reconnect_interval_secs);
                 break;
             }
 

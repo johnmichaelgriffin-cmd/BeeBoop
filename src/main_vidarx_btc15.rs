@@ -1,10 +1,12 @@
-//! BeeBoop Vidarx — Buy-only, maker-only, pair-cost-minimizing accumulator.
+//! BeeBoop Vidarx BTC 15M — BUY-ONLY MAKER BTC 15M accumulator.
 //!
 //! Strategy: post GTC postOnly bids on BOTH sides, skewed by signal.
 //! ~55% cheap / 45% expensive target fill ratio.
 //! Hold everything to resolution. Never sell intrawindow.
 //!
-//! Usage: beeboop-vidarx live
+//! 15-minute variant: 200sh cap, T-60s start, T+840s stop, :14/:29/:44/:59 WS reconnect.
+//!
+//! Usage: beeboop-btc15 live
 
 mod config_v2;
 mod types_v2;
@@ -40,11 +42,11 @@ async fn main() -> Result<()> {
 
     let mode = std::env::args().nth(1).unwrap_or("dryrun".into());
     let mut config = Config::default();
-    config.market = "btc".to_string();
+    config.market = "btc15".to_string();
 
-    // Vidarx-specific config overrides
-    config.start_delay_s = 5;           // start quoting at T+5s
-    config.cancel_at_s = 240;           // stop quoting at T+240s
+    // Vidarx BTC 15M-specific config overrides
+    config.start_delay_s = 5;           // start quoting at T+5s (strategy overrides with T-60s check)
+    config.cancel_at_s = 840;           // stop quoting at T+840s (14 minutes)
     config.cooldown_ms = 500;           // fast cooldown between quote refreshes
     config.max_pairs_per_window = 999;  // no limit — accumulate as much as possible
     config.share_base = 20.0;           // ladder sizing base
@@ -55,12 +57,14 @@ async fn main() -> Result<()> {
         config.load_credentials();
     }
 
-    info!("=== BEEBOOP VIDARX — BUY-ONLY MAKER BTC 5M ===");
+    info!("=== BEEBOOP VIDARX — BUY-ONLY MAKER BTC 15M ===");
     info!("Mode: {:?}", config.mode);
     info!("Strategy: postOnly GTC bids on BOTH sides, signal-skewed");
     info!("Target mix: 55% cheap / 45% expensive");
-    info!("Ladder: cheap 20/15/10sh, exp 15/12/8sh (3 levels each)");
-    info!("Timing: T+5s start, T+180s reduce, T+240s stop");
+    info!("Ladder: 8/6/6sh per side (3 levels each)");
+    info!("Timing: T-60s start, T+840s stop (14 minutes)");
+    info!("Max shares: 200/side (practical_full=196)");
+    info!("WS reconnect: :14/:29/:44/:59 (900s interval)");
     info!("No selling. Hold to resolution.");
 
     let shared = SharedState::new();
@@ -105,7 +109,7 @@ async fn main() -> Result<()> {
         log_tx.clone(),
     ));
 
-    // 4b. User WebSocket — authenticated feed for fill tracking
+    // 4b. User WebSocket — authenticated feed for fill tracking (900s interval for 15m windows)
     let (fill_tx, fill_rx) = mpsc::channel::<feeds::user_ws::UserFillEvent>(1_000);
     if config.has_credentials() {
         let api_key = config.poly_api_key.clone();
@@ -115,7 +119,7 @@ async fn main() -> Result<()> {
             api_key, api_secret, api_passphrase,
             market_watch_rx.clone(),
             fill_tx,
-            600,
+            900,
         ));
     } else {
         info!("No credentials — user WS disabled (fills won't be tracked)");
@@ -141,8 +145,8 @@ async fn main() -> Result<()> {
         log_tx.clone(),
     ));
 
-    // 7. Vidarx strategy — the new brain (with user WS fill tracking)
-    tokio::spawn(run_vidarx_strategy(
+    // 7. Vidarx BTC 15M strategy
+    tokio::spawn(run_vidarx_btc15_strategy(
         config.clone(),
         shared.clone(),
         market_watch_rx.clone(),
@@ -165,16 +169,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// FLASH LADDER Strategy — post both-side ladders, cancel after 250ms, repeat.
+/// FLASH LADDER Strategy (BTC 15M) — post both-side ladders, cancel after 250ms, repeat.
 ///
-/// 1. T+10s: start posting 3-level ladders on BOTH sides (ask-3c, -4c, -5c)
+/// 1. T-60s: start posting 3-level ladders on BOTH sides (bid-3c, -4c, -5c)
 /// 2. Cancel all after 250ms (avoid catching falling knives)
 /// 3. Re-post every 2s with fresh prices
-/// 4. Max 20sh per side. Once one side hits 20sh:
+/// 4. Max 200sh per side (practical_full=196). Once one side hits 196sh:
 ///    - If other side within 10% → done, hold to resolution
-///    - If not → post single GTC on underweight side at profitable price
-///    - Leave that GTC until resolution
-async fn run_vidarx_strategy(
+///    - If not → keep laddering the underweight side
+///    - Stop at T+840s
+async fn run_vidarx_btc15_strategy(
     config: Config,
     _shared: SharedState,
     market_rx: watch::Receiver<MarketDescriptor>,
@@ -185,7 +189,7 @@ async fn run_vidarx_strategy(
     mut fill_rx: mpsc::Receiver<feeds::user_ws::UserFillEvent>,
     _log_tx: mpsc::Sender<LogEvent>,
 ) {
-    info!("FLASH LADDER: post both sides ask-3/-4/-5c, cancel@250ms, max 20sh/side, matching GTC");
+    info!("BTC 15M FLASH LADDER: post both sides bid-3/-4/-5c, cancel@250ms, max 200sh/side");
 
     // Per-window state
     let mut last_window_ts: i64 = 0;
@@ -198,7 +202,7 @@ async fn run_vidarx_strategy(
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
     let mut matching_gtc_posted = false; // true once we've posted the single matching GTC
-    let max_shares_per_side: f64 = 75.0;
+    let max_shares_per_side: f64 = 200.0;
     let match_tolerance = 0.10; // within 10% = considered matched
     let target_pair_cost = 0.95; // lockprofit target
 
@@ -240,7 +244,7 @@ async fn run_vidarx_strategy(
                     reason: "new_window".into(),
                 }).await;
 
-                info!(">>> NEW WINDOW {} — flash ladder max {:.0}sh/side", market.window_start_ts, max_shares_per_side);
+                info!(">>> NEW WINDOW {} — BTC 15M flash ladder max {:.0}sh/side", market.window_start_ts, max_shares_per_side);
             }
         }
 
@@ -287,9 +291,9 @@ async fn run_vidarx_strategy(
                 info!(">>> FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c",
                     side_label, fill.size, fill.price, up_shares, dn_shares, matched, pair_cost * 100.0);
 
-                // FIX #2: Only check match AFTER one side is full (>= 20sh)
-                // Don't stop early when both sides are half-full
-                if !pair_done && (up_shares >= max_shares_per_side || dn_shares >= max_shares_per_side) {
+                // Only check match AFTER one side is full (>= practical_full)
+                let practical_full = max_shares_per_side - 4.0; // 196 when cap = 200
+                if !pair_done && (up_shares >= practical_full || dn_shares >= practical_full) {
                     let bigger = up_shares.max(dn_shares);
                     let smaller = up_shares.min(dn_shares);
                     if smaller >= bigger * (1.0 - match_tolerance) {
@@ -306,7 +310,7 @@ async fn run_vidarx_strategy(
             // Heartbeat
             _ = heartbeat_interval.tick() => {
                 let top = pm_top_rx.borrow().clone();
-                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pair_done={} gtc_match={} | fills={}",
+                info!("HEARTBEAT BTC 15M: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pair_done={} gtc_match={} | fills={}",
                     top.up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
                     top.down_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
                     up_shares, dn_shares, pair_done, matching_gtc_posted, fills_this_window);
@@ -322,12 +326,12 @@ async fn run_vidarx_strategy(
 
                 let elapsed_s = (now_ms / 1000) - market.window_start_ts;
 
-                // Wait for T+10s
-                if elapsed_s < 10 { continue; }
-                // Stop at T+240s
-                if elapsed_s >= 240 {
+                // Start at T-60s (1 minute BEFORE window opens)
+                if elapsed_s < -60 { continue; }
+                // Stop at T+840s (14 minutes)
+                if elapsed_s >= 840 {
                     if !pair_done {
-                        info!(">>> T+240s — window over, holding to resolution");
+                        info!(">>> T+840s — window over (BTC 15M), holding to resolution");
                         pair_done = true;
                     }
                     continue;
@@ -357,15 +361,14 @@ async fn run_vidarx_strategy(
                 let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
 
                 // Check if one side is full
-                // Use practical_full (16) to avoid dead zone when remaining < 5 (venue min)
-                let practical_full = max_shares_per_side - 4.0; // 16 when cap = 20
+                // Use practical_full (196) to avoid dead zone when remaining < 5 (venue min)
+                let practical_full = max_shares_per_side - 4.0; // 196 when cap = 200
                 let one_side_full = up_shares >= practical_full || dn_shares >= practical_full;
 
                 if !one_side_full && !matching_gtc_posted {
                     // Both sides still need tokens — post flash ladders every 2s
                     if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
                         // Post 3-level ladder on BOTH sides: bid-3c, bid-4c, bid-5c
-                        // FIX #1: decrement remaining as we post each level
                         // UP side
                         if up_needs >= 5.0 {
                             let base_sizes = [8.0_f64, 6.0, 6.0];
@@ -423,8 +426,7 @@ async fn run_vidarx_strategy(
                     }
                 }
 
-                // ═══ PHASE 2: One side full — post matching GTC on the other side ═══
-                // ═══ PHASE 2: One side full — keep laddering the underweight side 2c deeper ═══
+                // ═══ PHASE 2: One side full — keep laddering the underweight side ═══
                 if one_side_full && !pair_done {
                     let (full_side, full_shares, _full_cost) =
                         if up_shares >= dn_shares {
@@ -487,7 +489,7 @@ async fn run_vidarx_strategy(
 
                         orders_live = true;
                         last_post_ts = now_ms;
-                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | ladders -3/-4/-5c",
+                        info!(">>> PHASE 2 BTC 15M: {} full {:.0}sh | {} needs {:.0} more | ladders -3/-4/-5c",
                             full_side, full_shares, need_label, still_need);
                     }
                 }

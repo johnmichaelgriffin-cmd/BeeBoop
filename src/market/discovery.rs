@@ -1,16 +1,17 @@
-//! Market discovery — finds current 5-minute BTC Up/Down markets.
+//! Market discovery — finds current BTC/ETH/SOL/XRP/BNB Up/Down markets.
 //!
 //! Queries Gamma API for active markets, extracts UP/DOWN token IDs,
 //! and updates the watch channel when a new window starts.
+//!
+//! Supports 5-minute (300s) and 15-minute (900s) windows based on config.market.
 
 use tokio::sync::{mpsc, watch};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::config_v2::Config;
 use crate::types_v2::{LogEvent, MarketDescriptor};
 
 const GAMMA_API: &str = "https://gamma-api.polymarket.com";
-const WINDOW_SECONDS: i64 = 300;
 
 pub async fn run_market_discovery_task(
     config: Config,
@@ -22,28 +23,29 @@ pub async fn run_market_discovery_task(
         .build()
         .expect("http client");
 
-    let slug_prefix = match config.market.as_str() {
-        "btc" => "btc-updown-5m",
-        "eth" => "eth-updown-5m",
-        "sol" => "sol-updown-5m",
-        "xrp" => "xrp-updown-5m",
-        "bnb" => "bnb-updown-5m",
-        _ => "btc-updown-5m",
+    let (slug_prefix, window_seconds): (&str, i64) = match config.market.as_str() {
+        "btc"   => ("btc-updown-5m",  300),
+        "btc15" => ("btc-updown-15m", 900),
+        "eth"   => ("eth-updown-5m",  300),
+        "sol"   => ("sol-updown-5m",  300),
+        "xrp"   => ("xrp-updown-5m",  300),
+        "bnb"   => ("bnb-updown-5m",  300),
+        _       => ("btc-updown-5m",  300),
     };
 
     let mut last_window_ts: i64 = 0;
 
     loop {
         let now = chrono::Utc::now().timestamp();
-        let current_window = now - (now % WINDOW_SECONDS);
-        let next_window = current_window + WINDOW_SECONDS;
+        let current_window = now - (now % window_seconds);
+        let next_window = current_window + window_seconds;
 
         // Only fetch if window changed
         if current_window != last_window_ts {
             // Fetch current and next window
             for wts in [current_window, next_window] {
                 let slug = format!("{}-{}", slug_prefix, wts);
-                match fetch_market(&client, &slug).await {
+                match fetch_market(&client, &slug, window_seconds).await {
                     Some(md) => {
                         info!("market: {} UP={}...{} DN={}...{}",
                             md.slug,
@@ -72,7 +74,7 @@ pub async fn run_market_discovery_task(
     }
 }
 
-async fn fetch_market(client: &reqwest::Client, slug: &str) -> Option<MarketDescriptor> {
+async fn fetch_market(client: &reqwest::Client, slug: &str, window_seconds: i64) -> Option<MarketDescriptor> {
     let url = format!("{}/events?slug={}", GAMMA_API, slug);
     let resp = client.get(&url).send().await.ok()?;
     let body: serde_json::Value = resp.json().await.ok()?;
@@ -117,6 +119,6 @@ async fn fetch_market(client: &reqwest::Client, slug: &str) -> Option<MarketDesc
         up_token_id: up_id,
         down_token_id: down_id,
         window_start_ts: window_ts,
-        window_end_ts: window_ts + WINDOW_SECONDS,
+        window_end_ts: window_ts + window_seconds,
     })
 }

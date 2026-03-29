@@ -95,6 +95,10 @@ name = "beeboop-v3"
 path = "src/main_vidarx.rs"
 
 [[bin]]
+name = "beeboop-btc15"
+path = "src/main_vidarx_btc15.rs"
+
+[[bin]]
 name = "beeboop-v3-eth"
 path = "src/main_vidarx_eth.rs"
 

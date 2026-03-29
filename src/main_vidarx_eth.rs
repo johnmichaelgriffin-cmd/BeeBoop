@@ -118,6 +118,7 @@ async fn main() -> Result<()> {
             api_key, api_secret, api_passphrase,
             market_watch_rx.clone(),
             fill_tx,
+            600,
         ));
     } else {
         info!("No credentials — user WS disabled (fills won't be tracked)");
