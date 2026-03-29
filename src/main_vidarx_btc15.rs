@@ -376,7 +376,7 @@ async fn run_vidarx_btc15_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (1 + level) as f64 * 0.01;
+                                let offset = (2 + level) as f64 * 0.01;
                                 let price = ((up_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= up_ask { continue; }
 
@@ -402,7 +402,7 @@ async fn run_vidarx_btc15_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (1 + level) as f64 * 0.01;
+                                let offset = (2 + level) as f64 * 0.01;
                                 let price = ((dn_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= dn_ask { continue; }
 
@@ -469,7 +469,7 @@ async fn run_vidarx_btc15_strategy(
                             let size = base_size.min(remaining);
                             if size < 5.0 { break; }
                             // Same as Phase 1: bid-1/2/3c
-                            let offset = (1 + level) as f64 * 0.01;
+                            let offset = (2 + level) as f64 * 0.01;
                             let price = ((need_bid - offset) * 100.0).round() / 100.0;
                             if price <= 0.01 || price >= need_ask { continue; }
 
