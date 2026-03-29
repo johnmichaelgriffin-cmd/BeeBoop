@@ -207,14 +207,10 @@ async fn run_vidarx_btc15_strategy(
     let target_pair_cost = 0.95; // lockprofit target
 
     // Timing
-    let post_interval_ms: i64 = 2000;       // min 2s cooldown after cancel before repost
-    let max_order_live_ms: i64 = 2_000;     // repost every 2s, unless price cancel fires first
+    let post_interval_ms: i64 = 2000;       // repost every 2s
+    let cancel_delay_ms: i64 = 2000;        // cancel after 2s
     let mut last_post_ts: i64 = 0;
     let mut orders_live = false;             // true while orders are on the book
-
-    // Posted price tracking — for price-based cancel
-    let mut posted_up_top: f64 = 0.0;   // level-0 UP bid posted price
-    let mut posted_dn_top: f64 = 0.0;   // level-0 DN bid posted price
 
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
@@ -242,8 +238,6 @@ async fn run_vidarx_btc15_strategy(
                 matching_gtc_posted = false;
                 orders_live = false;
                 last_post_ts = 0;
-                posted_up_top = 0.0;
-                posted_dn_top = 0.0;
                 last_window_ts = market.window_start_ts;
 
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
@@ -354,32 +348,12 @@ async fn run_vidarx_btc15_strategy(
                     _ => continue,
                 };
 
-                // ═══ CANCEL: price-based (falling knife) OR 30s time refresh ═══
-                if orders_live {
-                    let up_danger = posted_up_top > 0.0 && up_bid <= posted_up_top + 0.01;
-                    let dn_danger = posted_dn_top > 0.0 && dn_bid <= posted_dn_top + 0.01;
-                    let time_refresh = (now_ms - last_post_ts) >= max_order_live_ms;
-
-                    if up_danger || dn_danger {
-                        info!(">>> PRICE CANCEL: market approaching — UP bid={:.0}c posted={:.0}c | DN bid={:.0}c posted={:.0}c",
-                            up_bid * 100.0, posted_up_top * 100.0, dn_bid * 100.0, posted_dn_top * 100.0);
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "price_cancel_bid_too_close".into(),
-                        }).await;
-                        orders_live = false;
-                        posted_up_top = 0.0;
-                        posted_dn_top = 0.0;
-                        last_post_ts = now_ms; // 2s cooldown before repost
-                    } else if time_refresh {
-                        info!(">>> TIME REFRESH: reposting at fresh prices after 30s");
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "time_refresh_30s".into(),
-                        }).await;
-                        orders_live = false;
-                        posted_up_top = 0.0;
-                        posted_dn_top = 0.0;
-                        last_post_ts = now_ms;
-                    }
+                // ═══ CANCEL after 2s ═══
+                if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms {
+                    let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                        reason: "flash_cancel_2s".into(),
+                    }).await;
+                    orders_live = false;
                 }
 
                 // ═══ PHASE 1: Both sides need tokens — post flash ladders ═══
@@ -394,7 +368,7 @@ async fn run_vidarx_btc15_strategy(
                 if !one_side_full && !matching_gtc_posted {
                     // Both sides still need tokens — post flash ladders every 2s
                     if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
-                        // Post 3-level ladder on BOTH sides: bid-3c, bid-4c, bid-5c
+                        // Post 3-level ladder on BOTH sides: bid-1c, bid-2c, bid-3c
                         // UP side
                         if up_needs >= 5.0 {
                             let base_sizes = [8.0_f64, 6.0, 6.0];
@@ -402,10 +376,9 @@ async fn run_vidarx_btc15_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (3 + level) as f64 * 0.01;
+                                let offset = (1 + level) as f64 * 0.01;
                                 let price = ((up_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= up_ask { continue; }
-                                if level == 0 { posted_up_top = price; }
 
                                 let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                     market_slug: market.slug.clone(),
@@ -429,10 +402,9 @@ async fn run_vidarx_btc15_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (3 + level) as f64 * 0.01;
+                                let offset = (1 + level) as f64 * 0.01;
                                 let price = ((dn_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= dn_ask { continue; }
-                                if level == 0 { posted_dn_top = price; }
 
                                 let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                     market_slug: market.slug.clone(),
@@ -496,14 +468,10 @@ async fn run_vidarx_btc15_strategy(
                         for (level, &base_size) in base_sizes.iter().enumerate() {
                             let size = base_size.min(remaining);
                             if size < 5.0 { break; }
-                            // Same as Phase 1: 3c, 4c, 5c from bid
-                            let offset = (3 + level) as f64 * 0.01;
+                            // Same as Phase 1: bid-1/2/3c
+                            let offset = (1 + level) as f64 * 0.01;
                             let price = ((need_bid - offset) * 100.0).round() / 100.0;
                             if price <= 0.01 || price >= need_ask { continue; }
-                            if level == 0 {
-                                if need_side == Side::Up { posted_up_top = price; }
-                                else { posted_dn_top = price; }
-                            }
 
                             let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                 market_slug: market.slug.clone(),
