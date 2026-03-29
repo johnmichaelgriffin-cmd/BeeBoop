@@ -367,7 +367,7 @@ async fn run_vidarx_strategy(
                         // FIX #1: decrement remaining as we post each level
                         // UP side
                         if up_needs >= 5.0 {
-                            let base_sizes = [10.0_f64, 8.0, 8.0];
+                            let base_sizes = [8.0_f64, 6.0, 6.0];
                             let mut up_remaining = up_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
@@ -393,7 +393,7 @@ async fn run_vidarx_strategy(
 
                         // DN side
                         if dn_needs >= 5.0 {
-                            let base_sizes = [10.0_f64, 8.0, 8.0];
+                            let base_sizes = [8.0_f64, 6.0, 6.0];
                             let mut dn_remaining = dn_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
@@ -458,7 +458,7 @@ async fn run_vidarx_strategy(
                         }).await;
                     } else if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
                         // Keep posting ladders on the UNDERWEIGHT side only, same offsets as Phase 1
-                        let base_sizes = [10.0_f64, 8.0, 8.0];
+                        let base_sizes = [8.0_f64, 6.0, 6.0];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
 

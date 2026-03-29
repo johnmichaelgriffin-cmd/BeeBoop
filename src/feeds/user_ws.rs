@@ -138,24 +138,12 @@ pub async fn run_user_ws_task(
         let mut order_matched: HashMap<String, f64> = HashMap::new();
         let mut events_received: u64 = 0;
         let user_connect_time = chrono::Utc::now().timestamp();
-        // Forced reconnect at the next :59 past the hour (e.g. 10:59, 11:59, ...)
-        let user_reconnect_at: i64 = {
-            let now = chrono::Utc::now();
-            let secs_into_hour = (now.minute() as i64) * 60 + (now.second() as i64);
-            let target_secs: i64 = 59 * 60; // :59:00 into the hour
-            if secs_into_hour < target_secs {
-                now.timestamp() + (target_secs - secs_into_hour)
-            } else {
-                now.timestamp() + (3600 - secs_into_hour + target_secs)
-            }
-        };
-
         // Reader loop with market change detection + forced reconnect
         loop {
-            // Forced reconnect at :59 past the hour
+            // Forced reconnect every 10 minutes
             let now_secs = chrono::Utc::now().timestamp();
-            if now_secs >= user_reconnect_at {
-                info!("user_ws: FORCED RECONNECT at :59 mark ({}s since connect)", now_secs - user_connect_time);
+            if now_secs - user_connect_time >= 600 {
+                info!("user_ws: FORCED RECONNECT after 600s");
                 break;
             }
 
