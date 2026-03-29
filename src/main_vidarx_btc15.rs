@@ -208,7 +208,7 @@ async fn run_vidarx_btc15_strategy(
 
     // Timing
     let post_interval_ms: i64 = 2000;   // post ladders every 2s
-    let cancel_delay_ms: u64 = 1000;    // cancel 1000ms after posting
+    let cancel_delay_ms: u64 = 2000;    // cancel 2000ms after posting
     let mut last_post_ts: i64 = 0;
     let mut orders_live = false;         // true between post and cancel
 
