@@ -208,7 +208,7 @@ async fn run_vidarx_btc15_strategy(
 
     // Timing
     let post_interval_ms: i64 = 2000;       // min 2s cooldown after cancel before repost
-    let max_order_live_ms: i64 = 30_000;    // hard refresh every 30s (repost at fresh prices)
+    let max_order_live_ms: i64 = 2_000;     // repost every 2s, unless price cancel fires first
     let mut last_post_ts: i64 = 0;
     let mut orders_live = false;             // true while orders are on the book
 
