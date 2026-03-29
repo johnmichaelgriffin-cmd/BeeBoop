@@ -207,9 +207,10 @@ async fn run_vidarx_btc15_strategy(
     let target_pair_cost = 0.95; // lockprofit target
 
     // Timing
-    let post_interval_ms: i64 = 2000;   // min 2s cooldown between post cycles
+    let post_interval_ms: i64 = 2000;       // min 2s cooldown after cancel before repost
+    let max_order_live_ms: i64 = 30_000;    // hard refresh every 30s (repost at fresh prices)
     let mut last_post_ts: i64 = 0;
-    let mut orders_live = false;         // true while orders are on the book
+    let mut orders_live = false;             // true while orders are on the book
 
     // Posted price tracking — for price-based cancel
     let mut posted_up_top: f64 = 0.0;   // level-0 UP bid posted price
@@ -353,13 +354,14 @@ async fn run_vidarx_btc15_strategy(
                     _ => continue,
                 };
 
-                // ═══ CANCEL if market drops to within 1c of our posted bid ═══
-                // Keeps queue position when market is stable; bails when knife is falling
+                // ═══ CANCEL: price-based (falling knife) OR 30s time refresh ═══
                 if orders_live {
                     let up_danger = posted_up_top > 0.0 && up_bid <= posted_up_top + 0.01;
                     let dn_danger = posted_dn_top > 0.0 && dn_bid <= posted_dn_top + 0.01;
+                    let time_refresh = (now_ms - last_post_ts) >= max_order_live_ms;
+
                     if up_danger || dn_danger {
-                        info!(">>> PRICE CANCEL: bid approached — UP bid={:.0}c posted={:.0}c | DN bid={:.0}c posted={:.0}c",
+                        info!(">>> PRICE CANCEL: market approaching — UP bid={:.0}c posted={:.0}c | DN bid={:.0}c posted={:.0}c",
                             up_bid * 100.0, posted_up_top * 100.0, dn_bid * 100.0, posted_dn_top * 100.0);
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                             reason: "price_cancel_bid_too_close".into(),
@@ -368,6 +370,15 @@ async fn run_vidarx_btc15_strategy(
                         posted_up_top = 0.0;
                         posted_dn_top = 0.0;
                         last_post_ts = now_ms; // 2s cooldown before repost
+                    } else if time_refresh {
+                        info!(">>> TIME REFRESH: reposting at fresh prices after 30s");
+                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                            reason: "time_refresh_30s".into(),
+                        }).await;
+                        orders_live = false;
+                        posted_up_top = 0.0;
+                        posted_dn_top = 0.0;
+                        last_post_ts = now_ms;
                     }
                 }
 
