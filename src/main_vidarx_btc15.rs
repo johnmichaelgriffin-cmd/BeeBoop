@@ -169,10 +169,10 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// FLASH LADDER Strategy (BTC 15M) — post both-side ladders, cancel after 250ms, repeat.
+/// FLASH LADDER Strategy (BTC 15M) — post both-side ladders, cancel after 2000ms, repeat.
 ///
 /// 1. T-60s: start posting 3-level ladders on BOTH sides (bid-3c, -4c, -5c)
-/// 2. Cancel all after 250ms (avoid catching falling knives)
+/// 2. Cancel all after 2000ms (avoid catching falling knives)
 /// 3. Re-post every 2s with fresh prices
 /// 4. Max 200sh per side (practical_full=196). Once one side hits 196sh:
 ///    - If other side within 10% → done, hold to resolution
@@ -189,7 +189,7 @@ async fn run_vidarx_btc15_strategy(
     mut fill_rx: mpsc::Receiver<feeds::user_ws::UserFillEvent>,
     _log_tx: mpsc::Sender<LogEvent>,
 ) {
-    info!("BTC 15M FLASH LADDER: post both sides bid-3/-4/-5c, cancel@250ms, max 200sh/side");
+    info!("BTC 15M FLASH LADDER: post both sides bid-3/-4/-5c, cancel@2000ms, max 200sh/side");
 
     // Per-window state
     let mut last_window_ts: i64 = 0;
@@ -337,10 +337,10 @@ async fn run_vidarx_btc15_strategy(
                     continue;
                 }
 
-                // ═══ CANCEL after 250ms ═══
+                // ═══ CANCEL after 2000ms ═══
                 if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms as i64 {
                     let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                        reason: "flash_cancel_250ms".into(),
+                        reason: "flash_cancel_2000ms".into(),
                     }).await;
                     orders_live = false;
                 }
