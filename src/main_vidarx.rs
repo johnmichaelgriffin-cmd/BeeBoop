@@ -207,6 +207,9 @@ async fn run_vidarx_strategy(
     let mut latest_obi: f64 = 0.0;
     let obi_threshold: f64 = 0.3; // |obi| > 0.3 = strong directional signal
 
+    // Window skip — play ~75% of windows (roll 1–100, skip if ≤25)
+    let mut window_skip = false;
+
     // Timing — both cancel and repost intervals randomized 500–2000ms
     let mut cancel_delay_ms: i64 = 2000; // randomized at post time
     let mut next_post_interval_ms: i64 = 0; // randomized at cancel time
@@ -241,14 +244,22 @@ async fn run_vidarx_strategy(
                 orders_live = false;
                 last_post_ts = 0;
                 last_cancel_ts = 0;
-                next_post_interval_ms = 0; // post immediately on new window
+                next_post_interval_ms = rand::thread_rng().gen_range(500..=2000); // randomize first post
                 last_window_ts = market.window_start_ts;
+
+                // Roll for window skip (1–100, skip if ≤25 → 75% play rate)
+                let roll = rand::thread_rng().gen_range(1u32..=100);
+                window_skip = roll <= 25;
 
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                     reason: "new_window".into(),
                 }).await;
 
-                info!(">>> NEW WINDOW {} — flash ladder max {:.0}sh/side", market.window_start_ts, max_shares_per_side);
+                if window_skip {
+                    info!(">>> NEW WINDOW {} — SKIPPING (roll={}/25)", market.window_start_ts, roll);
+                } else {
+                    info!(">>> NEW WINDOW {} — PLAYING (roll={}) max {:.0}sh/side", market.window_start_ts, roll, max_shares_per_side);
+                }
             }
         }
 
@@ -343,10 +354,10 @@ async fn run_vidarx_strategy(
                     continue;
                 }
 
-                // ═══ CANCEL after 2s — sample next interval at cancel time ═══
+                // ═══ CANCEL (random lifetime) — sample next repost interval at cancel time ═══
                 if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms {
                     let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                        reason: "flash_cancel_2s".into(),
+                        reason: "flash_cancel".into(),
                     }).await;
                     orders_live = false;
                     last_cancel_ts = now_ms;
@@ -373,7 +384,7 @@ async fn run_vidarx_strategy(
                 let practical_full = max_shares_per_side - 4.0; // 16 when cap = 20
                 let one_side_full = up_shares >= practical_full || dn_shares >= practical_full;
 
-                if !one_side_full && !matching_gtc_posted {
+                if !window_skip && !one_side_full && !matching_gtc_posted {
                     // Both sides still need tokens — wait measured from cancel, not post
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                         // OBI gate: go deep (3) on the risky side, random (1–3) on the safe side
@@ -448,7 +459,7 @@ async fn run_vidarx_strategy(
 
                 // ═══ PHASE 2: One side full — post matching GTC on the other side ═══
                 // ═══ PHASE 2: One side full — keep laddering the underweight side 2c deeper ═══
-                if one_side_full && !pair_done {
+                if !window_skip && one_side_full && !pair_done {
                     let (full_side, full_shares, _full_cost) =
                         if up_shares >= dn_shares {
                             ("UP", up_shares, up_cost)
@@ -485,7 +496,7 @@ async fn run_vidarx_strategy(
                         let risky = (need_side == Side::Up && latest_obi < -obi_threshold)
                                  || (need_side == Side::Down && latest_obi > obi_threshold);
                         let offset_base = if risky { 3usize } else { rand::thread_rng().gen_range(1usize..=3) };
-                        let base_sizes = [8.0_f64, 6.0, 6.0];
+                        let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
                         let mut posted_any = false;
