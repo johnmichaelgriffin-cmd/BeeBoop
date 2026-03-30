@@ -387,7 +387,7 @@ async fn run_vidarx_btc15_strategy(
 
                         // UP side
                         if up_needs >= 5.0 {
-                            let base_sizes = [8.0_f64, 6.0, 6.0];
+                            let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
                             let mut up_remaining = up_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
@@ -414,7 +414,7 @@ async fn run_vidarx_btc15_strategy(
 
                         // DN side
                         if dn_needs >= 5.0 {
-                            let base_sizes = [8.0_f64, 6.0, 6.0];
+                            let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
                             let mut dn_remaining = dn_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
