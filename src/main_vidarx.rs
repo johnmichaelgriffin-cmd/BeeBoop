@@ -207,9 +207,9 @@ async fn run_vidarx_strategy(
     let mut latest_obi: f64 = 0.0;
     let obi_threshold: f64 = 0.3; // |obi| > 0.3 = strong directional signal
 
-    // Timing — fixed 2s cancel, randomized 500–2000ms wait measured from cancel
-    let cancel_delay_ms: i64 = 2000;
-    let mut next_post_interval_ms: i64 = 0; // sampled at cancel time
+    // Timing — both cancel and repost intervals randomized 500–2000ms
+    let mut cancel_delay_ms: i64 = 2000; // randomized at post time
+    let mut next_post_interval_ms: i64 = 0; // randomized at cancel time
     let mut last_cancel_ts: i64 = 0;
     let mut last_post_ts: i64 = 0;
     let mut orders_live = false;         // true only if at least one order was sent
@@ -440,7 +440,8 @@ async fn run_vidarx_strategy(
                         if posted_any {
                             orders_live = true;
                             last_post_ts = now_ms;
-                            info!(">>> POST P1: obi={:.2} up_off={} dn_off={}", latest_obi, up_offset, dn_offset);
+                            cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
+                            info!(">>> POST P1: obi={:.2} up_off={} dn_off={} cancel={}ms", latest_obi, up_offset, dn_offset, cancel_delay_ms);
                         }
                     }
                 }
@@ -514,6 +515,7 @@ async fn run_vidarx_strategy(
                         if posted_any {
                             orders_live = true;
                             last_post_ts = now_ms;
+                            cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
                         }
                         info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | offset_base={}",
                             full_side, full_shares, need_label, still_need, offset_base);
