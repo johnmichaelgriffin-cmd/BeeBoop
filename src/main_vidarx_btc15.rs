@@ -207,6 +207,10 @@ async fn run_vidarx_btc15_strategy(
     let match_tolerance = 0.10; // within 10% = considered matched
     let target_pair_cost = 0.95; // lockprofit target
 
+    // OBI gate — adverse selection protection
+    let mut latest_obi: f64 = 0.0;
+    let obi_threshold: f64 = 0.3;
+
     // Timing — fixed 2s cancel, randomized 500–2000ms wait measured from cancel
     let cancel_delay_ms: i64 = 2000;
     let mut next_post_interval_ms: i64 = 0; // sampled at cancel time
@@ -253,8 +257,10 @@ async fn run_vidarx_btc15_strategy(
         }
 
         tokio::select! {
-            // Drain signals (not used directly but keeps channel flowing)
-            Some(_) = signal_rx.recv() => {}
+            // Store latest OBI for adverse selection gating
+            Some(sig) = signal_rx.recv() => {
+                latest_obi = sig.obi_ema;
+            }
 
             // Process executor events — confirm matching GTC was accepted
             Some(evt) = exec_evt_rx.recv() => {
@@ -374,7 +380,9 @@ async fn run_vidarx_btc15_strategy(
                 if !one_side_full && !matching_gtc_posted {
                     // Both sides still need tokens — wait measured from cancel, not post
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        let offset_base = rand::thread_rng().gen_range(1usize..=3);
+                        // OBI gate: go deep (3) on risky side, random (1–3) on safe side
+                        let up_offset = if latest_obi < -obi_threshold { 3usize } else { rand::thread_rng().gen_range(1usize..=3) };
+                        let dn_offset = if latest_obi >  obi_threshold { 3usize } else { rand::thread_rng().gen_range(1usize..=3) };
                         let mut posted_any = false;
 
                         // UP side
@@ -384,7 +392,7 @@ async fn run_vidarx_btc15_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (offset_base + level) as f64 * 0.01;
+                                let offset = (up_offset + level) as f64 * 0.01;
                                 let price = ((up_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= up_ask { continue; }
 
@@ -411,7 +419,7 @@ async fn run_vidarx_btc15_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (offset_base + level) as f64 * 0.01;
+                                let offset = (dn_offset + level) as f64 * 0.01;
                                 let price = ((dn_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= dn_ask { continue; }
 
@@ -434,6 +442,7 @@ async fn run_vidarx_btc15_strategy(
                         if posted_any {
                             orders_live = true;
                             last_post_ts = now_ms;
+                            info!(">>> POST P1: obi={:.2} up_off={} dn_off={}", latest_obi, up_offset, dn_offset);
                         }
                     }
                 }
@@ -472,7 +481,9 @@ async fn run_vidarx_btc15_strategy(
                             reason: "close_enough_sub5".into(),
                         }).await;
                     } else if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        let offset_base = rand::thread_rng().gen_range(1usize..=3);
+                        let risky = (need_side == Side::Up && latest_obi < -obi_threshold)
+                                 || (need_side == Side::Down && latest_obi > obi_threshold);
+                        let offset_base = if risky { 3usize } else { rand::thread_rng().gen_range(1usize..=3) };
                         let base_sizes = [8.0_f64, 6.0, 6.0];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
