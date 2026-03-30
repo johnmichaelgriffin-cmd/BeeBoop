@@ -21,6 +21,7 @@ mod logging;
 use anyhow::Result;
 use tracing::{info, warn, error};
 use tokio::sync::{broadcast, mpsc, watch};
+use rand::Rng;
 
 use config_v2::Config;
 use state::SharedState;
@@ -202,9 +203,9 @@ async fn run_vidarx_strategy(
     let match_tolerance = 0.10; // within 10% = considered matched
     let target_pair_cost = 0.95; // lockprofit target
 
-    // Timing
-    let post_interval_ms: i64 = 2000;   // post ladders every 2s
-    let cancel_delay_ms: u64 = 250;     // cancel 250ms after posting
+    // Timing — randomized post interval 500–2000ms, fixed 2s cancel
+    let cancel_delay_ms: i64 = 2000;
+    let mut next_post_interval_ms: i64 = 2000; // randomized each cycle
     let mut last_post_ts: i64 = 0;
     let mut orders_live = false;         // true between post and cancel
 
@@ -333,10 +334,10 @@ async fn run_vidarx_strategy(
                     continue;
                 }
 
-                // ═══ CANCEL after 250ms ═══
-                if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms as i64 {
+                // ═══ CANCEL after 2s ═══
+                if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms {
                     let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                        reason: "flash_cancel_250ms".into(),
+                        reason: "flash_cancel_2s".into(),
                     }).await;
                     orders_live = false;
                 }
@@ -362,10 +363,12 @@ async fn run_vidarx_strategy(
                 let one_side_full = up_shares >= practical_full || dn_shares >= practical_full;
 
                 if !one_side_full && !matching_gtc_posted {
-                    // Both sides still need tokens — post flash ladders every 2s
-                    if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
-                        // Post 3-level ladder on BOTH sides: bid-3c, bid-4c, bid-5c
-                        // FIX #1: decrement remaining as we post each level
+                    // Both sides still need tokens — post flash ladders at randomized interval
+                    if !orders_live && (now_ms - last_post_ts) >= next_post_interval_ms {
+                        // Randomize: interval 500–2000ms, offset_base 1–3 (gives bid-1/2/3 to bid-3/4/5)
+                        next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                        let offset_base = rand::thread_rng().gen_range(1usize..=3);
+                        // Post 3-level ladder on BOTH sides
                         // UP side
                         if up_needs >= 5.0 {
                             let base_sizes = [8.0_f64, 6.0, 6.0];
@@ -373,7 +376,7 @@ async fn run_vidarx_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (3 + level) as f64 * 0.01;
+                                let offset = (offset_base + level) as f64 * 0.01;
                                 let price = ((up_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= up_ask { continue; }
 
@@ -399,7 +402,7 @@ async fn run_vidarx_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (3 + level) as f64 * 0.01;
+                                let offset = (offset_base + level) as f64 * 0.01;
                                 let price = ((dn_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= dn_ask { continue; }
 
@@ -457,8 +460,9 @@ async fn run_vidarx_strategy(
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                             reason: "close_enough_sub5".into(),
                         }).await;
-                    } else if !orders_live && (now_ms - last_post_ts) >= post_interval_ms {
-                        // Keep posting ladders on the UNDERWEIGHT side only, same offsets as Phase 1
+                    } else if !orders_live && (now_ms - last_post_ts) >= next_post_interval_ms {
+                        next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                        let offset_base = rand::thread_rng().gen_range(1usize..=3);
                         let base_sizes = [8.0_f64, 6.0, 6.0];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
@@ -466,8 +470,7 @@ async fn run_vidarx_strategy(
                         for (level, &base_size) in base_sizes.iter().enumerate() {
                             let size = base_size.min(remaining);
                             if size < 5.0 { break; }
-                            // Same as Phase 1: 3c, 4c, 5c from bid
-                            let offset = (3 + level) as f64 * 0.01;
+                            let offset = (offset_base + level) as f64 * 0.01;
                             let price = ((need_bid - offset) * 100.0).round() / 100.0;
                             if price <= 0.01 || price >= need_ask { continue; }
 
