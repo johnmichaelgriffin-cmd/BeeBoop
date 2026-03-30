@@ -208,7 +208,7 @@ async fn run_vidarx_strategy(
     let obi_threshold: f64 = 0.3; // |obi| > 0.3 = strong directional signal
 
     // Timing — fixed 2s cancel, randomized 500–2000ms wait measured from cancel
-    let cancel_delay_ms: i64 = 2000;
+    let cancel_delay_ms: i64 = 750;
     let mut next_post_interval_ms: i64 = 0; // sampled at cancel time
     let mut last_cancel_ts: i64 = 0;
     let mut last_post_ts: i64 = 0;
