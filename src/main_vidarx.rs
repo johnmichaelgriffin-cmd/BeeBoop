@@ -203,11 +203,12 @@ async fn run_vidarx_strategy(
     let match_tolerance = 0.10; // within 10% = considered matched
     let target_pair_cost = 0.95; // lockprofit target
 
-    // Timing — randomized post interval 500–2000ms, fixed 2s cancel
+    // Timing — fixed 2s cancel, randomized 500–2000ms wait measured from cancel
     let cancel_delay_ms: i64 = 2000;
-    let mut next_post_interval_ms: i64 = 2000; // randomized each cycle
+    let mut next_post_interval_ms: i64 = 0; // sampled at cancel time
+    let mut last_cancel_ts: i64 = 0;
     let mut last_post_ts: i64 = 0;
-    let mut orders_live = false;         // true between post and cancel
+    let mut orders_live = false;         // true only if at least one order was sent
 
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
@@ -235,6 +236,8 @@ async fn run_vidarx_strategy(
                 matching_gtc_posted = false;
                 orders_live = false;
                 last_post_ts = 0;
+                last_cancel_ts = 0;
+                next_post_interval_ms = 0; // post immediately on new window
                 last_window_ts = market.window_start_ts;
 
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
@@ -334,12 +337,14 @@ async fn run_vidarx_strategy(
                     continue;
                 }
 
-                // ═══ CANCEL after 2s ═══
+                // ═══ CANCEL after 2s — sample next interval at cancel time ═══
                 if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms {
                     let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                         reason: "flash_cancel_2s".into(),
                     }).await;
                     orders_live = false;
+                    last_cancel_ts = now_ms;
+                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
                 }
 
                 // Get prices
@@ -363,12 +368,11 @@ async fn run_vidarx_strategy(
                 let one_side_full = up_shares >= practical_full || dn_shares >= practical_full;
 
                 if !one_side_full && !matching_gtc_posted {
-                    // Both sides still need tokens — post flash ladders at randomized interval
-                    if !orders_live && (now_ms - last_post_ts) >= next_post_interval_ms {
-                        // Randomize: interval 500–2000ms, offset_base 1–3 (gives bid-1/2/3 to bid-3/4/5)
-                        next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                    // Both sides still need tokens — wait measured from cancel, not post
+                    if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                         let offset_base = rand::thread_rng().gen_range(1usize..=3);
-                        // Post 3-level ladder on BOTH sides
+                        let mut posted_any = false;
+
                         // UP side
                         if up_needs >= 5.0 {
                             let base_sizes = [8.0_f64, 6.0, 6.0];
@@ -390,6 +394,7 @@ async fn run_vidarx_strategy(
                                     ladder_key: format!("up:{}", level),
                                     was_cheap: up_ask < dn_ask,
                                 }).await;
+                                posted_any = true;
                                 up_remaining -= size;
                                 if up_remaining < 5.0 { break; }
                             }
@@ -416,13 +421,16 @@ async fn run_vidarx_strategy(
                                     ladder_key: format!("dn:{}", level),
                                     was_cheap: dn_ask < up_ask,
                                 }).await;
+                                posted_any = true;
                                 dn_remaining -= size;
                                 if dn_remaining < 5.0 { break; }
                             }
                         }
 
-                        orders_live = true;
-                        last_post_ts = now_ms;
+                        if posted_any {
+                            orders_live = true;
+                            last_post_ts = now_ms;
+                        }
                     }
                 }
 
@@ -460,12 +468,12 @@ async fn run_vidarx_strategy(
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                             reason: "close_enough_sub5".into(),
                         }).await;
-                    } else if !orders_live && (now_ms - last_post_ts) >= next_post_interval_ms {
-                        next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                    } else if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                         let offset_base = rand::thread_rng().gen_range(1usize..=3);
                         let base_sizes = [8.0_f64, 6.0, 6.0];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
+                        let mut posted_any = false;
 
                         for (level, &base_size) in base_sizes.iter().enumerate() {
                             let size = base_size.min(remaining);
@@ -484,14 +492,17 @@ async fn run_vidarx_strategy(
                                 ladder_key: format!("match_{}:{}", need_label.to_lowercase(), level),
                                 was_cheap: price < 0.50,
                             }).await;
+                            posted_any = true;
                             remaining -= size;
                             if remaining < 5.0 { break; }
                         }
 
-                        orders_live = true;
-                        last_post_ts = now_ms;
-                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | ladders -3/-4/-5c",
-                            full_side, full_shares, need_label, still_need);
+                        if posted_any {
+                            orders_live = true;
+                            last_post_ts = now_ms;
+                        }
+                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | offset_base={}",
+                            full_side, full_shares, need_label, still_need, offset_base);
                     }
                 }
             }
