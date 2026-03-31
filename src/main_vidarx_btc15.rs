@@ -218,6 +218,7 @@ async fn run_vidarx_btc15_strategy(
 
     // OBI — stored for spike cancel only (no directional skew in Phase 1)
     let mut latest_obi: f64 = 0.0;
+    let mut window_skip = false;
 
     // Timing — Phase 1: random 500–2000ms cancel / random 500–2000ms repost
     //          Phase 2: 1000–1500ms cancel / random 500–2000ms repost
@@ -252,17 +253,25 @@ async fn run_vidarx_btc15_strategy(
                 pair_done = false;
                 matching_gtc_posted = false;
                 repair_mode = false;
+                window_skip = false;
                 orders_live = false;
                 last_post_ts = 0;
                 last_cancel_ts = 0;
                 next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
                 last_window_ts = market.window_start_ts;
 
+                let roll = rand::thread_rng().gen_range(1u32..=100);
+                window_skip = roll <= 25;
+
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                     reason: "new_window".into(),
                 }).await;
 
-                info!(">>> NEW WINDOW {} — max {:.0}sh/side BTC 15M", market.window_start_ts, max_shares_per_side);
+                if window_skip {
+                    info!(">>> NEW WINDOW {} — SKIPPING (roll={}/25)", market.window_start_ts, roll);
+                } else {
+                    info!(">>> NEW WINDOW {} — PLAYING (roll={}) max {:.0}sh/side BTC 15M", market.window_start_ts, roll, max_shares_per_side);
+                }
             }
         }
 
@@ -458,7 +467,7 @@ async fn run_vidarx_btc15_strategy(
                     (0.96 - up_cost / up_shares).max(0.30)
                 } else { 1.0_f64 };
 
-                if !repair_mode && !matching_gtc_posted {
+                if !window_skip && !repair_mode && !matching_gtc_posted {
                     // Both sides still need tokens — deterministic 2s repost, 250ms cancel
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                         // Fixed ladder: bid-3c / bid-4c / bid-5c on both sides
@@ -530,7 +539,7 @@ async fn run_vidarx_btc15_strategy(
                 }
 
                 // ═══ PHASE 2: Repair mode — quote only the underweight side ═══
-                if repair_mode && !pair_done {
+                if !window_skip && repair_mode && !pair_done {
                     let (full_side, full_shares, full_cost) =
                         if up_shares >= dn_shares {
                             ("UP", up_shares, up_cost)
