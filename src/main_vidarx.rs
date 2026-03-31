@@ -166,6 +166,15 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Repair pair cost target: relax the pair-cost ceiling as imbalance worsens.
+/// Normal accumulation targets 96¢. Emergency repair allows up to 100¢.
+fn repair_pair_cost_target(match_ratio: f64) -> f64 {
+    if match_ratio >= 0.80 { 0.96 }
+    else if match_ratio >= 0.60 { 0.98 }
+    else if match_ratio >= 0.40 { 0.99 }
+    else { 1.00 }
+}
+
 /// FLASH LADDER Strategy — post both-side ladders, cancel after 250ms, repeat.
 ///
 /// 1. T+10s: start posting 3-level ladders on BOTH sides (ask-3c, -4c, -5c)
@@ -308,6 +317,31 @@ async fn run_vidarx_strategy(
                 info!(">>> FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c",
                     side_label, fill.size, fill.price, up_shares, dn_shares, matched, pair_cost * 100.0);
 
+                // Markout logging: spawn task to capture mid at +250ms / +500ms / +1s
+                {
+                    let fill_price_snap = fill.price;
+                    let fill_side_str: &'static str = if is_up { "UP" } else { "DN" };
+                    let obi_at_fill = latest_obi;
+                    let pm_rx = pm_top_rx.clone();
+                    tokio::spawn(async move {
+                        for (delay_ms, label) in &[(250u64, "250ms"), (500u64, "500ms"), (1000u64, "1s")] {
+                            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
+                            let top = pm_rx.borrow().clone();
+                            let (bid_now, ask_now) = if fill_side_str == "UP" {
+                                (top.up_bid.unwrap_or(0.0), top.up_ask.unwrap_or(0.0))
+                            } else {
+                                (top.down_bid.unwrap_or(0.0), top.down_ask.unwrap_or(0.0))
+                            };
+                            let mid = (bid_now + ask_now) / 2.0;
+                            let markout = mid - fill_price_snap;
+                            info!(">>> MARKOUT@{}: {} fill={:.0}c mid={:.0}c Δ={:+.1}c obi@fill={:.2}",
+                                label, fill_side_str,
+                                fill_price_snap * 100.0, mid * 100.0,
+                                markout * 100.0, obi_at_fill);
+                        }
+                    });
+                }
+
                 // FIX #2: Only check match AFTER one side is full (>= 20sh)
                 // Don't stop early when both sides are half-full
                 if !pair_done && (up_shares >= max_shares_per_side || dn_shares >= max_shares_per_side) {
@@ -354,6 +388,17 @@ async fn run_vidarx_strategy(
                     continue;
                 }
 
+                // OBI spike cancel — cancel immediately if signal crosses hard threshold
+                if orders_live && latest_obi.abs() > 0.55 {
+                    let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                        reason: "obi_spike".into(),
+                    }).await;
+                    orders_live = false;
+                    last_cancel_ts = now_ms;
+                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                    info!(">>> OBI SPIKE CANCEL: obi={:.3}", latest_obi);
+                }
+
                 // ═══ CANCEL (random lifetime) — sample next repost interval at cancel time ═══
                 if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms {
                     let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
@@ -379,10 +424,24 @@ async fn run_vidarx_strategy(
                 let up_needs = (max_shares_per_side - up_shares).max(0.0);
                 let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
 
-                // Check if one side is full
-                // Use practical_full (16) to avoid dead zone when remaining < 5 (venue min)
-                let practical_full = max_shares_per_side - 4.0; // 16 when cap = 20
-                let one_side_full = up_shares >= practical_full || dn_shares >= practical_full;
+                // Check if one side is full, or far enough ahead to enter repair mode early.
+                // Early repair triggers when one side is 2x the other and both have ≥5 shares.
+                let practical_full = max_shares_per_side - 4.0; // 71 when cap = 75
+                let full_side_v = up_shares.max(dn_shares);
+                let weak_side_v = up_shares.min(dn_shares);
+                let early_repair = full_side_v >= 35.0 && weak_side_v >= 5.0
+                    && full_side_v / weak_side_v >= 2.0;
+                let one_side_full = up_shares >= practical_full || dn_shares >= practical_full
+                    || early_repair;
+
+                // Fair value price caps (Phase 1): don't bid above what keeps pair cost ≤ 0.96.
+                // Only applied once the other side has ≥10 shares of cost data.
+                let up_fv_cap = if dn_shares >= 10.0 {
+                    (0.96 - dn_cost / dn_shares).max(0.30)
+                } else { 1.0_f64 };
+                let dn_fv_cap = if up_shares >= 10.0 {
+                    (0.96 - up_cost / up_shares).max(0.30)
+                } else { 1.0_f64 };
 
                 if !window_skip && !one_side_full && !matching_gtc_posted {
                     // Both sides still need tokens — wait measured from cancel, not post
@@ -403,7 +462,7 @@ async fn run_vidarx_strategy(
                                 if size < 5.0 { break; }
                                 let offset = (up_offset + level) as f64 * 0.01;
                                 let price = ((up_bid - offset) * 100.0).round() / 100.0;
-                                if price <= 0.01 || price >= up_ask { continue; }
+                                if price <= 0.01 || price >= up_ask || price > up_fv_cap { continue; }
 
                                 let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                     market_slug: market.slug.clone(),
@@ -430,7 +489,7 @@ async fn run_vidarx_strategy(
                                 if size < 5.0 { break; }
                                 let offset = (dn_offset + level) as f64 * 0.01;
                                 let price = ((dn_bid - offset) * 100.0).round() / 100.0;
-                                if price <= 0.01 || price >= dn_ask { continue; }
+                                if price <= 0.01 || price >= dn_ask || price > dn_fv_cap { continue; }
 
                                 let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                     market_slug: market.slug.clone(),
@@ -460,7 +519,7 @@ async fn run_vidarx_strategy(
                 // ═══ PHASE 2: One side full — post matching GTC on the other side ═══
                 // ═══ PHASE 2: One side full — keep laddering the underweight side 2c deeper ═══
                 if !window_skip && one_side_full && !pair_done {
-                    let (full_side, full_shares, _full_cost) =
+                    let (full_side, full_shares, full_cost) =
                         if up_shares >= dn_shares {
                             ("UP", up_shares, up_cost)
                         } else {
@@ -475,6 +534,13 @@ async fn run_vidarx_strategy(
                         };
 
                     let still_need = (full_shares - already).max(0.0);
+
+                    // Repair max bid: pair cost target relaxes as imbalance worsens.
+                    // Prevents overpaying on repair while still allowing emergency fills.
+                    let match_ratio = already / full_shares.max(0.001);
+                    let repair_target = repair_pair_cost_target(match_ratio);
+                    let full_avg_cost = full_cost / full_shares.max(0.001);
+                    let repair_max_bid = (repair_target - full_avg_cost).max(0.30);
 
                     // Within 10% tolerance? Done.
                     if already >= full_shares * (1.0 - match_tolerance) {
@@ -506,7 +572,7 @@ async fn run_vidarx_strategy(
                             if size < 5.0 { break; }
                             let offset = (offset_base + level) as f64 * 0.01;
                             let price = ((need_bid - offset) * 100.0).round() / 100.0;
-                            if price <= 0.01 || price >= need_ask { continue; }
+                            if price <= 0.01 || price >= need_ask || price > repair_max_bid { continue; }
 
                             let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                 market_slug: market.slug.clone(),
@@ -526,10 +592,10 @@ async fn run_vidarx_strategy(
                         if posted_any {
                             orders_live = true;
                             last_post_ts = now_ms;
-                            cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
+                            cancel_delay_ms = rand::thread_rng().gen_range(1000..=3000);
                         }
-                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | offset_base={}",
-                            full_side, full_shares, need_label, still_need, offset_base);
+                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} more | offset_base={} repair_cap={:.0}c",
+                            full_side, full_shares, need_label, still_need, offset_base, repair_max_bid * 100.0);
                     }
                 }
             }
