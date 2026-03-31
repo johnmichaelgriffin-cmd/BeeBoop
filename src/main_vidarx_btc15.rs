@@ -219,9 +219,9 @@ async fn run_vidarx_btc15_strategy(
     // OBI — stored for spike cancel only (no directional skew in Phase 1)
     let mut latest_obi: f64 = 0.0;
 
-    // Timing — Phase 1: 250ms cancel / 2000ms repost (deterministic)
-    //          Phase 2: 1000–1500ms cancel / 2000ms repost
-    let mut cancel_delay_ms: i64 = 250;
+    // Timing — Phase 1: random 500–2000ms cancel / random 500–2000ms repost
+    //          Phase 2: 1000–1500ms cancel / random 500–2000ms repost
+    let mut cancel_delay_ms: i64 = 2000;
     let mut next_post_interval_ms: i64 = 0;
     let mut last_cancel_ts: i64 = 0;
     let mut last_post_ts: i64 = 0;
@@ -255,7 +255,7 @@ async fn run_vidarx_btc15_strategy(
                 orders_live = false;
                 last_post_ts = 0;
                 last_cancel_ts = 0;
-                next_post_interval_ms = 2000; // deterministic first post delay
+                next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
                 last_window_ts = market.window_start_ts;
 
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
@@ -415,7 +415,7 @@ async fn run_vidarx_btc15_strategy(
                     }).await;
                     orders_live = false;
                     last_cancel_ts = now_ms;
-                    next_post_interval_ms = 2000;
+                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
                     info!(">>> OBI SPIKE CANCEL: obi={:.3}", latest_obi);
                 }
 
@@ -426,7 +426,7 @@ async fn run_vidarx_btc15_strategy(
                     }).await;
                     orders_live = false;
                     last_cancel_ts = now_ms;
-                    next_post_interval_ms = 2000;
+                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
                 }
 
                 // ═══ PHASE 1: Both sides need tokens — post flash ladders ═══
@@ -468,7 +468,7 @@ async fn run_vidarx_btc15_strategy(
 
                         // UP side
                         if up_needs >= 5.0 {
-                            let base_sizes = [8.0_f64, 6.0, 6.0];
+                            let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
                             let mut up_remaining = up_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
@@ -495,7 +495,7 @@ async fn run_vidarx_btc15_strategy(
 
                         // DN side
                         if dn_needs >= 5.0 {
-                            let base_sizes = [8.0_f64, 6.0, 6.0];
+                            let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
                             let mut dn_remaining = dn_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
@@ -523,8 +523,8 @@ async fn run_vidarx_btc15_strategy(
                         if posted_any {
                             orders_live = true;
                             last_post_ts = now_ms;
-                            cancel_delay_ms = 250;
-                            info!(">>> POST P1: obi={:.2}", latest_obi);
+                            cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
+                            info!(">>> POST P1: obi={:.2} cancel={}ms", latest_obi, cancel_delay_ms);
                         }
                     }
                 }
