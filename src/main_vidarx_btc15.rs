@@ -170,13 +170,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Repair pair cost target: relax the pair-cost ceiling as imbalance worsens.
-/// Normal accumulation targets 96¢. Emergency repair allows up to 100¢.
+/// Repair pair cost target: completion-first schedule.
+/// Mild imbalance: stay picky. Severe imbalance: pay to finish, prevent naked loss.
 fn repair_pair_cost_target(match_ratio: f64) -> f64 {
-    if match_ratio >= 0.80 { 0.96 }
-    else if match_ratio >= 0.60 { 0.98 }
-    else if match_ratio >= 0.40 { 0.99 }
-    else { 1.00 }
+    if match_ratio >= 0.85 { 0.97 }
+    else if match_ratio >= 0.70 { 0.99 }
+    else if match_ratio >= 0.50 { 1.00 }
+    else { 1.02 }
 }
 
 /// FLASH LADDER Strategy (BTC 15M) — post both-side ladders, cancel after 2000ms, repeat.
@@ -213,8 +213,8 @@ async fn run_vidarx_btc15_strategy(
     let mut fills_this_window: u32 = 0;
     let mut matching_gtc_posted = false; // true once we've posted the single matching GTC
     let max_shares_per_side: f64 = 200.0;
-    let match_tolerance = 0.10; // within 10% = considered matched
-    let target_pair_cost = 0.95; // lockprofit target
+    let match_tolerance = 0.05; // within 5% = considered matched (tighter completion target)
+    let mut repair_mode = false; // one-way latch: once true stays true for the window
 
     // OBI gate — adverse selection protection
     let mut latest_obi: f64 = 0.0;
@@ -254,6 +254,7 @@ async fn run_vidarx_btc15_strategy(
                 fills_this_window = 0;
                 pair_done = false;
                 matching_gtc_posted = false;
+                repair_mode = false;
                 orders_live = false;
                 last_post_ts = 0;
                 last_cancel_ts = 0;
@@ -383,6 +384,21 @@ async fn run_vidarx_btc15_strategy(
 
                 // Start at T-60s (1 minute BEFORE window opens)
                 if elapsed_s < -60 { continue; }
+                // Late acceptance at T+735 (~87.5% of window): if lagging ≥85% of leader, accept
+                if elapsed_s >= 735 && !pair_done {
+                    let full_s = up_shares.max(dn_shares);
+                    let weak_s = up_shares.min(dn_shares);
+                    if full_s > 0.0 && weak_s >= full_s * 0.85 {
+                        info!(">>> T+735 LATE ACCEPT (15M): full={:.0} weak={:.0} ({:.0}%) — holding",
+                            full_s, weak_s, weak_s / full_s * 100.0);
+                        pair_done = true;
+                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                            reason: "late_accept".into(),
+                        }).await;
+                        continue;
+                    }
+                }
+
                 // Stop at T+840s (14 minutes)
                 if elapsed_s >= 840 {
                     if !pair_done {
@@ -428,15 +444,21 @@ async fn run_vidarx_btc15_strategy(
                 let up_needs = (max_shares_per_side - up_shares).max(0.0);
                 let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
 
-                // Check if one side is full, or far enough ahead to enter repair mode early.
-                // Early repair triggers when one side is 2x the other and both have ≥5 shares.
-                let practical_full = max_shares_per_side - 4.0; // 196 when cap = 200
-                let full_side_v = up_shares.max(dn_shares);
-                let weak_side_v = up_shares.min(dn_shares);
-                let early_repair = full_side_v >= 35.0 && weak_side_v >= 5.0
-                    && full_side_v / weak_side_v >= 2.0;
-                let one_side_full = up_shares >= practical_full || dn_shares >= practical_full
-                    || early_repair;
+                // Repair mode: one-way latch — once entered, never resumes accumulation.
+                // Triggered when one side is capped (≥198) or far enough ahead to need repair.
+                let practical_full = 198.0;
+                if !repair_mode {
+                    let full_side_v = up_shares.max(dn_shares);
+                    let weak_side_v = up_shares.min(dn_shares);
+                    let capped = up_shares >= practical_full || dn_shares >= practical_full;
+                    let early = (full_side_v >= 140.0 && weak_side_v <= full_side_v * 0.70)
+                        || (full_side_v >= 150.0 && full_side_v / weak_side_v.max(1.0) >= 2.5);
+                    if capped || early {
+                        repair_mode = true;
+                        info!(">>> REPAIR MODE ENGAGED (15M): full={:.0} weak={:.0} ratio={:.2}x",
+                            full_side_v, weak_side_v, full_side_v / weak_side_v.max(1.0));
+                    }
+                }
 
                 // Fair value price caps (Phase 1): don't bid above what keeps pair cost ≤ 0.96.
                 // Only applied once the other side has ≥10 shares of cost data.
@@ -447,7 +469,7 @@ async fn run_vidarx_btc15_strategy(
                     (0.96 - up_cost / up_shares).max(0.30)
                 } else { 1.0_f64 };
 
-                if !window_skip && !one_side_full && !matching_gtc_posted {
+                if !window_skip && !repair_mode && !matching_gtc_posted {
                     // Both sides still need tokens — wait measured from cancel, not post
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                         // OBI gate: go deep (3) on risky side, random (1–3) on safe side
@@ -518,8 +540,8 @@ async fn run_vidarx_btc15_strategy(
                     }
                 }
 
-                // ═══ PHASE 2: One side full — keep laddering the underweight side ═══
-                if !window_skip && one_side_full && !pair_done {
+                // ═══ PHASE 2: Repair mode — quote only the underweight side ═══
+                if !window_skip && repair_mode && !pair_done {
                     let (full_side, full_shares, full_cost) =
                         if up_shares >= dn_shares {
                             ("UP", up_shares, up_cost)
@@ -559,9 +581,8 @@ async fn run_vidarx_btc15_strategy(
                             reason: "close_enough_sub5".into(),
                         }).await;
                     } else if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        let risky = (need_side == Side::Up && latest_obi < -obi_threshold)
-                                 || (need_side == Side::Down && latest_obi > obi_threshold);
-                        let offset_base = if risky { 3usize } else { rand::thread_rng().gen_range(1usize..=3) };
+                        // Repair ladder: L1=bid-4c, L2=bid-5c, L3=bid-6c — consistent completion depth
+                        let offset_base = 4usize;
                         let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
@@ -592,10 +613,10 @@ async fn run_vidarx_btc15_strategy(
                         if posted_any {
                             orders_live = true;
                             last_post_ts = now_ms;
-                            cancel_delay_ms = rand::thread_rng().gen_range(1000..=3000);
+                            cancel_delay_ms = rand::thread_rng().gen_range(1000..=1500);
                         }
-                        info!(">>> PHASE 2 BTC 15M: {} full {:.0}sh | {} needs {:.0} more | offset_base={} repair_cap={:.0}c",
-                            full_side, full_shares, need_label, still_need, offset_base, repair_max_bid * 100.0);
+                        info!(">>> PHASE 2 BTC 15M: {} full {:.0}sh | {} needs {:.0} more | repair_cap={:.0}c",
+                            full_side, full_shares, need_label, still_need, repair_max_bid * 100.0);
                     }
                 }
             }
