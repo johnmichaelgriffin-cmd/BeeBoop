@@ -216,16 +216,13 @@ async fn run_vidarx_btc15_strategy(
     let match_tolerance = 0.05; // within 5% = considered matched (tighter completion target)
     let mut repair_mode = false; // one-way latch: once true stays true for the window
 
-    // OBI gate — adverse selection protection
+    // OBI — stored for spike cancel only (no directional skew in Phase 1)
     let mut latest_obi: f64 = 0.0;
-    let obi_threshold: f64 = 0.3;
 
-    // Window skip — play ~75% of windows (roll 1–100, skip if ≤25)
-    let mut window_skip = false;
-
-    // Timing — both cancel and repost intervals randomized 500–2000ms
-    let mut cancel_delay_ms: i64 = 2000; // randomized at post time
-    let mut next_post_interval_ms: i64 = 0; // randomized at cancel time
+    // Timing — Phase 1: 250ms cancel / 2000ms repost (deterministic)
+    //          Phase 2: 1000–1500ms cancel / 2000ms repost
+    let mut cancel_delay_ms: i64 = 250;
+    let mut next_post_interval_ms: i64 = 0;
     let mut last_cancel_ts: i64 = 0;
     let mut last_post_ts: i64 = 0;
     let mut orders_live = false;             // true only if at least one order was sent
@@ -258,22 +255,14 @@ async fn run_vidarx_btc15_strategy(
                 orders_live = false;
                 last_post_ts = 0;
                 last_cancel_ts = 0;
-                next_post_interval_ms = rand::thread_rng().gen_range(500..=2000); // randomize first post
+                next_post_interval_ms = 2000; // deterministic first post delay
                 last_window_ts = market.window_start_ts;
-
-                // Roll for window skip (1–100, skip if ≤25 → 75% play rate)
-                let roll = rand::thread_rng().gen_range(1u32..=100);
-                window_skip = roll <= 25;
 
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                     reason: "new_window".into(),
                 }).await;
 
-                if window_skip {
-                    info!(">>> NEW WINDOW {} — SKIPPING (roll={}/25)", market.window_start_ts, roll);
-                } else {
-                    info!(">>> NEW WINDOW {} — PLAYING (roll={}) max {:.0}sh/side BTC 15M", market.window_start_ts, roll, max_shares_per_side);
-                }
+                info!(">>> NEW WINDOW {} — max {:.0}sh/side BTC 15M", market.window_start_ts, max_shares_per_side);
             }
         }
 
@@ -426,7 +415,7 @@ async fn run_vidarx_btc15_strategy(
                     }).await;
                     orders_live = false;
                     last_cancel_ts = now_ms;
-                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                    next_post_interval_ms = 2000;
                     info!(">>> OBI SPIKE CANCEL: obi={:.3}", latest_obi);
                 }
 
@@ -437,7 +426,7 @@ async fn run_vidarx_btc15_strategy(
                     }).await;
                     orders_live = false;
                     last_cancel_ts = now_ms;
-                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                    next_post_interval_ms = 2000;
                 }
 
                 // ═══ PHASE 1: Both sides need tokens — post flash ladders ═══
@@ -469,17 +458,17 @@ async fn run_vidarx_btc15_strategy(
                     (0.96 - up_cost / up_shares).max(0.30)
                 } else { 1.0_f64 };
 
-                if !window_skip && !repair_mode && !matching_gtc_posted {
-                    // Both sides still need tokens — wait measured from cancel, not post
+                if !repair_mode && !matching_gtc_posted {
+                    // Both sides still need tokens — deterministic 2s repost, 250ms cancel
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        // OBI gate: go deep (3) on risky side, random (1–3) on safe side
-                        let up_offset = if latest_obi < -obi_threshold { 3usize } else { rand::thread_rng().gen_range(1usize..=3) };
-                        let dn_offset = if latest_obi >  obi_threshold { 3usize } else { rand::thread_rng().gen_range(1usize..=3) };
+                        // Fixed ladder: bid-3c / bid-4c / bid-5c on both sides
+                        let up_offset = 3usize;
+                        let dn_offset = 3usize;
                         let mut posted_any = false;
 
                         // UP side
                         if up_needs >= 5.0 {
-                            let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
+                            let base_sizes = [8.0_f64, 6.0, 6.0];
                             let mut up_remaining = up_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
@@ -506,7 +495,7 @@ async fn run_vidarx_btc15_strategy(
 
                         // DN side
                         if dn_needs >= 5.0 {
-                            let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
+                            let base_sizes = [8.0_f64, 6.0, 6.0];
                             let mut dn_remaining = dn_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
@@ -534,14 +523,14 @@ async fn run_vidarx_btc15_strategy(
                         if posted_any {
                             orders_live = true;
                             last_post_ts = now_ms;
-                            cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
-                            info!(">>> POST P1: obi={:.2} up_off={} dn_off={} cancel={}ms", latest_obi, up_offset, dn_offset, cancel_delay_ms);
+                            cancel_delay_ms = 250;
+                            info!(">>> POST P1: obi={:.2}", latest_obi);
                         }
                     }
                 }
 
                 // ═══ PHASE 2: Repair mode — quote only the underweight side ═══
-                if !window_skip && repair_mode && !pair_done {
+                if repair_mode && !pair_done {
                     let (full_side, full_shares, full_cost) =
                         if up_shares >= dn_shares {
                             ("UP", up_shares, up_cost)
