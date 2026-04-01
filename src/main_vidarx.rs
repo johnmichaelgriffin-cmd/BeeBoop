@@ -260,18 +260,11 @@ async fn run_vidarx_strategy(
                 next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
                 last_window_ts = market.window_start_ts;
 
-                let roll = rand::thread_rng().gen_range(1u32..=100);
-                window_skip = roll <= 25;
-
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                     reason: "new_window".into(),
                 }).await;
 
-                if window_skip {
-                    info!(">>> NEW WINDOW {} — SKIPPING (roll={}/25)", market.window_start_ts, roll);
-                } else {
-                    info!(">>> NEW WINDOW {} — PLAYING (roll={}) max {:.0}sh/side", market.window_start_ts, roll, max_shares_per_side);
-                }
+                info!(">>> NEW WINDOW {} — PLAYING max {:.0}sh/side", market.window_start_ts, max_shares_per_side);
             }
         }
 
