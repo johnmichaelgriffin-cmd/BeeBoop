@@ -504,11 +504,28 @@ async fn run_vidarx_btc15_strategy(
                         } else {
                             (3usize, 3usize)
                         };
+                        // Sizes: normal = 10–16 random per level (doubled from 5–8)
+                        //        underweight side in repair/late aggression = 24/18/18
+                        let in_aggression = repair_mode || elapsed_s >= 630;
+                        let up_base_sizes: [f64; 3] = if in_aggression && up_shares < dn_shares {
+                            [24.0, 18.0, 18.0]
+                        } else {
+                            [rand::thread_rng().gen_range(10u32..=16) as f64,
+                             rand::thread_rng().gen_range(10u32..=16) as f64,
+                             rand::thread_rng().gen_range(10u32..=16) as f64]
+                        };
+                        let dn_base_sizes: [f64; 3] = if in_aggression && dn_shares < up_shares {
+                            [24.0, 18.0, 18.0]
+                        } else {
+                            [rand::thread_rng().gen_range(10u32..=16) as f64,
+                             rand::thread_rng().gen_range(10u32..=16) as f64,
+                             rand::thread_rng().gen_range(10u32..=16) as f64]
+                        };
                         let mut posted_any = false;
 
                         // UP side
                         if up_needs >= 5.0 {
-                            let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
+                            let base_sizes = up_base_sizes;
                             let mut up_remaining = up_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
@@ -535,7 +552,7 @@ async fn run_vidarx_btc15_strategy(
 
                         // DN side
                         if dn_needs >= 5.0 {
-                            let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
+                            let base_sizes = dn_base_sizes;
                             let mut dn_remaining = dn_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
@@ -611,9 +628,9 @@ async fn run_vidarx_btc15_strategy(
                             reason: "close_enough_sub5".into(),
                         }).await;
                     } else if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        // Aggressive: offset_base=1 → bid-1c/-2c/-3c
+                        // Aggressive: offset_base=1 → bid-1c/-2c/-3c, sizes 24/18/18
                         let offset_base = 1usize;
-                        let base_sizes = [rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64, rand::thread_rng().gen_range(5u32..=8) as f64];
+                        let base_sizes = [24.0_f64, 18.0, 18.0];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
                         let mut posted_any = false;
