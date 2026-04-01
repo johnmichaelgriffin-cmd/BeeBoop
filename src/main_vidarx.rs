@@ -485,22 +485,19 @@ async fn run_vidarx_strategy(
                 if !window_skip && !phase2_mode {
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                         // Repair:        overweight offset=5 (bid-5c/-6c/-7c), underweight offset=1 (bid-1c/-2c/-3c)
-                        // Normal:        random base 2/3/4 → ladders -2/-3/-4, -3/-4/-5, or -4/-5/-6
-                        // Late (T+210s): force underweight to offset=1, overweight stays random
+                        // Normal:        fixed offset=3 (bid-3c/-4c/-5c)
+                        // Late (T+210s): force underweight to offset=0 (bid / bid-1c / bid-2c)
                         let (up_offset, dn_offset) = if repair_mode {
                             if up_shares >= dn_shares {
                                 (5usize, 1usize)   // UP overweight → throttle UP, aggressive DN
                             } else {
                                 (1usize, 5usize)   // DN overweight → throttle DN, aggressive UP
                             }
+                        } else if elapsed_s >= 210 {
+                            // Late aggression: underweight at bid/bid-1c/bid-2c, overweight normal
+                            if up_shares >= dn_shares { (3usize, 0usize) } else { (0usize, 3usize) }
                         } else {
-                            let rand_base = rand::thread_rng().gen_range(2usize..=4);
-                            if elapsed_s >= 210 {
-                                // Late aggression: push underweight to offset=1, overweight stays random
-                                if up_shares >= dn_shares { (rand_base, 1usize) } else { (1usize, rand_base) }
-                            } else {
-                                (rand_base, rand_base)
-                            }
+                            (3usize, 3usize)
                         };
                         let mut posted_any = false;
 
