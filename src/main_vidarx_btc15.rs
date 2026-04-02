@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     info!("Strategy: postOnly GTC bids on BOTH sides, signal-skewed");
     info!("Target mix: 55% cheap / 45% expensive");
     info!("Ladder: 8/6/6sh per side (3 levels each)");
-    info!("Timing: T-60s start, T+840s stop (14 minutes)");
+    info!("Timing: T+30s start, T+840s stop (~13.5 minutes)");
     info!("Max shares: 200/side (practical_full=196)");
     info!("WS reconnect: :14/:29/:44/:59 (900s interval)");
     info!("No selling. Hold to resolution.");
@@ -378,8 +378,8 @@ async fn run_vidarx_btc15_strategy(
 
                 let elapsed_s = (now_ms / 1000) - market.window_start_ts;
 
-                // Start at T-60s (1 minute BEFORE window opens)
-                if elapsed_s < -60 { continue; }
+                // Start at T+30s (let market establish direction first)
+                if elapsed_s < 30 { continue; }
                 // Late acceptance at T+735 (~87.5% of window): if lagging ≥85% of leader, accept
                 if elapsed_s >= 735 && !pair_done {
                     let full_s = up_shares.max(dn_shares);
