@@ -169,10 +169,10 @@ async fn main() -> Result<()> {
 /// Repair pair cost target: completion-first schedule.
 /// Mild imbalance: stay picky. Severe imbalance: pay to finish, prevent naked loss.
 fn repair_pair_cost_target(match_ratio: f64) -> f64 {
-    if match_ratio >= 0.85 { 0.97 }
-    else if match_ratio >= 0.70 { 0.99 }
-    else if match_ratio >= 0.50 { 1.00 }
-    else { 1.02 }
+    if match_ratio >= 0.85 { 0.96 }
+    else if match_ratio >= 0.70 { 0.97 }
+    else if match_ratio >= 0.50 { 0.98 }
+    else { 0.99 }
 }
 
 /// FLASH LADDER Strategy — post both-side ladders, cancel after random 500–2000ms, repeat.
@@ -496,12 +496,7 @@ async fn run_vidarx_strategy(
                         let pair_target = repair_pair_cost_target(match_ratio);
                         let raw_up_cap = if dn_shares >= 10.0 { (pair_target - dn_cost / dn_shares).max(0.30) } else { 1.0_f64 };
                         let raw_dn_cap = if up_shares >= 10.0 { (pair_target - up_cost / up_shares).max(0.30) } else { 1.0_f64 };
-                        let (up_price_cap, dn_price_cap) = if elapsed_s >= 210 {
-                            // Late aggression: gate off on underweight side only
-                            if up_shares >= dn_shares { (raw_up_cap, 1.0_f64) } else { (1.0_f64, raw_dn_cap) }
-                        } else {
-                            (raw_up_cap, raw_dn_cap)
-                        };
+                        let (up_price_cap, dn_price_cap) = (raw_up_cap, raw_dn_cap);
                         // Sizes: underweight in repair or T+210s = 48/36/36 | everything else = 24/18/18
                         let up_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 210) && up_shares < dn_shares {
                             [48.0, 36.0, 36.0]
@@ -632,7 +627,7 @@ async fn run_vidarx_strategy(
                             if size < 5.0 { break; }
                             let offset = (offset_base + level) as f64 * 0.01;
                             let price = ((need_bid - offset) * 100.0).round() / 100.0;
-                            if price <= 0.01 || price >= need_ask { continue; }
+                            if price <= 0.01 || price >= need_ask || price > repair_max_bid { continue; }
 
                             let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                 market_slug: market.slug.clone(),
@@ -654,8 +649,8 @@ async fn run_vidarx_strategy(
                             last_post_ts = now_ms;
                             cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
                         }
-                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} @ bid-3c | no cap",
-                            full_side, full_shares_v, need_label, still_need);
+                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} @ bid-3c | cap={:.0}c",
+                            full_side, full_shares_v, need_label, still_need, repair_max_bid * 100.0);
                     }
                 }
             }
