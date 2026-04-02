@@ -513,10 +513,13 @@ async fn run_vidarx_btc15_strategy(
                         } else {
                             [24.0, 18.0, 18.0]
                         };
+                        // Deep repair: underweight < 50% of overweight → stop posting overweight side
+                        let stop_overweight = repair_mode && weak_v < full_v * 0.50;
                         let mut posted_any = false;
 
                         // UP side
-                        if up_needs >= 5.0 {
+                        let up_is_overweight = repair_mode && up_shares >= dn_shares;
+                        if up_needs >= 5.0 && !(stop_overweight && up_is_overweight) {
                             let base_sizes = up_base_sizes;
                             let mut up_remaining = up_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
@@ -543,7 +546,8 @@ async fn run_vidarx_btc15_strategy(
                         }
 
                         // DN side
-                        if dn_needs >= 5.0 {
+                        let dn_is_overweight = repair_mode && dn_shares >= up_shares;
+                        if dn_needs >= 5.0 && !(stop_overweight && dn_is_overweight) {
                             let base_sizes = dn_base_sizes;
                             let mut dn_remaining = dn_needs;
                             for (level, &base_size) in base_sizes.iter().enumerate() {
