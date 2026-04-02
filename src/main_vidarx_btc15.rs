@@ -493,36 +493,30 @@ async fn run_vidarx_btc15_strategy(
                         } else {
                             (3usize, 3usize)
                         };
-                        // Repair price gate: apply repair_max_bid to underweight side only
-                        let (up_price_cap, dn_price_cap) = if repair_mode {
-                            let full_v = up_shares.max(dn_shares);
-                            let weak_v = up_shares.min(dn_shares);
-                            let match_ratio = weak_v / full_v.max(0.001);
-                            let repair_target = repair_pair_cost_target(match_ratio);
-                            if up_shares >= dn_shares {
-                                let full_avg = up_cost / up_shares.max(0.001);
-                                (1.0_f64, (repair_target - full_avg).max(0.30))
-                            } else {
-                                let full_avg = dn_cost / dn_shares.max(0.001);
-                                ((repair_target - full_avg).max(0.30), 1.0_f64)
-                            }
+                        // Price gate: repair_pair_cost_target schedule applied to both sides always.
+                        // Disabled only for underweight side at T+630s late aggression.
+                        let full_v = up_shares.max(dn_shares);
+                        let weak_v = up_shares.min(dn_shares);
+                        let match_ratio = if full_v >= 10.0 { weak_v / full_v } else { 1.0 };
+                        let pair_target = repair_pair_cost_target(match_ratio);
+                        let raw_up_cap = if dn_shares >= 10.0 { (pair_target - dn_cost / dn_shares).max(0.30) } else { 1.0_f64 };
+                        let raw_dn_cap = if up_shares >= 10.0 { (pair_target - up_cost / up_shares).max(0.30) } else { 1.0_f64 };
+                        let (up_price_cap, dn_price_cap) = if elapsed_s >= 630 {
+                            // Late aggression: gate off on underweight side only
+                            if up_shares >= dn_shares { (raw_up_cap, 1.0_f64) } else { (1.0_f64, raw_dn_cap) }
                         } else {
-                            (1.0_f64, 1.0_f64)
+                            (raw_up_cap, raw_dn_cap)
                         };
-                        // Sizes: normal = 10–16 random | repair underweight or T+630s underweight = 48/36/36
+                        // Sizes: underweight in repair or T+630s = 48/36/36 | everything else = 24/18/18
                         let up_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 630) && up_shares < dn_shares {
                             [48.0, 36.0, 36.0]
                         } else {
-                            [rand::thread_rng().gen_range(10u32..=16) as f64,
-                             rand::thread_rng().gen_range(10u32..=16) as f64,
-                             rand::thread_rng().gen_range(10u32..=16) as f64]
+                            [24.0, 18.0, 18.0]
                         };
                         let dn_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 630) && dn_shares < up_shares {
                             [48.0, 36.0, 36.0]
                         } else {
-                            [rand::thread_rng().gen_range(10u32..=16) as f64,
-                             rand::thread_rng().gen_range(10u32..=16) as f64,
-                             rand::thread_rng().gen_range(10u32..=16) as f64]
+                            [24.0, 18.0, 18.0]
                         };
                         let mut posted_any = false;
 
