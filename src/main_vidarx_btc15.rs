@@ -446,7 +446,7 @@ async fn run_vidarx_btc15_strategy(
                     let full_v = up_shares.max(dn_shares);
                     let weak_v = up_shares.min(dn_shares);
                     if !repair_mode {
-                        if full_v >= 5.0 && weak_v < full_v * 0.60 {
+                        if full_v >= 50.0 && weak_v < full_v * 0.60 {
                             repair_mode = true;
                             info!(">>> REPAIR MODE ON (15M): full={:.0} weak={:.0} ({:.0}%)",
                                 full_v, weak_v, weak_v / full_v * 100.0);
