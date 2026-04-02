@@ -478,17 +478,13 @@ async fn run_vidarx_strategy(
                 if !window_skip && !phase2_mode {
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                         // Repair:        overweight offset=5 (bid-5c/-6c/-7c), underweight offset=3 (bid-3c/-4c/-5c) + price gate
-                        // Normal:        fixed offset=3 (bid-3c/-4c/-5c)
-                        // Late (T+210s): force underweight to offset=0 (bid / bid-1c / bid-2c)
+                        // Normal/Late:   fixed offset=3 (bid-3c/-4c/-5c) — no price bending, only size changes
                         let (up_offset, dn_offset) = if repair_mode {
                             if up_shares >= dn_shares {
                                 (5usize, 3usize)   // UP overweight → throttle UP, gated DN
                             } else {
                                 (3usize, 5usize)   // DN overweight → gated UP, throttle DN
                             }
-                        } else if elapsed_s >= 210 {
-                            // Late aggression: underweight at bid/bid-1c/bid-2c, overweight normal
-                            if up_shares >= dn_shares { (3usize, 0usize) } else { (0usize, 3usize) }
                         } else {
                             (3usize, 3usize)
                         };
@@ -508,20 +504,16 @@ async fn run_vidarx_strategy(
                         } else {
                             (1.0_f64, 1.0_f64)
                         };
-                        // Sizes: normal = 10–16 random | repair underweight = 48/36/36 | late aggression = 24/18/18
-                        let up_base_sizes: [f64; 3] = if repair_mode && up_shares < dn_shares {
+                        // Sizes: normal = 10–16 random | repair underweight or T+210s underweight = 48/36/36
+                        let up_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 210) && up_shares < dn_shares {
                             [48.0, 36.0, 36.0]
-                        } else if elapsed_s >= 210 && up_shares < dn_shares {
-                            [24.0, 18.0, 18.0]
                         } else {
                             [rand::thread_rng().gen_range(10u32..=16) as f64,
                              rand::thread_rng().gen_range(10u32..=16) as f64,
                              rand::thread_rng().gen_range(10u32..=16) as f64]
                         };
-                        let dn_base_sizes: [f64; 3] = if repair_mode && dn_shares < up_shares {
+                        let dn_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 210) && dn_shares < up_shares {
                             [48.0, 36.0, 36.0]
-                        } else if elapsed_s >= 210 && dn_shares < up_shares {
-                            [24.0, 18.0, 18.0]
                         } else {
                             [rand::thread_rng().gen_range(10u32..=16) as f64,
                              rand::thread_rng().gen_range(10u32..=16) as f64,
