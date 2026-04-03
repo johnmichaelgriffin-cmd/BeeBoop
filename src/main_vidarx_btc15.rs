@@ -219,6 +219,8 @@ async fn run_vidarx_btc15_strategy(
     let mut repair_mode = false; // reversible: enters at weak<60% of full, exits at weak>=95%
     let mut phase2_mode = false; // one-way latch: overweight side capped OR T+630s emergency
     let practical_full: f64 = 198.0; // triggers phase2_mode when either side reaches this
+    let mut repair_entered_ms: i64 = 0;       // timestamp when repair_mode was last entered
+    let mut repair_underweight_fills: u32 = 0; // fills on underweight side since repair entered
 
     // OBI — stored for spike cancel only (no directional skew in Phase 1)
     let mut latest_obi: f64 = 0.0;
@@ -258,6 +260,8 @@ async fn run_vidarx_btc15_strategy(
                 matching_gtc_posted = false;
                 repair_mode = false;
                 phase2_mode = false;
+                repair_entered_ms = 0;
+                repair_underweight_fills = 0;
                 window_skip = false;
                 orders_live = false;
                 last_post_ts = 0;
@@ -301,12 +305,19 @@ async fn run_vidarx_btc15_strategy(
                 if fill.side != "BUY" { continue; }
 
                 fills_this_window += 1;
+                // Track underweight fills for repair timeout
+                let pre_up = up_shares;
+                let pre_dn = dn_shares;
                 if is_up {
                     up_shares += fill.size;
                     up_cost += fill.size * fill.price;
                 } else {
                     dn_shares += fill.size;
                     dn_cost += fill.size * fill.price;
+                }
+                if repair_mode {
+                    let fill_was_underweight = (is_up && pre_up <= pre_dn) || (is_dn && pre_dn <= pre_up);
+                    if fill_was_underweight { repair_underweight_fills += 1; }
                 }
 
                 let side_label = if is_up { "UP" } else { "DN" };
@@ -446,8 +457,10 @@ async fn run_vidarx_btc15_strategy(
                     let full_v = up_shares.max(dn_shares);
                     let weak_v = up_shares.min(dn_shares);
                     if !repair_mode {
-                        if full_v >= 50.0 && weak_v < full_v * 0.60 {
+                        if full_v >= 30.0 && weak_v < full_v * 0.60 {
                             repair_mode = true;
+                            repair_entered_ms = now_ms;
+                            repair_underweight_fills = 0;
                             info!(">>> REPAIR MODE ON (15M): full={:.0} weak={:.0} ({:.0}%)",
                                 full_v, weak_v, weak_v / full_v * 100.0);
                         }
@@ -456,6 +469,25 @@ async fn run_vidarx_btc15_strategy(
                         info!(">>> REPAIR MODE OFF (15M): full={:.0} weak={:.0} — rebalanced",
                             full_v, weak_v);
                     }
+                }
+
+                // Repair timeout: if in repair_mode for 2+ mins with zero underweight fills → full reset
+                if repair_mode && repair_entered_ms > 0
+                    && (now_ms - repair_entered_ms) >= 120_000
+                    && repair_underweight_fills == 0
+                {
+                    info!(">>> REPAIR TIMEOUT (15M): 2min, 0 underweight fills — resetting window state fresh");
+                    up_shares = 0.0; dn_shares = 0.0;
+                    up_cost = 0.0; dn_cost = 0.0;
+                    fills_this_window = 0;
+                    repair_mode = false;
+                    phase2_mode = false;
+                    repair_entered_ms = 0;
+                    repair_underweight_fills = 0;
+                    let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                        reason: "repair_timeout_reset".into(),
+                    }).await;
+                    orders_live = false;
                 }
 
                 // Phase 2 mode: ONE-WAY latch — overweight side hit practical cap,
