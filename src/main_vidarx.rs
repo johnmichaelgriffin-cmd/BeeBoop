@@ -215,6 +215,8 @@ async fn run_vidarx_strategy(
     let mut phase2_mode = false; // one-way latch: overweight side capped OR T+180s emergency
     let practical_full: f64 = 200.0; // triggers phase2_mode when either side reaches this
     let mut initial_phase = true; // collect ~30sh on exp side first, then go two-sided
+    let mut cap_overpay_since_ms: i64 = 0; // when pair_cost first exceeded 0.97
+    let mut price_cap_active = false;       // true after 30s straight of pair_cost > 0.97
 
     // OBI — stored for spike cancel only (no directional skew in Phase 1)
     let mut latest_obi: f64 = 0.0;
@@ -255,6 +257,8 @@ async fn run_vidarx_strategy(
                 repair_mode = false;
                 phase2_mode = false;
                 initial_phase = true;
+                cap_overpay_since_ms = 0;
+                price_cap_active = false;
                 window_skip = false;
                 orders_live = false;
                 last_post_ts = 0;
@@ -457,7 +461,7 @@ async fn run_vidarx_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(remaining);
                                 if size < 5.0 { break; }
-                                let offset = (3 + level) as f64 * 0.01;
+                                let offset = level as f64 * 0.01; // offset_base=0: bid, bid-1c, bid-2c
                                 let price = ((exp_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= exp_ask_p { continue; }
                                 let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
@@ -529,30 +533,49 @@ async fn run_vidarx_strategy(
                     }
                 }
 
-                // ═══ PHASE 1: Both sides, repair-aware offsets ═══
+                // Dynamic price cap: off by default; activates after 30s of pair_cost > 0.97
+                {
+                    let actual_pair_cost = if up_shares >= 1.0 && dn_shares >= 1.0 {
+                        (up_cost / up_shares) + (dn_cost / dn_shares)
+                    } else { 0.0 };
+                    if actual_pair_cost > 0.97 && up_shares >= 1.0 && dn_shares >= 1.0 {
+                        if cap_overpay_since_ms == 0 { cap_overpay_since_ms = now_ms; }
+                        if !price_cap_active && (now_ms - cap_overpay_since_ms) >= 30_000 {
+                            price_cap_active = true;
+                            info!(">>> PRICE CAP ON: pair_cost={:.3} for 30s straight", actual_pair_cost);
+                        }
+                    } else {
+                        cap_overpay_since_ms = 0;
+                        if price_cap_active {
+                            price_cap_active = false;
+                            info!(">>> PRICE CAP OFF: pair_cost={:.3}", actual_pair_cost);
+                        }
+                    }
+                }
+
+                // ═══ PHASE 1: Both sides, exp/cheap-aware offsets ═══
+                // Exp side (higher ask): offset_base=0  → bid, bid-1c, bid-2c  (aggressive)
+                // Cheap side (lower ask): offset_base=-5 → bid+5c, bid+4c, bid+3c (above bid, filtered by ask)
                 if !window_skip && !phase2_mode {
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        // Repair:        overweight offset=5 (bid-5c/-6c/-7c), underweight offset=3 (bid-3c/-4c/-5c) + price gate
-                        // Normal/Late:   fixed offset=3 (bid-3c/-4c/-5c) — no price bending, only size changes
-                        let (up_offset, dn_offset) = if repair_mode {
-                            if up_shares >= dn_shares {
-                                (5usize, 3usize)   // UP overweight → throttle UP, gated DN
-                            } else {
-                                (3usize, 5usize)   // DN overweight → gated UP, throttle DN
-                            }
+                        let (up_offset, dn_offset): (i32, i32) = if exp_is_up {
+                            (0, -5)  // UP=exp at bid; DN=cheap above bid
                         } else {
-                            (3usize, 3usize)
+                            (-5, 0)  // DN=exp at bid; UP=cheap above bid
                         };
-                        // Price gate: repair_pair_cost_target schedule applied to both sides always.
-                        // Disabled only for underweight side at T+210s late aggression.
-                        let full_v = up_shares.max(dn_shares);
-                        let weak_v = up_shares.min(dn_shares);
-                        let match_ratio = if full_v >= 10.0 { weak_v / full_v } else { 1.0 };
-                        let pair_target = repair_pair_cost_target(match_ratio);
-                        let raw_up_cap = if dn_shares >= 10.0 { (pair_target - dn_cost / dn_shares).max(0.30) } else { 1.0_f64 };
-                        let raw_dn_cap = if up_shares >= 10.0 { (pair_target - up_cost / up_shares).max(0.30) } else { 1.0_f64 };
-                        let (up_price_cap, dn_price_cap) = (raw_up_cap, raw_dn_cap);
-                        // Sizes: underweight in repair or T+210s = 48/36/36 | everything else = 24/18/18
+                        // Price cap (only active after 30s of pair_cost > 0.97)
+                        let (up_price_cap, dn_price_cap) = if price_cap_active {
+                            let full_v = up_shares.max(dn_shares);
+                            let weak_v = up_shares.min(dn_shares);
+                            let match_ratio = if full_v >= 10.0 { weak_v / full_v } else { 1.0 };
+                            let pair_target = repair_pair_cost_target(match_ratio);
+                            let raw_up = if dn_shares >= 10.0 { (pair_target - dn_cost / dn_shares).max(0.30) } else { 1.0_f64 };
+                            let raw_dn = if up_shares >= 10.0 { (pair_target - up_cost / up_shares).max(0.30) } else { 1.0_f64 };
+                            (raw_up, raw_dn)
+                        } else {
+                            (1.0_f64, 1.0_f64)
+                        };
+                        // Sizes: underweight in repair or T+210s = 25/35/40 | everything else = 24/18/18
                         let up_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 210) && up_shares < dn_shares {
                             [25.0, 35.0, 40.0]
                         } else {
@@ -575,7 +598,7 @@ async fn run_vidarx_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(up_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (up_offset + level) as f64 * 0.01;
+                                let offset = (up_offset + level as i32) as f64 * 0.01;
                                 let price = ((up_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= up_ask || price > up_price_cap { continue; }
 
@@ -603,7 +626,7 @@ async fn run_vidarx_strategy(
                             for (level, &base_size) in base_sizes.iter().enumerate() {
                                 let size = base_size.min(dn_remaining);
                                 if size < 5.0 { break; }
-                                let offset = (dn_offset + level) as f64 * 0.01;
+                                let offset = (dn_offset + level as i32) as f64 * 0.01;
                                 let price = ((dn_bid - offset) * 100.0).round() / 100.0;
                                 if price <= 0.01 || price >= dn_ask || price > dn_price_cap { continue; }
 
@@ -627,9 +650,9 @@ async fn run_vidarx_strategy(
                             orders_live = true;
                             last_post_ts = now_ms;
                             cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
-                            info!(">>> POST P1{}: up_off={} dn_off={} obi={:.2} cancel={}ms",
+                            info!(">>> POST P1{}: up_off={} dn_off={} cap={} obi={:.2} cancel={}ms",
                                 if repair_mode { " [REPAIR]" } else { "" },
-                                up_offset, dn_offset, latest_obi, cancel_delay_ms);
+                                up_offset, dn_offset, price_cap_active, latest_obi, cancel_delay_ms);
                         }
                     }
                 }
@@ -674,9 +697,10 @@ async fn run_vidarx_strategy(
                             reason: "close_enough_sub5".into(),
                         }).await;
                     } else if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        // Phase 2: offset_base=3 → bid-3c/-4c/-5c, sizes 48/36/36, no price gate
-                        let offset_base = 3usize;
-                        let base_sizes = [48.0_f64, 36.0, 36.0];
+                        // Phase 2: cheap side only, offset_base=-5 → bid+5c/+4c/+3c, sizes 25/35/40
+                        // Price cap only active if price_cap_active (30s of pair_cost > 0.97)
+                        let offset_base: i32 = -5;
+                        let base_sizes = [25.0_f64, 35.0, 40.0];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
                         let mut posted_any = false;
@@ -684,9 +708,10 @@ async fn run_vidarx_strategy(
                         for (level, &base_size) in base_sizes.iter().enumerate() {
                             let size = base_size.min(remaining);
                             if size < 5.0 { break; }
-                            let offset = (offset_base + level) as f64 * 0.01;
+                            let offset = (offset_base + level as i32) as f64 * 0.01;
                             let price = ((need_bid - offset) * 100.0).round() / 100.0;
-                            if price <= 0.01 || price >= need_ask || price > repair_max_bid { continue; }
+                            if price <= 0.01 || price >= need_ask { continue; }
+                            if price_cap_active && price > repair_max_bid { continue; }
 
                             let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                 market_slug: market.slug.clone(),
@@ -708,8 +733,8 @@ async fn run_vidarx_strategy(
                             last_post_ts = now_ms;
                             cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
                         }
-                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} @ bid-3c | cap={:.0}c",
-                            full_side, full_shares_v, need_label, still_need, repair_max_bid * 100.0);
+                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} above bid | cap={} max={:.0}c",
+                            full_side, full_shares_v, need_label, still_need, price_cap_active, repair_max_bid * 100.0);
                     }
                 }
             }
