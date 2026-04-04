@@ -196,36 +196,24 @@ async fn run_vidarx_strategy(
     mut fill_rx: mpsc::Receiver<feeds::user_ws::UserFillEvent>,
     _log_tx: mpsc::Sender<LogEvent>,
 ) {
-    info!("VIDARX v3: single bid per side, exp@bid / cheap@bid-5c, repair at T+95s targeting 97c pair cost");
+    info!("VIDARX v3: GTC resting orders — 10 rounds × 5sh/side every 25s from T+10s, no cancel");
 
     // Per-window state
     let mut last_window_ts: i64 = 0;
-    let mut pair_done = false;
 
-    // Per-window inventory
+    // Per-window inventory (fills tracked for logging)
     let mut up_shares: f64 = 0.0;
     let mut dn_shares: f64 = 0.0;
     let mut up_cost: f64 = 0.0;
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
-    let max_shares_per_side: f64 = 200.0;
-    let match_tolerance = 0.05; // within 5% = matched
-    // Repair order tracking: monotonically increasing per-side counters.
-    // Caps repair orders regardless of fill WS lag — prevents runaway taker buying.
-    let mut repair_sent_up: f64 = 0.0;
-    let mut repair_sent_dn: f64 = 0.0;
 
-    // OBI — stored for spike cancel only
+    // Round tracking: 10 rounds × 5sh each, one every 25s from T+10s
+    let total_rounds: u32 = 10;
+    let round_size: f64 = 5.0;
+    let mut rounds_posted: u32 = 0;
+
     let mut latest_obi: f64 = 0.0;
-    let mut window_skip = false;
-
-    // Timing: random 500–2500ms cancel / random 500–2500ms repost
-    let mut cancel_delay_ms: i64 = 2000;
-    let mut next_post_interval_ms: i64 = 0;
-    let mut last_cancel_ts: i64 = 0;
-    let mut last_post_ts: i64 = 0;
-    let mut orders_live = false;
-
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
     loop {
@@ -233,51 +221,40 @@ async fn run_vidarx_strategy(
         {
             let market = market_rx.borrow().clone();
             if market.window_start_ts > 0 && market.window_start_ts != last_window_ts {
-                // Log previous window
                 if last_window_ts > 0 && (up_shares > 0.0 || dn_shares > 0.0) {
                     let matched = up_shares.min(dn_shares);
                     let pair_cost = if matched > 0.0 {
                         (up_cost / up_shares.max(0.001)) + (dn_cost / dn_shares.max(0.001))
                     } else { 0.0 };
-                    info!(">>> WINDOW COMPLETE: UP {:.0}sh (${:.2}) DN {:.0}sh (${:.2}) | matched={:.0} pcost={:.0}c | fills={}",
+                    info!(">>> WINDOW COMPLETE: UP {:.0}sh (${:.2}) DN {:.0}sh (${:.2}) | matched={:.0} pcost={:.0}c | fills={} | rounds={}",
                         up_shares, up_cost, dn_shares, dn_cost,
-                        matched, pair_cost * 100.0, fills_this_window);
+                        matched, pair_cost * 100.0, fills_this_window, rounds_posted);
                 }
 
                 // Reset
                 up_shares = 0.0; dn_shares = 0.0;
                 up_cost = 0.0; dn_cost = 0.0;
                 fills_this_window = 0;
-                pair_done = false;
-                repair_sent_up = 0.0;
-                repair_sent_dn = 0.0;
-                window_skip = false;
-                orders_live = false;
-                last_post_ts = 0;
-                last_cancel_ts = 0;
-                next_post_interval_ms = rand::thread_rng().gen_range(500..=2500);
+                rounds_posted = 0;
                 last_window_ts = market.window_start_ts;
 
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                     reason: "new_window".into(),
                 }).await;
 
-                info!(">>> NEW WINDOW {} — PLAYING max {:.0}sh/side", market.window_start_ts, max_shares_per_side);
+                info!(">>> NEW WINDOW {} — {} rounds × {:.0}sh/side every 25s from T+10s",
+                    market.window_start_ts, total_rounds, round_size);
             }
         }
 
         tokio::select! {
-            // Store latest OBI for adverse selection gating
             Some(sig) = signal_rx.recv() => {
                 latest_obi = sig.obi_ema;
             }
 
-            // Process executor events — confirm matching GTC was accepted
-            Some(_evt) = exec_evt_rx.recv() => {
-                // executor events — no action needed
-            }
+            Some(_evt) = exec_evt_rx.recv() => {}
 
-            // Track fills from user WS
+            // Track fills
             Some(fill) = fill_rx.recv() => {
                 let market = market_rx.borrow().clone();
                 let is_up = fill.asset_id == market.up_token_id;
@@ -286,62 +263,16 @@ async fn run_vidarx_strategy(
                 if fill.side != "BUY" { continue; }
 
                 fills_this_window += 1;
-                if is_up {
-                    up_shares += fill.size;
-                    up_cost += fill.size * fill.price;
-                } else {
-                    dn_shares += fill.size;
-                    dn_cost += fill.size * fill.price;
-                }
+                if is_up { up_shares += fill.size; up_cost += fill.size * fill.price; }
+                else      { dn_shares += fill.size; dn_cost += fill.size * fill.price; }
 
-                let side_label = if is_up { "UP" } else { "DN" };
                 let matched = up_shares.min(dn_shares);
                 let pair_cost = if matched > 0.0 {
                     (up_cost / up_shares.max(0.001)) + (dn_cost / dn_shares.max(0.001))
                 } else { 0.0 };
-
-                info!(">>> FILL: {} {:.1}sh @ {:.2} | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c",
-                    side_label, fill.size, fill.price, up_shares, dn_shares, matched, pair_cost * 100.0);
-
-                // Markout logging: spawn task to capture mid at +250ms / +500ms / +1s
-                {
-                    let fill_price_snap = fill.price;
-                    let fill_side_str: &'static str = if is_up { "UP" } else { "DN" };
-                    let obi_at_fill = latest_obi;
-                    let pm_rx = pm_top_rx.clone();
-                    tokio::spawn(async move {
-                        for (delay_ms, label) in &[(250u64, "250ms"), (500u64, "500ms"), (1000u64, "1s")] {
-                            tokio::time::sleep(std::time::Duration::from_millis(*delay_ms)).await;
-                            let top = pm_rx.borrow().clone();
-                            let (bid_now, ask_now) = if fill_side_str == "UP" {
-                                (top.up_bid.unwrap_or(0.0), top.up_ask.unwrap_or(0.0))
-                            } else {
-                                (top.down_bid.unwrap_or(0.0), top.down_ask.unwrap_or(0.0))
-                            };
-                            let mid = (bid_now + ask_now) / 2.0;
-                            let markout = mid - fill_price_snap;
-                            info!(">>> MARKOUT@{}: {} fill={:.0}c mid={:.0}c Δ={:+.1}c obi@fill={:.2}",
-                                label, fill_side_str,
-                                fill_price_snap * 100.0, mid * 100.0,
-                                markout * 100.0, obi_at_fill);
-                        }
-                    });
-                }
-
-                // FIX #2: Only check match AFTER one side is full (>= 20sh)
-                // Don't stop early when both sides are half-full
-                if !pair_done && (up_shares >= max_shares_per_side || dn_shares >= max_shares_per_side) {
-                    let bigger = up_shares.max(dn_shares);
-                    let smaller = up_shares.min(dn_shares);
-                    if smaller >= bigger * (1.0 - match_tolerance) {
-                        info!(">>> MATCHED! UP={:.0} DN={:.0} — one side full + within 10%, holding to resolution",
-                            up_shares, dn_shares);
-                        pair_done = true;
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "matched_pair_done".into(),
-                        }).await;
-                    }
-                }
+                info!(">>> FILL: {} {:.1}sh @ {:.0}c | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c",
+                    if is_up { "UP" } else { "DN" }, fill.size, fill.price * 100.0,
+                    up_shares, dn_shares, matched, pair_cost * 100.0);
             }
 
             // Heartbeat
@@ -350,49 +281,32 @@ async fn run_vidarx_strategy(
                 let pair_cost = if up_shares >= 1.0 && dn_shares >= 1.0 {
                     (up_cost / up_shares) + (dn_cost / dn_shares)
                 } else { 0.0 };
-                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pcost={:.0}c | pair_done={} | fills={}",
+                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pcost={:.0}c | rounds={}/{} | obi={:.2}",
                     top.up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
                     top.down_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
-                    up_shares, dn_shares, pair_cost * 100.0, pair_done, fills_this_window);
+                    up_shares, dn_shares, pair_cost * 100.0,
+                    rounds_posted, total_rounds, latest_obi);
             }
 
-            // ═══ MAIN STRATEGY LOOP — every 100ms ═══
+            // ═══ MAIN LOOP — every 100ms ═══
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                if pair_done { continue; }
-
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 let market = market_rx.borrow().clone();
                 if market.up_token_id.is_empty() { continue; }
 
                 let elapsed_s = (now_ms / 1000) - market.window_start_ts;
 
-                // Wait for T+35s
-                if elapsed_s < 35 { continue; }
+                // How many rounds should have fired by now?
+                // Round N fires at T + 10 + N*25  (N=0..9)
+                let rounds_due = if elapsed_s < 10 {
+                    0u32
+                } else {
+                    (((elapsed_s - 10) / 25) + 1).min(total_rounds as i64) as u32
+                };
 
-                // No hard stop — keep posting until matched or new window detected
+                if rounds_posted >= rounds_due { continue; }
 
-                // OBI spike cancel
-                if orders_live && latest_obi.abs() > 0.55 {
-                    let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                        reason: "obi_spike".into(),
-                    }).await;
-                    orders_live = false;
-                    last_cancel_ts = now_ms;
-                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2500);
-                    info!(">>> OBI SPIKE CANCEL: obi={:.3}", latest_obi);
-                }
-
-                // Random cancel
-                if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms {
-                    let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                        reason: "flash_cancel".into(),
-                    }).await;
-                    orders_live = false;
-                    last_cancel_ts = now_ms;
-                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2500);
-                }
-
-                // Get prices
+                // Get current prices
                 let top = pm_top_rx.borrow().clone();
                 let (up_bid, up_ask) = match (top.up_bid, top.up_ask) {
                     (Some(b), Some(a)) => (b, a),
@@ -403,140 +317,61 @@ async fn run_vidarx_strategy(
                     _ => continue,
                 };
 
-                // Expensive side = higher ask; cheap side = lower ask
-                let exp_is_up  = up_ask >= dn_ask;
-                let exp_bid_v  = if exp_is_up { up_bid } else { dn_bid };
-                // Phase 1 prices: exp @ bid-1c, cheap @ 0.97-exp_bid (pair sums ~97c)
-                // Floor: cheap never goes below cheap_bid-2c (handles 99c/3c extreme splits)
-                let cheap_bid_v  = if exp_is_up { dn_bid } else { up_bid };
-                let cheap_formula = (0.97 - exp_bid_v).max(cheap_bid_v - 0.02);
-                let up_price_p1 = if exp_is_up { up_bid - 0.01 } else { cheap_formula };
-                let dn_price_p1 = if exp_is_up { cheap_formula } else { dn_bid - 0.01 };
+                // Exp = higher ask, cheap = lower ask
+                let exp_is_up   = up_ask >= dn_ask;
+                let exp_bid_v   = if exp_is_up { up_bid } else { dn_bid };
+                let cheap_ask_v = if exp_is_up { dn_ask } else { up_ask };
 
-                // ═══ T+95s+: REPAIR — post underweight side @ 0.97 - overweight_avg_cost ═══
-                if elapsed_s >= 95 {
-                    let full_v = up_shares.max(dn_shares);
-                    let weak_v = up_shares.min(dn_shares);
+                // Prices: exp @ bid, cheap @ 0.97 - exp_bid (capped below cheap ask)
+                let exp_price   = (exp_bid_v * 100.0).round() / 100.0;
+                let cheap_price = ((0.97 - exp_bid_v).max(0.01).min(cheap_ask_v - 0.01) * 100.0).round() / 100.0;
 
-                    // Matched? Hold to window close.
-                    if full_v > 0.0 && weak_v >= full_v * (1.0 - match_tolerance) {
-                        if !pair_done {
-                            info!(">>> REPAIRED: full={:.0} weak={:.0} ({:.0}%) — holding to close",
-                                full_v, weak_v, weak_v / full_v * 100.0);
-                            pair_done = true;
-                            let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                                reason: "repaired".into(),
-                            }).await;
-                        }
-                        continue;
-                    }
+                let (up_price, dn_price) = if exp_is_up {
+                    (exp_price, cheap_price)
+                } else {
+                    (cheap_price, exp_price)
+                };
 
-                    // Determine underweight side
-                    let under_is_up = up_shares <= dn_shares;
-                    let (under_ask, under_shares, over_cost_v, over_shares_v) =
-                        if under_is_up {
-                            (up_ask, up_shares, dn_cost, dn_shares)
-                        } else {
-                            (dn_ask, dn_shares, up_cost, up_shares)
-                        };
+                let round_num = rounds_posted + 1;
+                let mut posted_any = false;
 
-                    // Use repair_sent (not under_shares) to cap orders — fill WS lag
-                    // can delay share updates by 500ms+, causing runaway taker buying
-                    let repair_sent_under = if under_is_up { repair_sent_up } else { repair_sent_dn };
-                    let still_need = (max_shares_per_side - repair_sent_under.max(under_shares)).max(0.0);
-                    if still_need < 5.0 { continue; }
-
-                    // Price = 0.97 - overweight_avg_cost. post_only=false so it crosses
-                    // the spread immediately as a taker and fills fast.
-                    // Falls back to market formula if no fills yet on overweight side.
-                    let over_avg = if over_shares_v >= 1.0 { over_cost_v / over_shares_v } else { 0.0 };
-                    let raw_price = if over_shares_v >= 1.0 {
-                        0.97 - over_avg
-                    } else {
-                        let under_is_exp = under_is_up == exp_is_up;
-                        if under_is_exp { exp_bid_v } else { 0.97 - exp_bid_v }
-                    };
-                    let price = (raw_price * 100.0).round() / 100.0;
-
-                    if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        let size     = 24.0_f64.min(still_need);
-                        let token_id = if under_is_up { market.up_token_id.clone() } else { market.down_token_id.clone() };
-                        let side_v   = if under_is_up { Side::Up } else { Side::Down };
-                        let label    = if under_is_up { "UP" } else { "DN" };
-
-                        if size >= 5.0 && price > 0.01 {
-                            let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                                market_slug: market.slug.clone(),
-                                token_id,
-                                side: side_v,
-                                price,
-                                size,
-                                post_only: false,
-                                ladder_key: format!("repair_{}", label.to_lowercase()),
-                                was_cheap: under_is_up != exp_is_up,
-                            }).await;
-                            // Track immediately — don't wait for fill WS confirmation
-                            if under_is_up { repair_sent_up += size; } else { repair_sent_dn += size; }
-                            orders_live = true;
-                            last_post_ts = now_ms;
-                            cancel_delay_ms = rand::thread_rng().gen_range(500..=2500);
-                            info!(">>> REPAIR [{}]: {:.0}sh @ {:.0}c (taker) | over_avg={:.0}c | target_sum={:.0}c | full={:.0} weak={:.0}",
-                                label, size, price * 100.0, over_avg * 100.0,
-                                (price + over_avg) * 100.0, full_v, weak_v);
-                        }
-                    }
-                    continue; // skip phase1 posting
+                // UP side
+                if up_price > 0.01 && up_price < up_ask {
+                    let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                        market_slug: market.slug.clone(),
+                        token_id: market.up_token_id.clone(),
+                        side: Side::Up,
+                        price: up_price,
+                        size: round_size,
+                        post_only: true,
+                        ladder_key: format!("up:r{}", round_num),
+                        was_cheap: !exp_is_up,
+                    }).await;
+                    posted_any = true;
                 }
 
-                // ═══ T+35s to T+95s: PHASE 1 — single bid per side, pair sums to 97c ═══
-                // Exp @ exp_bid, cheap @ 0.97 - exp_bid
-                if !window_skip && !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                    let up_needs = (max_shares_per_side - up_shares).max(0.0);
-                    let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
-                    let up_price = (up_price_p1.min(up_ask - 0.01) * 100.0).round() / 100.0;
-                    let dn_price = (dn_price_p1.min(dn_ask - 0.01) * 100.0).round() / 100.0;
-                    let mut posted_any = false;
+                // DN side
+                if dn_price > 0.01 && dn_price < dn_ask {
+                    let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                        market_slug: market.slug.clone(),
+                        token_id: market.down_token_id.clone(),
+                        side: Side::Down,
+                        price: dn_price,
+                        size: round_size,
+                        post_only: true,
+                        ladder_key: format!("dn:r{}", round_num),
+                        was_cheap: exp_is_up,
+                    }).await;
+                    posted_any = true;
+                }
 
-                    // UP side
-                    if up_needs >= 5.0 && up_price > 0.01 && up_price < up_ask {
-                        let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                            market_slug: market.slug.clone(),
-                            token_id: market.up_token_id.clone(),
-                            side: Side::Up,
-                            price: up_price,
-                            size: 24.0_f64.min(up_needs),
-                            post_only: true,
-                            ladder_key: "up:0".into(),
-                            was_cheap: !exp_is_up,
-                        }).await;
-                        posted_any = true;
-                    }
-
-                    // DN side
-                    if dn_needs >= 5.0 && dn_price > 0.01 && dn_price < dn_ask {
-                        let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                            market_slug: market.slug.clone(),
-                            token_id: market.down_token_id.clone(),
-                            side: Side::Down,
-                            price: dn_price,
-                            size: 24.0_f64.min(dn_needs),
-                            post_only: true,
-                            ladder_key: "dn:0".into(),
-                            was_cheap: exp_is_up,
-                        }).await;
-                        posted_any = true;
-                    }
-
-                    if posted_any {
-                        orders_live = true;
-                        last_post_ts = now_ms;
-                        cancel_delay_ms = rand::thread_rng().gen_range(500..=2500);
-                        info!(">>> POST P1: UP@{:.0}c[{}] DN@{:.0}c[{}] sum={:.0}c | UP={:.0}sh DN={:.0}sh cancel={}ms",
-                            up_price * 100.0, if exp_is_up { "EXP" } else { "CHEAP" },
-                            dn_price * 100.0, if exp_is_up { "CHEAP" } else { "EXP" },
-                            (up_price + dn_price) * 100.0,
-                            up_shares, dn_shares, cancel_delay_ms);
-                    }
+                if posted_any {
+                    rounds_posted += 1;
+                    info!(">>> ROUND {}/{}: UP@{:.0}c[{}] DN@{:.0}c[{}] sum={:.0}c | T+{}s",
+                        rounds_posted, total_rounds,
+                        up_price * 100.0, if exp_is_up { "EXP" } else { "CHEAP" },
+                        dn_price * 100.0, if exp_is_up { "CHEAP" } else { "EXP" },
+                        (up_price + dn_price) * 100.0, elapsed_s);
                 }
             }
         }
