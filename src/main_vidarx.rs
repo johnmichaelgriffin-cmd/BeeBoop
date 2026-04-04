@@ -210,6 +210,10 @@ async fn run_vidarx_strategy(
     let mut fills_this_window: u32 = 0;
     let max_shares_per_side: f64 = 200.0;
     let match_tolerance = 0.05; // within 5% = matched
+    // Repair order tracking: monotonically increasing per-side counters.
+    // Caps repair orders regardless of fill WS lag — prevents runaway taker buying.
+    let mut repair_sent_up: f64 = 0.0;
+    let mut repair_sent_dn: f64 = 0.0;
 
     // OBI — stored for spike cancel only
     let mut latest_obi: f64 = 0.0;
@@ -245,6 +249,8 @@ async fn run_vidarx_strategy(
                 up_cost = 0.0; dn_cost = 0.0;
                 fills_this_window = 0;
                 pair_done = false;
+                repair_sent_up = 0.0;
+                repair_sent_dn = 0.0;
                 window_skip = false;
                 orders_live = false;
                 last_post_ts = 0;
@@ -434,7 +440,10 @@ async fn run_vidarx_strategy(
                             (dn_ask, dn_shares, up_cost, up_shares)
                         };
 
-                    let still_need = (max_shares_per_side - under_shares).max(0.0);
+                    // Use repair_sent (not under_shares) to cap orders — fill WS lag
+                    // can delay share updates by 500ms+, causing runaway taker buying
+                    let repair_sent_under = if under_is_up { repair_sent_up } else { repair_sent_dn };
+                    let still_need = (max_shares_per_side - repair_sent_under.max(under_shares)).max(0.0);
                     if still_need < 5.0 { continue; }
 
                     // Price = 0.97 - overweight_avg_cost. post_only=false so it crosses
@@ -466,6 +475,8 @@ async fn run_vidarx_strategy(
                                 ladder_key: format!("repair_{}", label.to_lowercase()),
                                 was_cheap: under_is_up != exp_is_up,
                             }).await;
+                            // Track immediately — don't wait for fill WS confirmation
+                            if under_is_up { repair_sent_up += size; } else { repair_sent_dn += size; }
                             orders_live = true;
                             last_post_ts = now_ms;
                             cancel_delay_ms = rand::thread_rng().gen_range(500..=2500);
