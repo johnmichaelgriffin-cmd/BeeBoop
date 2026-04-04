@@ -405,9 +405,13 @@ async fn run_vidarx_strategy(
                 };
 
                 // Expensive side = higher ask; cheap side = lower ask
-                let exp_is_up = up_ask >= dn_ask;
+                let exp_is_up  = up_ask >= dn_ask;
+                let exp_bid_v  = if exp_is_up { up_bid } else { dn_bid };
+                // Phase 1 prices: exp @ bid, cheap @ 0.97 - exp_bid → pair always sums to 97c
+                let up_price_p1 = if exp_is_up { exp_bid_v } else { 0.97 - exp_bid_v };
+                let dn_price_p1 = if exp_is_up { 0.97 - exp_bid_v } else { exp_bid_v };
 
-                // ═══ T+95s+: REPAIR — only post underweight side, cap at 0.97 pair cost ═══
+                // ═══ T+95s+: REPAIR — post underweight side @ 0.97 - overweight_avg_cost ═══
                 if elapsed_s >= 95 {
                     let full_v = up_shares.max(dn_shares);
                     let weak_v = up_shares.min(dn_shares);
@@ -427,35 +431,34 @@ async fn run_vidarx_strategy(
 
                     // Determine underweight side
                     let under_is_up = up_shares <= dn_shares;
-                    let (under_bid, under_ask, under_shares, over_cost_v, over_shares_v) =
+                    let (under_ask, under_shares, over_cost_v, over_shares_v) =
                         if under_is_up {
-                            (up_bid, up_ask, up_shares, dn_cost, dn_shares)
+                            (up_ask, up_shares, dn_cost, dn_shares)
                         } else {
-                            (dn_bid, dn_ask, dn_shares, up_cost, up_shares)
+                            (dn_ask, dn_shares, up_cost, up_shares)
                         };
 
                     let still_need = (max_shares_per_side - under_shares).max(0.0);
                     if still_need < 5.0 { continue; }
 
-                    // Price cap: target average pair cost of 97c
-                    let repair_max_bid = if over_shares_v >= 1.0 {
-                        (0.97 - over_cost_v / over_shares_v).max(0.30)
+                    // Price = 0.97 - overweight_avg_cost (actual cost of the filled opposite side)
+                    // Falls back to 1.0 cap if overweight side is empty (no fills yet)
+                    let price = if over_shares_v >= 1.0 {
+                        ((0.97 - over_cost_v / over_shares_v) * 100.0).round() / 100.0
                     } else {
-                        1.0_f64
+                        // No fills yet on either side — use market formula as fallback
+                        let under_is_exp = under_is_up == exp_is_up;
+                        ((if under_is_exp { exp_bid_v } else { 0.97 - exp_bid_v }) * 100.0).round() / 100.0
                     };
 
-                    // Offset: exp=bid (offset 0), cheap=bid-5c (offset 5)
-                    let under_is_exp = under_is_up == exp_is_up;
-                    let offset = if under_is_exp { 0.0_f64 } else { 0.05_f64 };
-
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        let size = 24.0_f64.min(still_need);
-                        let price = ((under_bid - offset) * 100.0).round() / 100.0;
+                        let size     = 24.0_f64.min(still_need);
                         let token_id = if under_is_up { market.up_token_id.clone() } else { market.down_token_id.clone() };
                         let side_v   = if under_is_up { Side::Up } else { Side::Down };
                         let label    = if under_is_up { "UP" } else { "DN" };
+                        let over_avg = if over_shares_v >= 1.0 { over_cost_v / over_shares_v } else { 0.0 };
 
-                        if size >= 5.0 && price > 0.01 && price < under_ask && price <= repair_max_bid {
+                        if size >= 5.0 && price > 0.01 && price < under_ask {
                             let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                 market_slug: market.slug.clone(),
                                 token_id,
@@ -464,74 +467,66 @@ async fn run_vidarx_strategy(
                                 size,
                                 post_only: true,
                                 ladder_key: format!("repair_{}", label.to_lowercase()),
-                                was_cheap: !under_is_exp,
+                                was_cheap: under_is_up != exp_is_up,
                             }).await;
                             orders_live = true;
                             last_post_ts = now_ms;
                             cancel_delay_ms = rand::thread_rng().gen_range(500..=2500);
-                            info!(">>> REPAIR [{}|{}]: {:.0}sh @ {:.0}c | cap={:.0}c | full={:.0} weak={:.0} cancel={}ms",
-                                label, if under_is_exp { "EXP" } else { "CHEAP" },
-                                size, price * 100.0, repair_max_bid * 100.0,
-                                full_v, weak_v, cancel_delay_ms);
+                            info!(">>> REPAIR [{}]: {:.0}sh @ {:.0}c | over_avg={:.0}c | sum={:.0}c | full={:.0} weak={:.0} cancel={}ms",
+                                label, size, price * 100.0, over_avg * 100.0,
+                                (price + over_avg) * 100.0, full_v, weak_v, cancel_delay_ms);
                         }
                     }
                     continue; // skip phase1 posting
                 }
 
-                // ═══ T+35s to T+95s: PHASE 1 — single bid per side ═══
-                // Exp at bid (offset=0), cheap at bid-5c (offset=0.05)
+                // ═══ T+35s to T+95s: PHASE 1 — single bid per side, pair sums to 97c ═══
+                // Exp @ exp_bid, cheap @ 0.97 - exp_bid
                 if !window_skip && !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                    let up_needs  = (max_shares_per_side - up_shares).max(0.0);
-                    let dn_needs  = (max_shares_per_side - dn_shares).max(0.0);
-                    let up_offset = if exp_is_up { 0.0_f64 } else { 0.05_f64 };
-                    let dn_offset = if exp_is_up { 0.05_f64 } else { 0.0_f64 };
+                    let up_needs = (max_shares_per_side - up_shares).max(0.0);
+                    let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
+                    let up_price = (up_price_p1 * 100.0).round() / 100.0;
+                    let dn_price = (dn_price_p1 * 100.0).round() / 100.0;
                     let mut posted_any = false;
 
                     // UP side
-                    if up_needs >= 5.0 {
-                        let size  = 24.0_f64.min(up_needs);
-                        let price = ((up_bid - up_offset) * 100.0).round() / 100.0;
-                        if price > 0.01 && price < up_ask {
-                            let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                                market_slug: market.slug.clone(),
-                                token_id: market.up_token_id.clone(),
-                                side: Side::Up,
-                                price,
-                                size,
-                                post_only: true,
-                                ladder_key: "up:0".into(),
-                                was_cheap: !exp_is_up,
-                            }).await;
-                            posted_any = true;
-                        }
+                    if up_needs >= 5.0 && up_price > 0.01 && up_price < up_ask {
+                        let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                            market_slug: market.slug.clone(),
+                            token_id: market.up_token_id.clone(),
+                            side: Side::Up,
+                            price: up_price,
+                            size: 24.0_f64.min(up_needs),
+                            post_only: true,
+                            ladder_key: "up:0".into(),
+                            was_cheap: !exp_is_up,
+                        }).await;
+                        posted_any = true;
                     }
 
                     // DN side
-                    if dn_needs >= 5.0 {
-                        let size  = 24.0_f64.min(dn_needs);
-                        let price = ((dn_bid - dn_offset) * 100.0).round() / 100.0;
-                        if price > 0.01 && price < dn_ask {
-                            let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                                market_slug: market.slug.clone(),
-                                token_id: market.down_token_id.clone(),
-                                side: Side::Down,
-                                price,
-                                size,
-                                post_only: true,
-                                ladder_key: "dn:0".into(),
-                                was_cheap: exp_is_up,
-                            }).await;
-                            posted_any = true;
-                        }
+                    if dn_needs >= 5.0 && dn_price > 0.01 && dn_price < dn_ask {
+                        let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                            market_slug: market.slug.clone(),
+                            token_id: market.down_token_id.clone(),
+                            side: Side::Down,
+                            price: dn_price,
+                            size: 24.0_f64.min(dn_needs),
+                            post_only: true,
+                            ladder_key: "dn:0".into(),
+                            was_cheap: exp_is_up,
+                        }).await;
+                        posted_any = true;
                     }
 
                     if posted_any {
                         orders_live = true;
                         last_post_ts = now_ms;
                         cancel_delay_ms = rand::thread_rng().gen_range(500..=2500);
-                        info!(">>> POST P1: UP@{:.0}c[{}] DN@{:.0}c[{}] UP={:.0}sh DN={:.0}sh cancel={}ms",
-                            (up_bid - up_offset) * 100.0, if exp_is_up { "EXP" } else { "CHEAP" },
-                            (dn_bid - dn_offset) * 100.0, if exp_is_up { "CHEAP" } else { "EXP" },
+                        info!(">>> POST P1: UP@{:.0}c[{}] DN@{:.0}c[{}] sum={:.0}c | UP={:.0}sh DN={:.0}sh cancel={}ms",
+                            up_price * 100.0, if exp_is_up { "EXP" } else { "CHEAP" },
+                            dn_price * 100.0, if exp_is_up { "CHEAP" } else { "EXP" },
+                            (up_price + dn_price) * 100.0,
                             up_shares, dn_shares, cancel_delay_ms);
                     }
                 }
