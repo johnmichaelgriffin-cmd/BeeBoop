@@ -196,7 +196,7 @@ async fn run_vidarx_strategy(
     mut fill_rx: mpsc::Receiver<feeds::user_ws::UserFillEvent>,
     _log_tx: mpsc::Sender<LogEvent>,
 ) {
-    info!("FLASH LADDER: post both sides ask-3/-4/-5c, cancel@250ms, max 20sh/side, matching GTC");
+    info!("VIDARX v3: single bid per side, exp@bid / cheap@bid-5c, repair at T+95s targeting 97c pair cost");
 
     // Per-window state
     let mut last_window_ts: i64 = 0;
@@ -208,27 +208,19 @@ async fn run_vidarx_strategy(
     let mut up_cost: f64 = 0.0;
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
-    let mut matching_gtc_posted = false; // true once we've posted the single matching GTC
     let max_shares_per_side: f64 = 200.0;
-    let match_tolerance = 0.05; // within 5% = considered matched (tighter completion target)
-    let mut repair_mode = false; // reversible: enters at weak<60% of full, exits at weak>=95%
-    let mut phase2_mode = false; // one-way latch: overweight side capped OR T+180s emergency
-    let practical_full: f64 = 200.0; // triggers phase2_mode when either side reaches this
-    let mut initial_phase = true; // collect ~30sh on exp side first, then go two-sided
-    let mut cap_overpay_since_ms: i64 = 0; // when pair_cost first exceeded 0.97
-    let mut price_cap_active = false;       // true after 30s straight of pair_cost > 0.97
+    let match_tolerance = 0.05; // within 5% = matched
 
-    // OBI — stored for spike cancel only (no directional skew in Phase 1)
+    // OBI — stored for spike cancel only
     let mut latest_obi: f64 = 0.0;
     let mut window_skip = false;
 
-    // Timing — Phase 1: random 500–2000ms cancel / random 500–2000ms repost
-    //          Phase 2: 1000–1500ms cancel / random 500–2000ms repost
+    // Timing: random 500–2500ms cancel / random 500–2500ms repost
     let mut cancel_delay_ms: i64 = 2000;
     let mut next_post_interval_ms: i64 = 0;
     let mut last_cancel_ts: i64 = 0;
     let mut last_post_ts: i64 = 0;
-    let mut orders_live = false;         // true only if at least one order was sent
+    let mut orders_live = false;
 
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
@@ -253,17 +245,11 @@ async fn run_vidarx_strategy(
                 up_cost = 0.0; dn_cost = 0.0;
                 fills_this_window = 0;
                 pair_done = false;
-                matching_gtc_posted = false;
-                repair_mode = false;
-                phase2_mode = false;
-                initial_phase = true;
-                cap_overpay_since_ms = 0;
-                price_cap_active = false;
                 window_skip = false;
                 orders_live = false;
                 last_post_ts = 0;
                 last_cancel_ts = 0;
-                next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                next_post_interval_ms = rand::thread_rng().gen_range(500..=2500);
                 last_window_ts = market.window_start_ts;
 
                 let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
@@ -281,16 +267,8 @@ async fn run_vidarx_strategy(
             }
 
             // Process executor events — confirm matching GTC was accepted
-            Some(evt) = exec_evt_rx.recv() => {
-                match evt {
-                    ExecutionEvent::MakerOrderPosted { ladder_key, order_id, .. } => {
-                        if ladder_key == "matching_gtc" {
-                            matching_gtc_posted = true;
-                            info!(">>> MATCHING GTC CONFIRMED: order_id={}", &order_id[..16.min(order_id.len())]);
-                        }
-                    }
-                    _ => {}
-                }
+            Some(_evt) = exec_evt_rx.recv() => {
+                // executor events — no action needed
             }
 
             // Track fills from user WS
@@ -363,10 +341,13 @@ async fn run_vidarx_strategy(
             // Heartbeat
             _ = heartbeat_interval.tick() => {
                 let top = pm_top_rx.borrow().clone();
-                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pair_done={} gtc_match={} | fills={}",
+                let pair_cost = if up_shares >= 1.0 && dn_shares >= 1.0 {
+                    (up_cost / up_shares) + (dn_cost / dn_shares)
+                } else { 0.0 };
+                info!("HEARTBEAT: UP ask={} DN ask={} | UP={:.0}sh DN={:.0}sh | pcost={:.0}c | pair_done={} | fills={}",
                     top.up_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
                     top.down_ask.map_or("?".into(), |v| format!("{:.0}c", v * 100.0)),
-                    up_shares, dn_shares, pair_done, matching_gtc_posted, fills_this_window);
+                    up_shares, dn_shares, pair_cost * 100.0, pair_done, fills_this_window);
             }
 
             // ═══ MAIN STRATEGY LOOP — every 100ms ═══
@@ -381,20 +362,6 @@ async fn run_vidarx_strategy(
 
                 // Wait for T+35s
                 if elapsed_s < 35 { continue; }
-                // Late acceptance at T+210: if lagging ≥85% of leader, accept as done
-                if elapsed_s >= 210 && !pair_done {
-                    let full_s = up_shares.max(dn_shares);
-                    let weak_s = up_shares.min(dn_shares);
-                    if full_s > 0.0 && weak_s >= full_s * 0.85 {
-                        info!(">>> T+210 LATE ACCEPT: full={:.0} weak={:.0} ({:.0}%) — holding",
-                            full_s, weak_s, weak_s / full_s * 100.0);
-                        pair_done = true;
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "late_accept".into(),
-                        }).await;
-                        continue;
-                    }
-                }
 
                 // Stop at T+240s
                 if elapsed_s >= 240 {
@@ -405,25 +372,25 @@ async fn run_vidarx_strategy(
                     continue;
                 }
 
-                // OBI spike cancel — cancel immediately if signal crosses hard threshold
+                // OBI spike cancel
                 if orders_live && latest_obi.abs() > 0.55 {
                     let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                         reason: "obi_spike".into(),
                     }).await;
                     orders_live = false;
                     last_cancel_ts = now_ms;
-                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2500);
                     info!(">>> OBI SPIKE CANCEL: obi={:.3}", latest_obi);
                 }
 
-                // ═══ CANCEL (random lifetime) — sample next repost interval at cancel time ═══
+                // Random cancel
                 if orders_live && (now_ms - last_post_ts) >= cancel_delay_ms {
                     let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
                         reason: "flash_cancel".into(),
                     }).await;
                     orders_live = false;
                     last_cancel_ts = now_ms;
-                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                    next_post_interval_ms = rand::thread_rng().gen_range(500..=2500);
                 }
 
                 // Get prices
@@ -437,304 +404,135 @@ async fn run_vidarx_strategy(
                     _ => continue,
                 };
 
-                // ═══ INITIAL PHASE: collect ~30sh on expensive side first ═══
-                // Expensive = whichever token has the higher ask (>50c in a binary)
+                // Expensive side = higher ask; cheap side = lower ask
                 let exp_is_up = up_ask >= dn_ask;
-                let exp_shares = if exp_is_up { up_shares } else { dn_shares };
-                if initial_phase {
-                    if exp_shares >= 30.0 {
-                        initial_phase = false;
-                        info!(">>> INITIAL PHASE DONE: {} {:.0}sh — entering two-sided mode",
-                            if exp_is_up { "UP-EXP" } else { "DN-EXP" }, exp_shares);
-                        // fall through to normal logic — repair_mode will fire immediately
-                    } else {
-                        // Only post the expensive side, 24/18/18 at bid-3c/-4c/-5c
-                        if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                            let (exp_bid, exp_ask_p, exp_token, exp_side_v) = if exp_is_up {
-                                (up_bid, up_ask, market.up_token_id.clone(), Side::Up)
-                            } else {
-                                (dn_bid, dn_ask, market.down_token_id.clone(), Side::Down)
-                            };
-                            let base_sizes = [24.0_f64, 18.0, 18.0];
-                            let mut remaining = (max_shares_per_side - exp_shares).max(0.0);
-                            let mut posted_any = false;
-                            for (level, &base_size) in base_sizes.iter().enumerate() {
-                                let size = base_size.min(remaining);
-                                if size < 5.0 { break; }
-                                let offset = level as f64 * 0.01; // offset_base=0: bid, bid-1c, bid-2c
-                                let price = ((exp_bid - offset) * 100.0).round() / 100.0;
-                                if price <= 0.01 || price >= exp_ask_p { continue; }
-                                let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                                    market_slug: market.slug.clone(),
-                                    token_id: exp_token.clone(),
-                                    side: exp_side_v,
-                                    price,
-                                    size,
-                                    post_only: true,
-                                    ladder_key: format!("init:{}", level),
-                                    was_cheap: false,
-                                }).await;
-                                posted_any = true;
-                                remaining -= size;
-                                if remaining < 5.0 { break; }
-                            }
-                            if posted_any {
-                                orders_live = true;
-                                last_post_ts = now_ms;
-                                cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
-                                info!(">>> POST INIT [{}]: {:.0}sh so far cancel={}ms",
-                                    if exp_is_up { "UP-EXP" } else { "DN-EXP" }, exp_shares, cancel_delay_ms);
-                            }
-                        }
-                        continue; // skip repair/phase2/phase1 logic while collecting exp side
-                    }
-                }
 
-                // ═══ PHASE 1: Both sides need tokens — post flash ladders ═══
-                let up_needs = (max_shares_per_side - up_shares).max(0.0);
-                let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
-
-                // Repair mode: REVERSIBLE — enters when weak side falls below 60% of strong side,
-                // exits when weak side recovers to ≥95% of strong side.
-                {
+                // ═══ T+95s+: REPAIR — only post underweight side, cap at 0.97 pair cost ═══
+                if elapsed_s >= 95 {
                     let full_v = up_shares.max(dn_shares);
                     let weak_v = up_shares.min(dn_shares);
-                    if !repair_mode {
-                        if full_v >= 30.0 && weak_v < full_v * 0.60 {
-                            repair_mode = true;
-                            info!(">>> REPAIR MODE ON: full={:.0} weak={:.0} ({:.0}%)",
+
+                    // Matched? Hold to window close.
+                    if full_v > 0.0 && weak_v >= full_v * (1.0 - match_tolerance) {
+                        if !pair_done {
+                            info!(">>> REPAIRED: full={:.0} weak={:.0} ({:.0}%) — holding to close",
                                 full_v, weak_v, weak_v / full_v * 100.0);
+                            pair_done = true;
+                            let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
+                                reason: "repaired".into(),
+                            }).await;
                         }
-                    } else if weak_v >= full_v * 0.95 {
-                        repair_mode = false;
-                        info!(">>> REPAIR MODE OFF: full={:.0} weak={:.0} — rebalanced",
-                            full_v, weak_v);
+                        continue;
                     }
-                }
 
-                // Phase 2 mode: ONE-WAY latch — overweight side hit practical cap,
-                // OR T+180s emergency if still not matched within 5%.
-                // Once latched: only quote underweight side at offset=1.
-                if !phase2_mode {
-                    let full_v = up_shares.max(dn_shares);
-                    let weak_v = up_shares.min(dn_shares);
-                    let ratio   = weak_v / full_v.max(0.001);
-                    let capped    = up_shares >= practical_full || dn_shares >= practical_full;
-                    let emergency = elapsed_s >= 180 && full_v >= 5.0 && ratio < 0.95;
-                    if capped || emergency {
-                        phase2_mode = true;
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "phase2_start".into(),
-                        }).await;
-                        orders_live = false;
-                        last_cancel_ts = now_ms;
-                        info!(">>> PHASE 2 START: capped={} emergency={} full={:.0} ratio={:.0}%",
-                            capped, emergency, full_v, ratio * 100.0);
-                    }
-                }
+                    // Determine underweight side
+                    let under_is_up = up_shares <= dn_shares;
+                    let (under_bid, under_ask, under_shares, over_cost_v, over_shares_v) =
+                        if under_is_up {
+                            (up_bid, up_ask, up_shares, dn_cost, dn_shares)
+                        } else {
+                            (dn_bid, dn_ask, dn_shares, up_cost, up_shares)
+                        };
 
-                // Dynamic price cap: off by default; activates after 30s of pair_cost > 0.97
-                {
-                    let actual_pair_cost = if up_shares >= 1.0 && dn_shares >= 1.0 {
-                        (up_cost / up_shares) + (dn_cost / dn_shares)
-                    } else { 0.0 };
-                    if actual_pair_cost > 0.97 && up_shares >= 1.0 && dn_shares >= 1.0 {
-                        if cap_overpay_since_ms == 0 { cap_overpay_since_ms = now_ms; }
-                        if !price_cap_active && (now_ms - cap_overpay_since_ms) >= 30_000 {
-                            price_cap_active = true;
-                            info!(">>> PRICE CAP ON: pair_cost={:.3} for 30s straight", actual_pair_cost);
-                        }
+                    let still_need = (max_shares_per_side - under_shares).max(0.0);
+                    if still_need < 5.0 { continue; }
+
+                    // Price cap: target average pair cost of 97c
+                    let repair_max_bid = if over_shares_v >= 1.0 {
+                        (0.97 - over_cost_v / over_shares_v).max(0.30)
                     } else {
-                        cap_overpay_since_ms = 0;
-                        if price_cap_active {
-                            price_cap_active = false;
-                            info!(">>> PRICE CAP OFF: pair_cost={:.3}", actual_pair_cost);
-                        }
-                    }
-                }
+                        1.0_f64
+                    };
 
-                // ═══ PHASE 1: Both sides, exp/cheap-aware offsets ═══
-                // Exp side (higher ask): offset_base=0  → bid, bid-1c, bid-2c  (aggressive)
-                // Cheap side (lower ask): offset_base=-5 → bid+5c, bid+4c, bid+3c (above bid, filtered by ask)
-                if !window_skip && !phase2_mode {
+                    // Offset: exp=bid (offset 0), cheap=bid-5c (offset 5)
+                    let under_is_exp = under_is_up == exp_is_up;
+                    let offset = if under_is_exp { 0.0_f64 } else { 0.05_f64 };
+
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        let (up_offset, dn_offset): (i32, i32) = if exp_is_up {
-                            (0, 5)  // UP=exp at bid; DN=cheap bid-5c/-6c/-7c
-                        } else {
-                            (5, 0)  // DN=exp at bid; UP=cheap bid-5c/-6c/-7c
-                        };
-                        // Price cap (only active after 30s of pair_cost > 0.97)
-                        let (up_price_cap, dn_price_cap) = if price_cap_active {
-                            let full_v = up_shares.max(dn_shares);
-                            let weak_v = up_shares.min(dn_shares);
-                            let match_ratio = if full_v >= 10.0 { weak_v / full_v } else { 1.0 };
-                            let pair_target = repair_pair_cost_target(match_ratio);
-                            let raw_up = if dn_shares >= 10.0 { (pair_target - dn_cost / dn_shares).max(0.30) } else { 1.0_f64 };
-                            let raw_dn = if up_shares >= 10.0 { (pair_target - up_cost / up_shares).max(0.30) } else { 1.0_f64 };
-                            (raw_up, raw_dn)
-                        } else {
-                            (1.0_f64, 1.0_f64)
-                        };
-                        // Sizes: underweight in repair or T+210s = 25/35/40 | everything else = 24/18/18
-                        let up_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 210) && up_shares < dn_shares {
-                            [25.0, 35.0, 40.0]
-                        } else {
-                            [24.0, 18.0, 18.0]
-                        };
-                        let dn_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 210) && dn_shares < up_shares {
-                            [25.0, 35.0, 40.0]
-                        } else {
-                            [24.0, 18.0, 18.0]
-                        };
-                        // In repair mode: always stop posting the overweight side — underweight only
-                        let stop_overweight = repair_mode;
-                        let mut posted_any = false;
+                        let size = 24.0_f64.min(still_need);
+                        let price = ((under_bid - offset) * 100.0).round() / 100.0;
+                        let token_id = if under_is_up { market.up_token_id.clone() } else { market.down_token_id.clone() };
+                        let side_v   = if under_is_up { Side::Up } else { Side::Down };
+                        let label    = if under_is_up { "UP" } else { "DN" };
 
-                        // UP side
-                        let up_is_overweight = repair_mode && up_shares >= dn_shares;
-                        if up_needs >= 5.0 && !(stop_overweight && up_is_overweight) {
-                            let base_sizes = up_base_sizes;
-                            let mut up_remaining = up_needs;
-                            for (level, &base_size) in base_sizes.iter().enumerate() {
-                                let size = base_size.min(up_remaining);
-                                if size < 5.0 { break; }
-                                let offset = (up_offset + level as i32) as f64 * 0.01;
-                                let price = ((up_bid - offset) * 100.0).round() / 100.0;
-                                if price <= 0.01 || price >= up_ask || price > up_price_cap { continue; }
-
-                                let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                                    market_slug: market.slug.clone(),
-                                    token_id: market.up_token_id.clone(),
-                                    side: Side::Up,
-                                    price,
-                                    size,
-                                    post_only: true,
-                                    ladder_key: format!("up:{}", level),
-                                    was_cheap: up_ask < dn_ask,
-                                }).await;
-                                posted_any = true;
-                                up_remaining -= size;
-                                if up_remaining < 5.0 { break; }
-                            }
-                        }
-
-                        // DN side
-                        let dn_is_overweight = repair_mode && dn_shares >= up_shares;
-                        if dn_needs >= 5.0 && !(stop_overweight && dn_is_overweight) {
-                            let base_sizes = dn_base_sizes;
-                            let mut dn_remaining = dn_needs;
-                            for (level, &base_size) in base_sizes.iter().enumerate() {
-                                let size = base_size.min(dn_remaining);
-                                if size < 5.0 { break; }
-                                let offset = (dn_offset + level as i32) as f64 * 0.01;
-                                let price = ((dn_bid - offset) * 100.0).round() / 100.0;
-                                if price <= 0.01 || price >= dn_ask || price > dn_price_cap { continue; }
-
-                                let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                                    market_slug: market.slug.clone(),
-                                    token_id: market.down_token_id.clone(),
-                                    side: Side::Down,
-                                    price,
-                                    size,
-                                    post_only: true,
-                                    ladder_key: format!("dn:{}", level),
-                                    was_cheap: dn_ask < up_ask,
-                                }).await;
-                                posted_any = true;
-                                dn_remaining -= size;
-                                if dn_remaining < 5.0 { break; }
-                            }
-                        }
-
-                        if posted_any {
-                            orders_live = true;
-                            last_post_ts = now_ms;
-                            cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
-                            info!(">>> POST P1{}: up_off={} dn_off={} cap={} obi={:.2} cancel={}ms",
-                                if repair_mode { " [REPAIR]" } else { "" },
-                                up_offset, dn_offset, price_cap_active, latest_obi, cancel_delay_ms);
-                        }
-                    }
-                }
-
-                // ═══ PHASE 2: Underweight side only, aggressive offset=1 ═══
-                if !window_skip && phase2_mode && !pair_done {
-                    let (full_side, full_shares_v, full_cost_v) =
-                        if up_shares >= dn_shares {
-                            ("UP", up_shares, up_cost)
-                        } else {
-                            ("DN", dn_shares, dn_cost)
-                        };
-
-                    let (need_side, need_token, need_bid, need_ask, already) =
-                        if up_shares >= dn_shares {
-                            (Side::Down, &market.down_token_id, dn_bid, dn_ask, dn_shares)
-                        } else {
-                            (Side::Up, &market.up_token_id, up_bid, up_ask, up_shares)
-                        };
-
-                    let still_need = (full_shares_v - already).max(0.0);
-
-                    // Repair max bid: pair cost target relaxes as imbalance worsens.
-                    let match_ratio = already / full_shares_v.max(0.001);
-                    let repair_target = repair_pair_cost_target(match_ratio);
-                    let full_avg_cost = full_cost_v / full_shares_v.max(0.001);
-                    let repair_max_bid = (repair_target - full_avg_cost).max(0.30);
-
-                    // Within 5% tolerance? Done.
-                    if already >= full_shares_v * (1.0 - match_tolerance) {
-                        info!(">>> PHASE 2 MATCHED: {} {:.0}sh, other {:.0}sh — done",
-                            full_side, full_shares_v, already);
-                        pair_done = true;
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "matched_within_tolerance".into(),
-                        }).await;
-                    } else if still_need < 5.0 {
-                        info!(">>> PHASE 2 CLOSE: {} {:.0}sh, other {:.0}sh, need {:.1} < 5 — done",
-                            full_side, full_shares_v, already, still_need);
-                        pair_done = true;
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "close_enough_sub5".into(),
-                        }).await;
-                    } else if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        // Phase 2: cheap side only, offset_base=5 → bid-5c/-6c/-7c, sizes 25/35/40
-                        // Price cap only active if price_cap_active (30s of pair_cost > 0.97)
-                        let offset_base: i32 = 5;
-                        let base_sizes = [25.0_f64, 35.0, 40.0];
-                        let mut remaining = still_need.min(max_shares_per_side - already);
-                        let need_label = if need_side == Side::Up { "UP" } else { "DN" };
-                        let mut posted_any = false;
-
-                        for (level, &base_size) in base_sizes.iter().enumerate() {
-                            let size = base_size.min(remaining);
-                            if size < 5.0 { break; }
-                            let offset = (offset_base + level as i32) as f64 * 0.01;
-                            let price = ((need_bid - offset) * 100.0).round() / 100.0;
-                            if price <= 0.01 || price >= need_ask { continue; }
-                            if price_cap_active && price > repair_max_bid { continue; }
-
+                        if size >= 5.0 && price > 0.01 && price < under_ask && price <= repair_max_bid {
                             let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                 market_slug: market.slug.clone(),
-                                token_id: need_token.clone(),
-                                side: need_side,
+                                token_id,
+                                side: side_v,
                                 price,
                                 size,
                                 post_only: true,
-                                ladder_key: format!("p2_{}:{}", need_label.to_lowercase(), level),
-                                was_cheap: price < 0.50,
+                                ladder_key: format!("repair_{}", label.to_lowercase()),
+                                was_cheap: !under_is_exp,
                             }).await;
-                            posted_any = true;
-                            remaining -= size;
-                            if remaining < 5.0 { break; }
-                        }
-
-                        if posted_any {
                             orders_live = true;
                             last_post_ts = now_ms;
-                            cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
+                            cancel_delay_ms = rand::thread_rng().gen_range(500..=2500);
+                            info!(">>> REPAIR [{}|{}]: {:.0}sh @ {:.0}c | cap={:.0}c | full={:.0} weak={:.0} cancel={}ms",
+                                label, if under_is_exp { "EXP" } else { "CHEAP" },
+                                size, price * 100.0, repair_max_bid * 100.0,
+                                full_v, weak_v, cancel_delay_ms);
                         }
-                        info!(">>> PHASE 2: {} full {:.0}sh | {} needs {:.0} above bid | cap={} max={:.0}c",
-                            full_side, full_shares_v, need_label, still_need, price_cap_active, repair_max_bid * 100.0);
+                    }
+                    continue; // skip phase1 posting
+                }
+
+                // ═══ T+35s to T+95s: PHASE 1 — single bid per side ═══
+                // Exp at bid (offset=0), cheap at bid-5c (offset=0.05)
+                if !window_skip && !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
+                    let up_needs  = (max_shares_per_side - up_shares).max(0.0);
+                    let dn_needs  = (max_shares_per_side - dn_shares).max(0.0);
+                    let up_offset = if exp_is_up { 0.0_f64 } else { 0.05_f64 };
+                    let dn_offset = if exp_is_up { 0.05_f64 } else { 0.0_f64 };
+                    let mut posted_any = false;
+
+                    // UP side
+                    if up_needs >= 5.0 {
+                        let size  = 24.0_f64.min(up_needs);
+                        let price = ((up_bid - up_offset) * 100.0).round() / 100.0;
+                        if price > 0.01 && price < up_ask {
+                            let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                                market_slug: market.slug.clone(),
+                                token_id: market.up_token_id.clone(),
+                                side: Side::Up,
+                                price,
+                                size,
+                                post_only: true,
+                                ladder_key: "up:0".into(),
+                                was_cheap: !exp_is_up,
+                            }).await;
+                            posted_any = true;
+                        }
+                    }
+
+                    // DN side
+                    if dn_needs >= 5.0 {
+                        let size  = 24.0_f64.min(dn_needs);
+                        let price = ((dn_bid - dn_offset) * 100.0).round() / 100.0;
+                        if price > 0.01 && price < dn_ask {
+                            let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                                market_slug: market.slug.clone(),
+                                token_id: market.down_token_id.clone(),
+                                side: Side::Down,
+                                price,
+                                size,
+                                post_only: true,
+                                ladder_key: "dn:0".into(),
+                                was_cheap: exp_is_up,
+                            }).await;
+                            posted_any = true;
+                        }
+                    }
+
+                    if posted_any {
+                        orders_live = true;
+                        last_post_ts = now_ms;
+                        cancel_delay_ms = rand::thread_rng().gen_range(500..=2500);
+                        info!(">>> POST P1: UP@{:.0}c[{}] DN@{:.0}c[{}] UP={:.0}sh DN={:.0}sh cancel={}ms",
+                            (up_bid - up_offset) * 100.0, if exp_is_up { "EXP" } else { "CHEAP" },
+                            (dn_bid - dn_offset) * 100.0, if exp_is_up { "CHEAP" } else { "EXP" },
+                            up_shares, dn_shares, cancel_delay_ms);
                     }
                 }
             }
