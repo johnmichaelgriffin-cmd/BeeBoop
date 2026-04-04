@@ -559,9 +559,9 @@ async fn run_vidarx_strategy(
                 if !window_skip && !phase2_mode {
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                         let (up_offset, dn_offset): (i32, i32) = if exp_is_up {
-                            (0, -5)  // UP=exp at bid; DN=cheap above bid
+                            (0, 5)  // UP=exp at bid; DN=cheap bid-5c/-6c/-7c
                         } else {
-                            (-5, 0)  // DN=exp at bid; UP=cheap above bid
+                            (5, 0)  // DN=exp at bid; UP=cheap bid-5c/-6c/-7c
                         };
                         // Price cap (only active after 30s of pair_cost > 0.97)
                         let (up_price_cap, dn_price_cap) = if price_cap_active {
@@ -697,9 +697,9 @@ async fn run_vidarx_strategy(
                             reason: "close_enough_sub5".into(),
                         }).await;
                     } else if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
-                        // Phase 2: cheap side only, offset_base=-5 → bid+5c/+4c/+3c, sizes 25/35/40
+                        // Phase 2: cheap side only, offset_base=5 → bid-5c/-6c/-7c, sizes 25/35/40
                         // Price cap only active if price_cap_active (30s of pair_cost > 0.97)
-                        let offset_base: i32 = -5;
+                        let offset_base: i32 = 5;
                         let base_sizes = [25.0_f64, 35.0, 40.0];
                         let mut remaining = still_need.min(max_shares_per_side - already);
                         let need_label = if need_side == Side::Up { "UP" } else { "DN" };
