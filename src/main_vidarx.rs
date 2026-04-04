@@ -209,7 +209,7 @@ async fn run_vidarx_strategy(
     let mut dn_cost: f64 = 0.0;
     let mut fills_this_window: u32 = 0;
     let mut matching_gtc_posted = false; // true once we've posted the single matching GTC
-    let max_shares_per_side: f64 = 75.0;
+    let max_shares_per_side: f64 = 200.0;
     let match_tolerance = 0.05; // within 5% = considered matched (tighter completion target)
     let mut repair_mode = false; // reversible: enters at weak<60% of full, exits at weak>=95%
     let mut phase2_mode = false; // one-way latch: overweight side capped OR T+180s emergency
