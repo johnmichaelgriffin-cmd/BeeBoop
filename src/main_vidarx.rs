@@ -554,12 +554,12 @@ async fn run_vidarx_strategy(
                         let (up_price_cap, dn_price_cap) = (raw_up_cap, raw_dn_cap);
                         // Sizes: underweight in repair or T+210s = 48/36/36 | everything else = 24/18/18
                         let up_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 210) && up_shares < dn_shares {
-                            [48.0, 36.0, 36.0]
+                            [25.0, 35.0, 40.0]
                         } else {
                             [24.0, 18.0, 18.0]
                         };
                         let dn_base_sizes: [f64; 3] = if (repair_mode || elapsed_s >= 210) && dn_shares < up_shares {
-                            [48.0, 36.0, 36.0]
+                            [25.0, 35.0, 40.0]
                         } else {
                             [24.0, 18.0, 18.0]
                         };
