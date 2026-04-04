@@ -441,40 +441,41 @@ async fn run_vidarx_strategy(
                     let still_need = (max_shares_per_side - under_shares).max(0.0);
                     if still_need < 5.0 { continue; }
 
-                    // Price = 0.97 - overweight_avg_cost (actual cost of the filled opposite side)
-                    // Falls back to 1.0 cap if overweight side is empty (no fills yet)
-                    let price = if over_shares_v >= 1.0 {
-                        ((0.97 - over_cost_v / over_shares_v) * 100.0).round() / 100.0
+                    // Price = 0.97 - overweight_avg_cost. post_only=false so it crosses
+                    // the spread immediately as a taker and fills fast.
+                    // Falls back to market formula if no fills yet on overweight side.
+                    let over_avg = if over_shares_v >= 1.0 { over_cost_v / over_shares_v } else { 0.0 };
+                    let raw_price = if over_shares_v >= 1.0 {
+                        0.97 - over_avg
                     } else {
-                        // No fills yet on either side — use market formula as fallback
                         let under_is_exp = under_is_up == exp_is_up;
-                        ((if under_is_exp { exp_bid_v } else { 0.97 - exp_bid_v }) * 100.0).round() / 100.0
+                        if under_is_exp { exp_bid_v } else { 0.97 - exp_bid_v }
                     };
+                    let price = (raw_price * 100.0).round() / 100.0;
 
                     if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                         let size     = 24.0_f64.min(still_need);
                         let token_id = if under_is_up { market.up_token_id.clone() } else { market.down_token_id.clone() };
                         let side_v   = if under_is_up { Side::Up } else { Side::Down };
                         let label    = if under_is_up { "UP" } else { "DN" };
-                        let over_avg = if over_shares_v >= 1.0 { over_cost_v / over_shares_v } else { 0.0 };
 
-                        if size >= 5.0 && price > 0.01 && price < under_ask {
+                        if size >= 5.0 && price > 0.01 {
                             let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                                 market_slug: market.slug.clone(),
                                 token_id,
                                 side: side_v,
                                 price,
                                 size,
-                                post_only: true,
+                                post_only: false,
                                 ladder_key: format!("repair_{}", label.to_lowercase()),
                                 was_cheap: under_is_up != exp_is_up,
                             }).await;
                             orders_live = true;
                             last_post_ts = now_ms;
                             cancel_delay_ms = rand::thread_rng().gen_range(500..=2500);
-                            info!(">>> REPAIR [{}]: {:.0}sh @ {:.0}c | over_avg={:.0}c | sum={:.0}c | full={:.0} weak={:.0} cancel={}ms",
+                            info!(">>> REPAIR [{}]: {:.0}sh @ {:.0}c (taker) | over_avg={:.0}c | target_sum={:.0}c | full={:.0} weak={:.0}",
                                 label, size, price * 100.0, over_avg * 100.0,
-                                (price + over_avg) * 100.0, full_v, weak_v, cancel_delay_ms);
+                                (price + over_avg) * 100.0, full_v, weak_v);
                         }
                     }
                     continue; // skip phase1 posting
@@ -485,8 +486,9 @@ async fn run_vidarx_strategy(
                 if !window_skip && !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                     let up_needs = (max_shares_per_side - up_shares).max(0.0);
                     let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
-                    let up_price = (up_price_p1 * 100.0).round() / 100.0;
-                    let dn_price = (dn_price_p1 * 100.0).round() / 100.0;
+                    // Cap each side at ask-1c so postOnly never crosses the spread
+                    let up_price = (up_price_p1.min(up_ask - 0.01) * 100.0).round() / 100.0;
+                    let dn_price = (dn_price_p1.min(dn_ask - 0.01) * 100.0).round() / 100.0;
                     let mut posted_any = false;
 
                     // UP side
