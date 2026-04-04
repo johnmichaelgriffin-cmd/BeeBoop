@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
     info!("Strategy: postOnly GTC bids on BOTH sides, signal-skewed");
     info!("Target mix: 55% cheap / 45% expensive");
     info!("Ladder: 8/6/6sh per side (3 levels each)");
-    info!("Timing: T+30s start, resets at T+240/450/660s, hold at T+870s");
+    info!("Timing: T+30s start, T+840s stop (~13.5 minutes)");
     info!("Max shares: 200/side (practical_full=196)");
     info!("WS reconnect: :14/:29/:44/:59 (900s interval)");
     info!("No selling. Hold to resolution.");
@@ -221,7 +221,6 @@ async fn run_vidarx_btc15_strategy(
     let practical_full: f64 = 198.0; // triggers phase2_mode when either side reaches this
     let mut repair_entered_ms: i64 = 0;       // timestamp when repair_mode was last entered
     let mut repair_underweight_fills: u32 = 0; // fills on underweight side since repair entered
-    let mut last_subwindow_reset: i64 = 0;    // tracks which sub-window boundary we last reset at
 
     // OBI — stored for spike cancel only (no directional skew in Phase 1)
     let mut latest_obi: f64 = 0.0;
@@ -263,7 +262,6 @@ async fn run_vidarx_btc15_strategy(
                 phase2_mode = false;
                 repair_entered_ms = 0;
                 repair_underweight_fills = 0;
-                last_subwindow_reset = 0;
                 window_skip = false;
                 orders_live = false;
                 last_post_ts = 0;
@@ -393,38 +391,26 @@ async fn run_vidarx_btc15_strategy(
 
                 // Start at T+30s (let market establish direction first)
                 if elapsed_s < 30 { continue; }
-
-                // Sub-window resets: every 3m30s starting at T+30s
-                // Boundaries: T+240s, T+450s, T+660s → fresh counts each time
-                // T+870s: hold everything to resolution, no more posting
-                for &reset_at in &[240i64, 450, 660] {
-                    if elapsed_s >= reset_at && last_subwindow_reset < reset_at {
-                        last_subwindow_reset = reset_at;
-                        up_shares = 0.0; dn_shares = 0.0;
-                        up_cost = 0.0; dn_cost = 0.0;
-                        fills_this_window = 0;
-                        pair_done = false;
-                        repair_mode = false;
-                        phase2_mode = false;
-                        repair_entered_ms = 0;
-                        repair_underweight_fills = 0;
-                        orders_live = false;
-                        next_post_interval_ms = rand::thread_rng().gen_range(500..=2000);
+                // Late acceptance at T+735 (~87.5% of window): if lagging ≥85% of leader, accept
+                if elapsed_s >= 735 && !pair_done {
+                    let full_s = up_shares.max(dn_shares);
+                    let weak_s = up_shares.min(dn_shares);
+                    if full_s > 0.0 && weak_s >= full_s * 0.85 {
+                        info!(">>> T+735 LATE ACCEPT (15M): full={:.0} weak={:.0} ({:.0}%) — holding",
+                            full_s, weak_s, weak_s / full_s * 100.0);
+                        pair_done = true;
                         let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: format!("subwindow_reset_{}s", reset_at),
+                            reason: "late_accept".into(),
                         }).await;
-                        info!(">>> SUB-WINDOW RESET at T+{}s — fresh counts", reset_at);
+                        continue;
                     }
                 }
 
-                // Hold to resolution at T+870s (14m30s)
-                if elapsed_s >= 870 {
+                // Stop at T+840s (14 minutes)
+                if elapsed_s >= 840 {
                     if !pair_done {
-                        info!(">>> T+870s — hold to resolution (BTC 15M)");
+                        info!(">>> T+840s — window over (BTC 15M), holding to resolution");
                         pair_done = true;
-                        let _ = exec_cmd_tx.send(ExecutionCommand::CancelAll {
-                            reason: "hold_to_resolution".into(),
-                        }).await;
                     }
                     continue;
                 }
