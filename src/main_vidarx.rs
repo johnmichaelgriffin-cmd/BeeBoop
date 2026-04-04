@@ -363,14 +363,7 @@ async fn run_vidarx_strategy(
                 // Wait for T+35s
                 if elapsed_s < 35 { continue; }
 
-                // Stop at T+240s
-                if elapsed_s >= 240 {
-                    if !pair_done {
-                        info!(">>> T+240s — window over, holding to resolution");
-                        pair_done = true;
-                    }
-                    continue;
-                }
+                // No hard stop — keep posting until matched or new window detected
 
                 // OBI spike cancel
                 if orders_live && latest_obi.abs() > 0.55 {
@@ -407,10 +400,12 @@ async fn run_vidarx_strategy(
                 // Expensive side = higher ask; cheap side = lower ask
                 let exp_is_up  = up_ask >= dn_ask;
                 let exp_bid_v  = if exp_is_up { up_bid } else { dn_bid };
-                // Phase 1 prices: exp @ bid-1c, cheap @ 0.97 - exp_bid (pair sums to ~97c)
-                // cheap naturally lands ~bid-2c since exp+cheap≈1.00 in binary market
-                let up_price_p1 = if exp_is_up { up_bid - 0.01 } else { 0.97 - exp_bid_v };
-                let dn_price_p1 = if exp_is_up { 0.97 - exp_bid_v } else { dn_bid - 0.01 };
+                // Phase 1 prices: exp @ bid-1c, cheap @ 0.97-exp_bid (pair sums ~97c)
+                // Floor: cheap never goes below cheap_bid-2c (handles 99c/3c extreme splits)
+                let cheap_bid_v  = if exp_is_up { dn_bid } else { up_bid };
+                let cheap_formula = (0.97 - exp_bid_v).max(cheap_bid_v - 0.02);
+                let up_price_p1 = if exp_is_up { up_bid - 0.01 } else { cheap_formula };
+                let dn_price_p1 = if exp_is_up { cheap_formula } else { dn_bid - 0.01 };
 
                 // ═══ T+95s+: REPAIR — post underweight side @ 0.97 - overweight_avg_cost ═══
                 if elapsed_s >= 95 {
