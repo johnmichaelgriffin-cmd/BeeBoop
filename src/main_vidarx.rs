@@ -407,9 +407,9 @@ async fn run_vidarx_strategy(
                 // Expensive side = higher ask; cheap side = lower ask
                 let exp_is_up  = up_ask >= dn_ask;
                 let exp_bid_v  = if exp_is_up { up_bid } else { dn_bid };
-                // Phase 1 prices: exp @ bid, cheap @ 0.97 - exp_bid → pair always sums to 97c
-                let up_price_p1 = if exp_is_up { exp_bid_v } else { 0.97 - exp_bid_v };
-                let dn_price_p1 = if exp_is_up { 0.97 - exp_bid_v } else { exp_bid_v };
+                // Phase 1 prices: exp @ bid-1c, cheap @ bid-2c (3c total pull from bids)
+                let up_price_p1 = if exp_is_up { up_bid - 0.01 } else { up_bid - 0.02 };
+                let dn_price_p1 = if exp_is_up { dn_bid - 0.02 } else { dn_bid - 0.01 };
 
                 // ═══ T+95s+: REPAIR — post underweight side @ 0.97 - overweight_avg_cost ═══
                 if elapsed_s >= 95 {
@@ -486,9 +486,8 @@ async fn run_vidarx_strategy(
                 if !window_skip && !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
                     let up_needs = (max_shares_per_side - up_shares).max(0.0);
                     let dn_needs = (max_shares_per_side - dn_shares).max(0.0);
-                    // Cap each side at ask-1c so postOnly never crosses the spread
-                    let up_price = (up_price_p1.min(up_ask - 0.01) * 100.0).round() / 100.0;
-                    let dn_price = (dn_price_p1.min(dn_ask - 0.01) * 100.0).round() / 100.0;
+                    let up_price = (up_price_p1 * 100.0).round() / 100.0;
+                    let dn_price = (dn_price_p1 * 100.0).round() / 100.0;
                     let mut posted_any = false;
 
                     // UP side
