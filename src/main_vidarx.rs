@@ -213,7 +213,8 @@ async fn run_vidarx_strategy(
     let match_tolerance = 0.05; // within 5% = considered matched (tighter completion target)
     let mut repair_mode = false; // reversible: enters at weak<60% of full, exits at weak>=95%
     let mut phase2_mode = false; // one-way latch: overweight side capped OR T+180s emergency
-    let practical_full: f64 = 74.0; // triggers phase2_mode when either side reaches this
+    let practical_full: f64 = 200.0; // triggers phase2_mode when either side reaches this
+    let mut initial_phase = true; // collect ~30sh on exp side first, then go two-sided
 
     // OBI — stored for spike cancel only (no directional skew in Phase 1)
     let mut latest_obi: f64 = 0.0;
@@ -253,6 +254,7 @@ async fn run_vidarx_strategy(
                 matching_gtc_posted = false;
                 repair_mode = false;
                 phase2_mode = false;
+                initial_phase = true;
                 window_skip = false;
                 orders_live = false;
                 last_post_ts = 0;
@@ -373,8 +375,8 @@ async fn run_vidarx_strategy(
 
                 let elapsed_s = (now_ms / 1000) - market.window_start_ts;
 
-                // Wait for T+10s
-                if elapsed_s < 10 { continue; }
+                // Wait for T+35s
+                if elapsed_s < 35 { continue; }
                 // Late acceptance at T+210: if lagging ≥85% of leader, accept as done
                 if elapsed_s >= 210 && !pair_done {
                     let full_s = up_shares.max(dn_shares);
@@ -430,6 +432,59 @@ async fn run_vidarx_strategy(
                     (Some(b), Some(a)) => (b, a),
                     _ => continue,
                 };
+
+                // ═══ INITIAL PHASE: collect ~30sh on expensive side first ═══
+                // Expensive = whichever token has the higher ask (>50c in a binary)
+                let exp_is_up = up_ask >= dn_ask;
+                let exp_shares = if exp_is_up { up_shares } else { dn_shares };
+                if initial_phase {
+                    if exp_shares >= 30.0 {
+                        initial_phase = false;
+                        info!(">>> INITIAL PHASE DONE: {} {:.0}sh — entering two-sided mode",
+                            if exp_is_up { "UP-EXP" } else { "DN-EXP" }, exp_shares);
+                        // fall through to normal logic — repair_mode will fire immediately
+                    } else {
+                        // Only post the expensive side, 24/18/18 at bid-3c/-4c/-5c
+                        if !orders_live && (now_ms - last_cancel_ts) >= next_post_interval_ms {
+                            let (exp_bid, exp_ask_p, exp_token, exp_side_v) = if exp_is_up {
+                                (up_bid, up_ask, market.up_token_id.clone(), Side::Up)
+                            } else {
+                                (dn_bid, dn_ask, market.down_token_id.clone(), Side::Down)
+                            };
+                            let base_sizes = [24.0_f64, 18.0, 18.0];
+                            let mut remaining = (max_shares_per_side - exp_shares).max(0.0);
+                            let mut posted_any = false;
+                            for (level, &base_size) in base_sizes.iter().enumerate() {
+                                let size = base_size.min(remaining);
+                                if size < 5.0 { break; }
+                                let offset = (3 + level) as f64 * 0.01;
+                                let price = ((exp_bid - offset) * 100.0).round() / 100.0;
+                                if price <= 0.01 || price >= exp_ask_p { continue; }
+                                let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                                    market_slug: market.slug.clone(),
+                                    token_id: exp_token.clone(),
+                                    side: exp_side_v,
+                                    price,
+                                    size,
+                                    post_only: true,
+                                    ladder_key: format!("init:{}", level),
+                                    was_cheap: false,
+                                }).await;
+                                posted_any = true;
+                                remaining -= size;
+                                if remaining < 5.0 { break; }
+                            }
+                            if posted_any {
+                                orders_live = true;
+                                last_post_ts = now_ms;
+                                cancel_delay_ms = rand::thread_rng().gen_range(500..=2000);
+                                info!(">>> POST INIT [{}]: {:.0}sh so far cancel={}ms",
+                                    if exp_is_up { "UP-EXP" } else { "DN-EXP" }, exp_shares, cancel_delay_ms);
+                            }
+                        }
+                        continue; // skip repair/phase2/phase1 logic while collecting exp side
+                    }
+                }
 
                 // ═══ PHASE 1: Both sides need tokens — post flash ladders ═══
                 let up_needs = (max_shares_per_side - up_shares).max(0.0);
