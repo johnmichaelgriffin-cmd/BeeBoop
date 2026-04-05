@@ -196,7 +196,7 @@ async fn run_vidarx_strategy(
     mut fill_rx: mpsc::Receiver<feeds::user_ws::UserFillEvent>,
     _log_tx: mpsc::Sender<LogEvent>,
 ) {
-    info!("VIDARX v3: GTC resting orders — 10 rounds × 5sh/side every 25s from T+10s, no cancel");
+    info!("VIDARX v4: FOK exp at ask, then reactive cheap GTC at 0.97-fill_price — 10 rounds × 5sh from T+10s");
 
     // Per-window state
     let mut last_window_ts: i64 = 0;
@@ -213,6 +213,8 @@ async fn run_vidarx_strategy(
     let round_size: f64 = 5.0;
     let mut rounds_posted: u32 = 0;
 
+    // Track which fills are exp so we can react with cheap GTC
+    // We identify exp fills by checking whether fill.asset_id matches the current exp token
     let mut latest_obi: f64 = 0.0;
     let mut heartbeat_interval = tokio::time::interval(std::time::Duration::from_secs(30));
 
@@ -254,7 +256,7 @@ async fn run_vidarx_strategy(
 
             Some(_evt) = exec_evt_rx.recv() => {}
 
-            // Track fills
+            // Track fills — exp fills trigger reactive cheap GTC
             Some(fill) = fill_rx.recv() => {
                 let market = market_rx.borrow().clone();
                 let is_up = fill.asset_id == market.up_token_id;
@@ -270,9 +272,49 @@ async fn run_vidarx_strategy(
                 let pair_cost = if matched > 0.0 {
                     (up_cost / up_shares.max(0.001)) + (dn_cost / dn_shares.max(0.001))
                 } else { 0.0 };
-                info!(">>> FILL: {} {:.1}sh @ {:.0}c | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c",
+
+                // Determine which side is exp right now
+                let top = pm_top_rx.borrow().clone();
+                let exp_is_up = top.up_ask.unwrap_or(0.5) >= top.down_ask.unwrap_or(0.5);
+                let fill_is_exp = (is_up && exp_is_up) || (is_dn && !exp_is_up);
+
+                info!(">>> FILL: {} {:.1}sh @ {:.0}c [{}] | UP={:.0} DN={:.0} matched={:.0} pcost={:.0}c",
                     if is_up { "UP" } else { "DN" }, fill.size, fill.price * 100.0,
+                    if fill_is_exp { "EXP" } else { "CHEAP" },
                     up_shares, dn_shares, matched, pair_cost * 100.0);
+
+                // Reactive cheap GTC: post cheap side at 0.97 - fill.price
+                if fill_is_exp {
+                    let cheap_ask_now = if exp_is_up {
+                        top.down_ask.unwrap_or(0.50)
+                    } else {
+                        top.up_ask.unwrap_or(0.50)
+                    };
+                    let cheap_token = if exp_is_up {
+                        market.down_token_id.clone()
+                    } else {
+                        market.up_token_id.clone()
+                    };
+                    let cheap_side = if exp_is_up { Side::Down } else { Side::Up };
+                    let cheap_price = ((0.97 - fill.price).max(0.01).min(cheap_ask_now - 0.01) * 100.0).round() / 100.0;
+
+                    if cheap_price > 0.01 {
+                        info!(">>> REACTIVE CHEAP GTC: {:.0}c (0.97-{:.0}c) {:.1}sh",
+                            cheap_price * 100.0, fill.price * 100.0, fill.size);
+                        let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                            market_slug: market.slug.clone(),
+                            token_id: cheap_token,
+                            side: cheap_side,
+                            price: cheap_price,
+                            size: fill.size,
+                            post_only: true,
+                            ladder_key: format!("cheap:reactive:{:.0}", fill.price * 100.0),
+                            was_cheap: true,
+                        }).await;
+                    } else {
+                        warn!(">>> REACTIVE CHEAP: price too low ({:.0}c), skipping", cheap_price * 100.0);
+                    }
+                }
             }
 
             // Heartbeat
@@ -306,73 +348,43 @@ async fn run_vidarx_strategy(
 
                 if rounds_posted >= rounds_due { continue; }
 
-                // Get current prices
+                // Get current asks (exp FOK targets ask price directly)
                 let top = pm_top_rx.borrow().clone();
-                let (up_bid, up_ask) = match (top.up_bid, top.up_ask) {
-                    (Some(b), Some(a)) => (b, a),
-                    _ => continue,
+                let up_ask = match top.up_ask {
+                    Some(a) => a,
+                    None => continue,
                 };
-                let (dn_bid, dn_ask) = match (top.down_bid, top.down_ask) {
-                    (Some(b), Some(a)) => (b, a),
-                    _ => continue,
+                let dn_ask = match top.down_ask {
+                    Some(a) => a,
+                    None => continue,
                 };
 
-                // Exp = higher ask, cheap = lower ask
-                let exp_is_up   = up_ask >= dn_ask;
-                let exp_bid_v   = if exp_is_up { up_bid } else { dn_bid };
-                let cheap_ask_v = if exp_is_up { dn_ask } else { up_ask };
-
-                // Prices: exp @ bid, cheap @ 0.97 - exp_bid (capped below cheap ask)
-                let exp_price   = (exp_bid_v * 100.0).round() / 100.0;
-                let cheap_price = ((0.94 - exp_bid_v).max(0.01).min(cheap_ask_v - 0.01) * 100.0).round() / 100.0;
-
-                let (up_price, dn_price) = if exp_is_up {
-                    (exp_price, cheap_price)
+                // Exp = higher ask (FOK taker at MARKET=0.99), cheap = lower ask (reactive GTC after fill)
+                let exp_is_up = up_ask >= dn_ask;
+                let (exp_token, exp_side, exp_label) = if exp_is_up {
+                    (market.up_token_id.clone(), Side::Up, "UP")
                 } else {
-                    (cheap_price, exp_price)
+                    (market.down_token_id.clone(), Side::Down, "DN")
                 };
+                // Use 0.99 as market price — guarantees sweep regardless of ask movement
+                let exp_price: f64 = 0.99;
 
                 let round_num = rounds_posted + 1;
-                let mut posted_any = false;
 
-                // UP side
-                if up_price > 0.01 && up_price < up_ask {
-                    let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                        market_slug: market.slug.clone(),
-                        token_id: market.up_token_id.clone(),
-                        side: Side::Up,
-                        price: up_price,
-                        size: round_size,
-                        post_only: true,
-                        ladder_key: format!("up:r{}", round_num),
-                        was_cheap: !exp_is_up,
-                    }).await;
-                    posted_any = true;
-                }
-
-                // DN side
-                if dn_price > 0.01 && dn_price < dn_ask {
-                    let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
-                        market_slug: market.slug.clone(),
-                        token_id: market.down_token_id.clone(),
-                        side: Side::Down,
-                        price: dn_price,
-                        size: round_size,
-                        post_only: true,
-                        ladder_key: format!("dn:r{}", round_num),
-                        was_cheap: exp_is_up,
-                    }).await;
-                    posted_any = true;
-                }
-
-                if posted_any {
-                    rounds_posted += 1;
-                    info!(">>> ROUND {}/{}: UP@{:.0}c[{}] DN@{:.0}c[{}] sum={:.0}c | T+{}s",
-                        rounds_posted, total_rounds,
-                        up_price * 100.0, if exp_is_up { "EXP" } else { "CHEAP" },
-                        dn_price * 100.0, if exp_is_up { "CHEAP" } else { "EXP" },
-                        (up_price + dn_price) * 100.0, elapsed_s);
-                }
+                // Send FOK taker order on exp side at market price (0.99 = will always fill)
+                info!(">>> ROUND {}/{}: FOK {} EXP@MKT(99c) ask={:.0}c {:.0}sh | T+{}s",
+                    round_num, total_rounds, exp_label, up_ask.max(dn_ask) * 100.0, round_size, elapsed_s);
+                let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
+                    market_slug: market.slug.clone(),
+                    token_id: exp_token,
+                    side: exp_side,
+                    price: exp_price,
+                    size: round_size,
+                    post_only: false,  // FOK taker — fills immediately at market
+                    ladder_key: format!("exp:fok:r{}", round_num),
+                    was_cheap: false,
+                }).await;
+                rounds_posted += 1;
             }
         }
     }
