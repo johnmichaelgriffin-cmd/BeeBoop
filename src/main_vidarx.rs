@@ -359,21 +359,19 @@ async fn run_vidarx_strategy(
                     None => continue,
                 };
 
-                // Exp = higher ask (FOK taker at MARKET=0.99), cheap = lower ask (reactive GTC after fill)
+                // Exp = higher ask (FOK taker at ask price — notional-based so must use actual ask)
                 let exp_is_up = up_ask >= dn_ask;
-                let (exp_token, exp_side, exp_label) = if exp_is_up {
-                    (market.up_token_id.clone(), Side::Up, "UP")
+                let (exp_token, exp_side, exp_price, exp_label) = if exp_is_up {
+                    (market.up_token_id.clone(), Side::Up, up_ask, "UP")
                 } else {
-                    (market.down_token_id.clone(), Side::Down, "DN")
+                    (market.down_token_id.clone(), Side::Down, dn_ask, "DN")
                 };
-                // Use 0.99 as market price — guarantees sweep regardless of ask movement
-                let exp_price: f64 = 0.99;
 
                 let round_num = rounds_posted + 1;
 
-                // Send FOK taker order on exp side at market price (0.99 = will always fill)
-                info!(">>> ROUND {}/{}: FOK {} EXP@MKT(99c) ask={:.0}c {:.0}sh | T+{}s",
-                    round_num, total_rounds, exp_label, up_ask.max(dn_ask) * 100.0, round_size, elapsed_s);
+                // Send FOK taker at actual ask — USDC spent = size × ask, fills exactly round_size shares
+                info!(">>> ROUND {}/{}: FOK {} EXP@{:.0}c (ask) {:.0}sh | T+{}s",
+                    round_num, total_rounds, exp_label, exp_price * 100.0, round_size, elapsed_s);
                 let _ = exec_cmd_tx.send(ExecutionCommand::PostMakerBid {
                     market_slug: market.slug.clone(),
                     token_id: exp_token,
