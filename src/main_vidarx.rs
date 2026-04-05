@@ -324,7 +324,7 @@ async fn run_vidarx_strategy(
 
                 // Prices: exp @ bid, cheap @ 0.97 - exp_bid (capped below cheap ask)
                 let exp_price   = (exp_bid_v * 100.0).round() / 100.0;
-                let cheap_price = ((0.96 - exp_bid_v).max(0.01).min(cheap_ask_v - 0.01) * 100.0).round() / 100.0;
+                let cheap_price = ((0.94 - exp_bid_v).max(0.01).min(cheap_ask_v - 0.01) * 100.0).round() / 100.0;
 
                 let (up_price, dn_price) = if exp_is_up {
                     (exp_price, cheap_price)
