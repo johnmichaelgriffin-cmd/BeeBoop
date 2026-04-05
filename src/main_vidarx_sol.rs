@@ -1,9 +1,9 @@
-//! BeeBoop Vidarx v4 — ETH 5M binary markets.
+//! BeeBoop Vidarx v4 — SOL 5M binary markets.
 //!
 //! Strategy: FOK exp side at ask, 5sh every 25s, 10 rounds from T+10s.
 //! No cheap side — exp only, hold to resolution.
 //!
-//! Usage: beeboop-v3-eth live
+//! Usage: beeboop-v3-sol live
 
 mod config_v2;
 mod types_v2;
@@ -38,7 +38,7 @@ async fn main() -> Result<()> {
 
     let mode = std::env::args().nth(1).unwrap_or("dryrun".into());
     let mut config = Config::default();
-    config.market = "eth".to_string();
+    config.market = "sol".to_string();
 
     config.start_delay_s = 5;
     config.cancel_at_s = 240;
@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
         config.load_credentials();
     }
 
-    info!("=== BEEBOOP VIDARX v4 — ETH 5M ===");
+    info!("=== BEEBOOP VIDARX v4 — SOL 5M ===");
     info!("Mode: {:?}", config.mode);
     info!("Strategy: FOK exp at ask, 5sh every 25s, 10 rounds from T+10s — exp only");
 
@@ -74,7 +74,7 @@ async fn main() -> Result<()> {
     ));
 
     tokio::spawn(feeds::binance::run_binance_feed_task_for(
-        "ethusdt", binance_tx.clone(), log_tx.clone(),
+        "solusdt", binance_tx.clone(), log_tx.clone(),
     ));
 
     tokio::spawn(feeds::market_ws::run_market_ws_task(
@@ -82,7 +82,7 @@ async fn main() -> Result<()> {
     ));
 
     tokio::spawn(feeds::rtds::run_rtds_task_for(
-        "eth/usd", chainlink_tx, chainlink_watch_tx, log_tx.clone(),
+        "sol/usd", chainlink_tx, chainlink_watch_tx, log_tx.clone(),
     ));
 
     let (fill_tx, fill_rx) = mpsc::channel::<feeds::user_ws::UserFillEvent>(1_000);
@@ -134,7 +134,7 @@ async fn run_vidarx_strategy(
     mut fill_rx: mpsc::Receiver<feeds::user_ws::UserFillEvent>,
     _log_tx: mpsc::Sender<LogEvent>,
 ) {
-    info!("VIDARX v4 ETH: FOK exp at ask, 5sh every 25s — exp only, no cheap side");
+    info!("VIDARX v4 SOL: FOK exp at ask, 5sh every 25s — exp only, no cheap side");
 
     let mut last_window_ts: i64 = 0;
     let mut up_shares: f64 = 0.0;

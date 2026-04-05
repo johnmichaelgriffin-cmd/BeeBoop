@@ -106,6 +106,14 @@ name = "beeboop-v3-eth"
 path = "src/main_vidarx_eth.rs"
 
 [[bin]]
+name = "beeboop-v3-sol"
+path = "src/main_vidarx_sol.rs"
+
+[[bin]]
+name = "beeboop-v3-xrp"
+path = "src/main_vidarx_xrp.rs"
+
+[[bin]]
 name = "lockprofit-eth"
 path = "src/main_lockprofit_eth.rs"
 
